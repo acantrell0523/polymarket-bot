@@ -67,9 +67,9 @@ trading:
   # Maximum total portfolio exposure in USDC across all open positions
   max_portfolio_exposure_usd: 500.0
   # Stop-loss threshold: close position if unrealized loss exceeds this fraction
-  stop_loss_threshold: 0.20  # 20% loss triggers stop-loss (tighter, cuts losers faster)
+  stop_loss_threshold: 0.25  # 25% loss triggers stop-loss (more room during volatile games)
   # Take-profit threshold: close position when price converges within this of fair value
-  take_profit_threshold: 0.01  # Within 1% of estimated fair value (takes profit sooner)
+  take_profit_threshold: 0.05  # Within 5% of estimated fair value (lets winners run)
   # Daily loss limit in USDC — halt all trading when breached
   daily_loss_limit_usd: 200.0
   # Maximum number of concurrent open positions

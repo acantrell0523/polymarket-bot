@@ -60,7 +60,7 @@ class TradingBot:
 
         # Live-game trading overrides
         self.live_min_edge = 0.015
-        self.live_take_profit = 0.005
+        self.live_take_profit = 0.03
         self.live_scan_interval = 3
         self.full_scan_interval = 60  # full market scan every 60s
 
