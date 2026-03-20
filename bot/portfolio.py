@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import List, Optional, Dict
 from utils.models import Position, Trade, TradeSignal
 from utils.logger import TradingLogger
+from bot import trade_db
 
 
 class Portfolio:
@@ -130,6 +131,33 @@ class Portfolio:
                 pnl=realized_pnl,
                 close_reason=reason,
             )
+
+        # Persist to SQLite for supervisor analysis
+        try:
+            slug = getattr(position, 'slug', position.market_id)
+            market_type = ""
+            if slug.startswith("asc-") or "pos-" in slug:
+                market_type = "spread"
+            elif slug.startswith("tsc-") or "pt5" in slug:
+                market_type = "totals"
+            else:
+                market_type = "moneyline"
+            trade_db.insert_trade(
+                slug=slug,
+                market_id=position.market_id,
+                side=position.side,
+                entry_price=position.entry_price,
+                close_price=current_price,
+                quantity=position.quantity,
+                size_usd=position.size_usd,
+                realized_pnl=realized_pnl,
+                close_reason=reason,
+                market_type=market_type,
+                entry_time=position.entry_time,
+                close_time=close_time,
+            )
+        except Exception:
+            pass  # DB errors must not break trading
 
         return realized_pnl
 

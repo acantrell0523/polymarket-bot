@@ -1,11 +1,13 @@
 """Main orchestrator loop with dual-speed scanning."""
 
+import os
 import sys
 import time
 import signal
 import copy
 from datetime import datetime, timezone
 from typing import Optional, List, Dict
+from dateutil import parser as dateutil_parser
 
 from utils.config import load_config, BotConfig
 from utils.logger import TradingLogger
@@ -97,6 +99,28 @@ class TradingBot:
                 self.logger.warning("onchain_import_failed", {
                     "message": "OnChainEnrichmentClient not available, running without enrichment"
                 })
+
+    def _check_supervisor_flags(self) -> bool:
+        """Check if supervisor has halted or paused trading. Returns True if OK to trade."""
+        kill_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "kill_switch")
+        pause_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "pause_until")
+
+        if os.path.exists(kill_path):
+            self.logger.warning("trading_halted_by_kill_switch", {})
+            return False
+
+        if os.path.exists(pause_path):
+            try:
+                with open(pause_path, "r") as f:
+                    resume_at = dateutil_parser.isoparse(f.read().strip())
+                if datetime.now(timezone.utc) < resume_at:
+                    self.logger.info("trading_paused", {"resume_at": resume_at.isoformat()})
+                    return False
+                else:
+                    os.remove(pause_path)
+            except Exception:
+                os.remove(pause_path)
+        return True
 
     def _should_enrich(self, has_edge: bool) -> bool:
         if not self.onchain_client:
@@ -381,6 +405,11 @@ class TradingBot:
         while self.running:
             cycle += 1
             try:
+                # Check supervisor kill switch / pause
+                if not self._check_supervisor_flags():
+                    time.sleep(10)
+                    continue
+
                 now = time.time()
                 time_since_full = now - self._last_full_scan
                 is_full_scan = time_since_full >= self.full_scan_interval
