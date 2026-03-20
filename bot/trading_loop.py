@@ -1,11 +1,11 @@
-"""Main orchestrator loop with on-chain enrichment pipeline."""
+"""Main orchestrator loop with dual-speed scanning."""
 
 import sys
 import time
 import signal
 import copy
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List, Dict
 
 from utils.config import load_config, BotConfig
 from utils.logger import TradingLogger
@@ -20,7 +20,7 @@ from bot.alerts import SlackAlerter
 
 
 class TradingBot:
-    """Main trading bot orchestrator."""
+    """Main trading bot orchestrator with dual-speed scanning."""
 
     def __init__(self, config: BotConfig):
         self.config = config
@@ -50,7 +50,6 @@ class TradingBot:
         live_signal_config = copy.deepcopy(config.signals)
         live_signal_config.order_book_imbalance_weight = 0.35
         live_signal_config.price_momentum_weight = 0.30
-        # Redistribute remaining 0.35 across other signals proportionally
         live_signal_config.volume_signal_weight = 0.10
         live_signal_config.mean_reversion_weight = 0.08
         live_signal_config.volatility_signal_weight = 0.02
@@ -60,15 +59,19 @@ class TradingBot:
         self.live_estimator = ProbabilityEstimator(live_signal_config)
 
         # Live-game trading overrides
-        self.live_min_edge = 0.015       # 1.5% edge threshold
-        self.live_take_profit = 0.005    # 0.5% take-profit
-        self.live_scan_interval = 3      # 3 second scan for live games
+        self.live_min_edge = 0.015
+        self.live_take_profit = 0.005
+        self.live_scan_interval = 3
+        self.full_scan_interval = 60  # full market scan every 60s
+
+        # Cached market list from last full scan
+        self._cached_markets: List[Dict] = []
+        self._last_full_scan = 0.0
 
         # On-chain enrichment client (optional)
         self.onchain_client = None
         if config.onchain.enabled:
             try:
-                # Import from the project root onchain.py
                 sys.path.insert(0, ".")
                 from onchain import OnChainEnrichmentClient
                 self.onchain_client = OnChainEnrichmentClient(
@@ -84,7 +87,6 @@ class TradingBot:
                 })
 
     def _should_enrich(self, has_edge: bool) -> bool:
-        """Decide whether to enrich a market with on-chain data."""
         if not self.onchain_client:
             return False
         if self.config.onchain.enrich_all_markets:
@@ -93,9 +95,29 @@ class TradingBot:
             return True
         return False
 
+    def _is_live_market(self, market: Dict) -> bool:
+        """Check if a market's game is currently in progress."""
+        game_start_str = market.get("gameStartTime")
+        if not game_start_str:
+            return False
+        game_start = self.market_data._parse_datetime(game_start_str)
+        if game_start is None:
+            return False
+        return game_start <= datetime.now(timezone.utc)
+
+    def _split_markets(self, markets: List[Dict]):
+        """Split markets into live and pre-game lists."""
+        live = []
+        pregame = []
+        for m in markets:
+            if self._is_live_market(m):
+                live.append(m)
+            else:
+                pregame.append(m)
+        return live, pregame
+
     def process_market(self, snapshot: MarketSnapshot):
         """Process a single market snapshot through the full pipeline."""
-        # Select estimator and thresholds based on live status
         if snapshot.is_live:
             estimator = self.live_estimator
             min_edge = self.live_min_edge
@@ -103,17 +125,14 @@ class TradingBot:
             estimator = self.estimator
             min_edge = self.config.trading.min_edge_threshold
 
-        # Phase 1: Core signal edge detection
         trade_signal = estimator.detect_edge(
             snapshot,
             min_edge=min_edge,
             max_edge=self.config.trading.max_edge_threshold,
         )
 
-        # Phase 2: Enrich with on-chain data if edge detected
         if self._should_enrich(trade_signal is not None) and trade_signal is not None:
             enrichment = self.onchain_client.get_enrichment_for_market(snapshot)
-            # Re-run with enrichment
             trade_signal = estimator.detect_edge(
                 snapshot,
                 min_edge=min_edge,
@@ -124,30 +143,24 @@ class TradingBot:
         if trade_signal is None:
             return
 
-        # Phase 3: Risk checks
         if not self.risk.can_open_position(self.portfolio.positions):
             return
 
-        # Phase 4: Position sizing
         exposure = self.portfolio.get_total_exposure()
         size = self.sizer.size_position(trade_signal, self.portfolio.bankroll, exposure)
         if size <= 0:
             return
 
         trade_signal.position_size_usd = size
-
-        # Attach snapshot metadata for alerts
         trade_signal._question = snapshot.question
         trade_signal._is_live = snapshot.is_live
 
-        # Phase 5: Execute
         trade = self.executor.execute_trade(trade_signal)
         if trade:
             self.portfolio.open_position(trade_signal, trade)
 
     def check_positions(self, has_live_games: bool = False):
         """Check all open positions for stop-loss/take-profit."""
-        # For live games, temporarily use tighter take-profit
         original_tp = self.risk.config.take_profit_threshold
         if has_live_games:
             self.risk.config.take_profit_threshold = self.live_take_profit
@@ -162,29 +175,79 @@ class TradingBot:
                 )
                 self.risk.record_pnl(position.realized_pnl)
 
-        # Restore original threshold
         if has_live_games:
             self.risk.config.take_profit_threshold = original_tp
 
+    def _do_full_scan(self) -> List[Dict]:
+        """Full market scan — fetches all markets, processes everything."""
+        markets = self.market_data.get_active_markets()
+        self._cached_markets = markets
+        self._last_full_scan = time.time()
+        return markets
+
+    def _do_live_scan(self, live_markets: List[Dict]):
+        """Fast scan — only builds snapshots for live game markets."""
+        for market in live_markets:
+            if not self.running:
+                break
+            snapshot = self.market_data.build_snapshot(market)
+            if snapshot:
+                self.process_market(snapshot)
+
+    def _log_open_positions(self):
+        """Log all currently open positions at startup."""
+        open_pos = self.portfolio.get_open_positions()
+        if not open_pos:
+            self.logger.info("open_positions", {"count": 0, "positions": []})
+            print("  Open positions: none")
+            return
+
+        pos_list = []
+        for p in open_pos:
+            pos_list.append({
+                "market_id": p.market_id,
+                "side": p.side,
+                "entry_price": p.entry_price,
+                "size_usd": p.size_usd,
+            })
+
+        self.logger.info("open_positions", {
+            "count": len(open_pos),
+            "positions": pos_list,
+        })
+        print(f"  Open positions: {len(open_pos)}")
+        for p in open_pos:
+            print(f"    {p.side.upper():4s}  ${p.size_usd:.0f}  @ {p.entry_price:.3f}  {p.market_id}")
+
     def run(self):
-        """Main trading loop."""
+        """Main trading loop with dual-speed scanning.
+
+        Fast loop (every 3s): only scans live in-game markets (~10 markets).
+        Full scan (every 60s): scans all filtered markets (~68 markets) for new opportunities.
+        """
         mode = "PAPER" if self.config.trading.paper_trading else "LIVE"
         self.logger.info("bot_starting", {
             "mode": mode,
             "bankroll": self.portfolio.bankroll,
-            "scan_interval": self.config.api.scan_interval_seconds,
+            "live_scan_interval": self.live_scan_interval,
+            "full_scan_interval": self.full_scan_interval,
         })
 
         print(f"\n{'='*60}")
         print(f"  Polymarket Trading Bot - {mode} MODE")
         print(f"  Bankroll: ${self.portfolio.bankroll:.2f}")
-        print(f"  Scan interval: {self.config.api.scan_interval_seconds}s")
-        print(f"  Edge threshold: {self.config.trading.min_edge_threshold*100:.1f}%")
+        print(f"  Fast scan: {self.live_scan_interval}s (live games only)")
+        print(f"  Full scan: {self.full_scan_interval}s (all markets)")
+        print(f"  Edge threshold: {self.config.trading.min_edge_threshold*100:.1f}% "
+              f"(live: {self.live_min_edge*100:.1f}%)")
+
+        # Log open positions
+        self._log_open_positions()
         print(f"{'='*60}\n")
 
-        # Send startup alert
-        markets_preview = self.market_data.get_active_markets()
-        self.alerter.bot_started(mode, self.portfolio.bankroll, len(markets_preview))
+        # Initial full scan + startup alert
+        markets = self._do_full_scan()
+        self.alerter.bot_started(mode, self.portfolio.bankroll, len(markets))
 
         def signal_handler(sig, frame):
             print("\nShutting down gracefully...")
@@ -194,35 +257,68 @@ class TradingBot:
 
         cycle = 0
         last_summary_date = None
+
         while self.running:
             cycle += 1
             try:
-                self.logger.info("scan_cycle_start", {"cycle": cycle})
+                now = time.time()
+                time_since_full = now - self._last_full_scan
+                is_full_scan = time_since_full >= self.full_scan_interval
 
-                # Fetch active markets
-                markets = self.market_data.get_active_markets()
+                if is_full_scan:
+                    # === FULL SCAN: all markets ===
+                    self.logger.info("full_scan_start", {"cycle": cycle})
 
-                if not markets:
-                    self.logger.warning("no_markets_found", {"cycle": cycle})
-                    time.sleep(self.config.api.scan_interval_seconds)
-                    continue
+                    markets = self._do_full_scan()
+                    if not markets:
+                        self.logger.warning("no_markets_found", {"cycle": cycle})
+                        time.sleep(self.live_scan_interval)
+                        continue
 
-                # Build snapshots and process
-                has_live_games = False
-                for market in markets:
-                    if not self.running:
-                        break
-                    snapshot = self.market_data.build_snapshot(market)
-                    if snapshot:
-                        if snapshot.is_live:
-                            has_live_games = True
-                        self.process_market(snapshot)
+                    live_markets, pregame_markets = self._split_markets(markets)
 
-                # Check existing positions (tighter take-profit for live games)
-                self.check_positions(has_live_games)
+                    # Process all markets (live + pregame)
+                    for market in markets:
+                        if not self.running:
+                            break
+                        snapshot = self.market_data.build_snapshot(market)
+                        if snapshot:
+                            self.process_market(snapshot)
 
-                # Record equity
-                self.portfolio.record_equity()
+                    has_live = len(live_markets) > 0
+                    self.check_positions(has_live)
+                    self.portfolio.record_equity()
+
+                    stats = self.portfolio.get_stats()
+                    self.logger.info("full_scan_complete", {
+                        "cycle": cycle,
+                        "total_markets": len(markets),
+                        "live_markets": len(live_markets),
+                        "pregame_markets": len(pregame_markets),
+                        "open_positions": len(self.portfolio.get_open_positions()),
+                        "total_trades": stats["total_trades"],
+                        "total_pnl": round(stats["total_pnl"], 2),
+                        "bankroll": round(self.portfolio.bankroll, 2),
+                    })
+
+                else:
+                    # === FAST SCAN: live games only ===
+                    live_markets, _ = self._split_markets(self._cached_markets)
+
+                    if live_markets:
+                        self.logger.info("live_scan_start", {
+                            "cycle": cycle,
+                            "live_count": len(live_markets),
+                        })
+
+                        self._do_live_scan(live_markets)
+                        self.check_positions(has_live_games=True)
+
+                        self.logger.info("live_scan_complete", {
+                            "cycle": cycle,
+                            "live_markets": len(live_markets),
+                            "open_positions": len(self.portfolio.get_open_positions()),
+                        })
 
                 # Daily summary alert
                 now_utc = datetime.now(timezone.utc)
@@ -241,24 +337,7 @@ class TradingBot:
                     )
                     last_summary_date = today_str
 
-                # Log status
-                stats = self.portfolio.get_stats()
-                open_count = len(self.portfolio.get_open_positions())
-                # Use faster scan interval when live games are active
-                scan_interval = self.live_scan_interval if has_live_games else self.config.api.scan_interval_seconds
-
-                self.logger.info("scan_cycle_complete", {
-                    "cycle": cycle,
-                    "markets_scanned": len(markets),
-                    "live_games": has_live_games,
-                    "open_positions": open_count,
-                    "total_trades": stats["total_trades"],
-                    "total_pnl": round(stats["total_pnl"], 2),
-                    "bankroll": round(self.portfolio.bankroll, 2),
-                    "next_scan_seconds": scan_interval,
-                })
-
-                time.sleep(scan_interval)
+                time.sleep(self.live_scan_interval)
 
             except Exception as e:
                 self.logger.error("scan_cycle_error", {"cycle": cycle, "error": str(e)})
