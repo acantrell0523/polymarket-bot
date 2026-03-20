@@ -40,19 +40,24 @@ class TradingBot:
             enabled=config.alerts.enabled,
         )
 
-        # Initialize odds cache for external odds comparison
+        # Initialize external data caches
         from bot.signals.odds_api import OddsCache
-        self.odds_cache = OddsCache(
-            api_key=config.odds_api_key,
-            cache_ttl=300,
-        )
+        from bot.signals.cross_market import PredictItCache
+        from bot.signals.crypto_api import CryptoCache
+
+        self.odds_cache = OddsCache(api_key=config.odds_api_key, cache_ttl=300)
+        self.predictit_cache = PredictItCache(cache_ttl=300)
+        self.crypto_cache = CryptoCache(cache_ttl=300)
+
         if not self.odds_cache.enabled:
             self.logger.warning("odds_api_disabled", {
-                "message": "THE_ODDS_API_KEY not set — bot will not trade (no external validation)"
+                "message": "THE_ODDS_API_KEY not set — sports markets will not trade"
             })
 
-        # Estimator with odds cache
-        self.estimator = ProbabilityEstimator(config.signals, self.odds_cache)
+        # Estimator with all caches
+        self.estimator = ProbabilityEstimator(
+            config.signals, self.odds_cache, self.predictit_cache, self.crypto_cache,
+        )
 
         # Fetch real balance from exchange for live mode
         initial_bankroll = config.backtest.initial_bankroll_usd
@@ -74,16 +79,22 @@ class TradingBot:
         )
         self.running = True
 
+        # Cooldown tracker: slug → earliest time we can reopen
+        self._slug_cooldowns: Dict[str, float] = {}
+        self._cooldown_seconds = 600  # 10 minutes
+
         # Live-game estimator with aggressive weights
         live_signal_config = copy.deepcopy(config.signals)
         live_signal_config.odds_value_weight = 0.40
         live_signal_config.order_book_imbalance_weight = 0.25
         live_signal_config.line_movement_weight = 0.15
         live_signal_config.liquidity_imbalance_weight = 0.20
-        self.live_estimator = ProbabilityEstimator(live_signal_config, self.odds_cache)
+        self.live_estimator = ProbabilityEstimator(
+            live_signal_config, self.odds_cache, self.predictit_cache, self.crypto_cache,
+        )
 
-        # Live-game trading overrides
-        self.live_min_edge = 0.015
+        # Live-game trading overrides — use same edge threshold as config
+        self.live_min_edge = config.trading.min_edge_threshold
         self.live_take_profit = 0.03
         self.live_scan_interval = 3
         self.full_scan_interval = 60
@@ -156,6 +167,12 @@ class TradingBot:
         # Skip if we already have a position on this market
         slug = snapshot.slug
         if any(p.slug == slug for p in self.portfolio.get_open_positions()):
+            return
+
+        # Skip if this slug is in cooldown after a recent close
+        import time as _time
+        cooldown_until = self._slug_cooldowns.get(slug, 0)
+        if _time.time() < cooldown_until:
             return
 
         if not self.risk.can_open_position(self.portfolio.positions):
@@ -236,6 +253,9 @@ class TradingBot:
                         "exit": position.current_price,
                         "pnl": round(position.realized_pnl, 2),
                     })
+                    # 10-minute cooldown before reopening this slug
+                    import time as _time
+                    self._slug_cooldowns[slug] = _time.time() + self._cooldown_seconds
                 else:
                     self.logger.error("position_exit_failed", {
                         "slug": slug,

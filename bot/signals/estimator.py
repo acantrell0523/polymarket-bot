@@ -1,6 +1,16 @@
-"""Combines signals into probability estimates and detects edge."""
+"""Combines signals into probability estimates and detects edge.
 
-from typing import List, Optional, Tuple
+Auto-detects market type from slug/question and routes to the appropriate
+signal sources:
+  - Sports → odds_api (the-odds-api.com)
+  - Crypto → crypto_model (CoinGecko)
+  - Politics/Other → cross_market (PredictIt)
+
+The external validation gate applies to ALL types: no external data = no trade.
+"""
+
+import re
+from typing import List, Optional, Tuple, Dict
 from utils.models import MarketSnapshot, Signal, TradeSignal
 from utils.config import SignalConfig
 from bot.signals.signals import (
@@ -8,44 +18,132 @@ from bot.signals.signals import (
     line_movement_signal,
     odds_value_signal,
     liquidity_imbalance_signal,
+    cross_market_signal,
+    crypto_model_signal,
 )
 from bot.signals.odds_api import OddsCache
+from bot.signals.cross_market import PredictItCache
+from bot.signals.crypto_api import CryptoCache
+
+
+# Market type detection patterns
+SPORTS_PREFIXES = ("aec-", "asc-", "tsc-", "atc-")
+CRYPTO_KEYWORDS = re.compile(
+    r"\b(bitcoin|btc|ethereum|eth|solana|sol|dogecoin|doge|xrp|crypto|cardano|ada|"
+    r"avalanche|avax|polkadot|dot|chainlink|link|bnb)\b",
+    re.IGNORECASE,
+)
+POLITICS_KEYWORDS = re.compile(
+    r"\b(election|president|congress|senate|governor|democrat|republican|"
+    r"vote|primary|nominee|caucus|poll|cabinet|impeach)\b",
+    re.IGNORECASE,
+)
+
+# Weights per market type
+WEIGHTS = {
+    "sports": {
+        "odds_value": 0.45,
+        "order_book_imbalance": 0.20,
+        "line_movement": 0.20,
+        "liquidity_imbalance": 0.15,
+    },
+    "crypto": {
+        "crypto_model": 0.45,
+        "cross_market": 0.25,
+        "order_book_imbalance": 0.20,
+        "liquidity_imbalance": 0.10,
+    },
+    "politics": {
+        "cross_market": 0.45,
+        "order_book_imbalance": 0.25,
+        "line_movement": 0.15,
+        "liquidity_imbalance": 0.15,
+    },
+    "other": {
+        "cross_market": 0.40,
+        "order_book_imbalance": 0.25,
+        "line_movement": 0.20,
+        "liquidity_imbalance": 0.15,
+    },
+}
+
+
+def detect_market_type(snapshot: MarketSnapshot) -> str:
+    """Classify a market into sports/crypto/politics/other."""
+    slug = snapshot.slug.lower()
+
+    if any(slug.startswith(p) for p in SPORTS_PREFIXES):
+        return "sports"
+
+    q = snapshot.question
+    if CRYPTO_KEYWORDS.search(q) or CRYPTO_KEYWORDS.search(slug):
+        return "crypto"
+    if POLITICS_KEYWORDS.search(q):
+        return "politics"
+
+    return "other"
 
 
 class ProbabilityEstimator:
-    """Combines 4 signals into a single probability estimate."""
+    """Multi-market-type estimator with external validation gate."""
 
-    def __init__(self, config: SignalConfig, odds_cache: Optional[OddsCache] = None):
+    def __init__(
+        self,
+        config: SignalConfig,
+        odds_cache: Optional[OddsCache] = None,
+        predictit_cache: Optional[PredictItCache] = None,
+        crypto_cache: Optional[CryptoCache] = None,
+    ):
         self.config = config
         self.odds_cache = odds_cache
-        self.weights = {
-            "order_book_imbalance": config.order_book_imbalance_weight,
-            "line_movement": config.line_movement_weight,
-            "odds_value": config.odds_value_weight,
-            "liquidity_imbalance": config.liquidity_imbalance_weight,
-        }
+        self.predictit_cache = predictit_cache
+        self.crypto_cache = crypto_cache
 
-    def compute_signals(self, snapshot: MarketSnapshot) -> List[Signal]:
-        """Compute all signals for a market snapshot."""
-        return [
+    def compute_signals(self, snapshot: MarketSnapshot, market_type: str) -> List[Signal]:
+        """Compute signals appropriate for the market type."""
+        signals = [
             order_book_imbalance_signal(snapshot, self.config),
-            line_movement_signal(snapshot, self.config),
-            odds_value_signal(snapshot, self.config, self.odds_cache),
             liquidity_imbalance_signal(snapshot, self.config),
         ]
 
-    def estimate_probability(self, signals: List[Signal]) -> Tuple[float, float]:
-        """Combine signals into a single probability estimate.
+        if market_type == "sports":
+            signals.append(odds_value_signal(snapshot, self.config, self.odds_cache))
+            signals.append(line_movement_signal(snapshot, self.config))
+        elif market_type == "crypto":
+            signals.append(crypto_model_signal(snapshot, self.config, self.crypto_cache))
+            signals.append(cross_market_signal(snapshot, self.config, self.predictit_cache))
+        elif market_type == "politics":
+            signals.append(cross_market_signal(snapshot, self.config, self.predictit_cache))
+            signals.append(line_movement_signal(snapshot, self.config))
+        else:  # "other"
+            signals.append(cross_market_signal(snapshot, self.config, self.predictit_cache))
+            signals.append(line_movement_signal(snapshot, self.config))
 
-        Returns (estimated_probability, overall_confidence).
+        return signals
 
-        Formula: p = sum(w_i * c_i * v_i) / sum(w_i * c_i)
+    def _get_primary_signal(self, signals: List[Signal], market_type: str) -> Optional[Signal]:
+        """Get the primary external validation signal for this market type."""
+        primary_name = {
+            "sports": "odds_value",
+            "crypto": "crypto_model",
+            "politics": "cross_market",
+            "other": "cross_market",
+        }.get(market_type)
+
+        return next((s for s in signals if s.name == primary_name), None)
+
+    def estimate_probability(
+        self, signals: List[Signal], weights: Dict[str, float]
+    ) -> Tuple[float, float]:
+        """Combine signals using confidence-weighted averaging.
+
+        p = sum(w_i * c_i * v_i) / sum(w_i * c_i)
         """
         weighted_sum = 0.0
         weight_sum = 0.0
 
         for signal in signals:
-            w = self.weights.get(signal.name, 0)
+            w = weights.get(signal.name, 0)
             if w <= 0:
                 continue
             effective_weight = w * signal.confidence
@@ -61,7 +159,7 @@ class ProbabilityEstimator:
         conf_sum = 0.0
         w_total = 0.0
         for signal in signals:
-            w = self.weights.get(signal.name, 0)
+            w = weights.get(signal.name, 0)
             if w > 0:
                 conf_sum += w * signal.confidence
                 w_total += w
@@ -75,37 +173,38 @@ class ProbabilityEstimator:
         min_edge: float,
         max_edge: float,
     ) -> Optional[TradeSignal]:
-        """Run all signals, estimate probability, and detect tradeable edge.
+        """Detect tradeable edge with external validation gate.
 
-        CRITICAL rules:
-        1. If odds_value has confidence=0 (no external odds), do NOT trade.
-        2. If odds-based edge < 2%, penalize all other signal confidences by 50%.
-        3. If odds-based edge < 3%, cap the combined edge at 3%.
+        Rules:
+        1. If primary external signal has confidence=0, do NOT trade.
+        2. If external edge < 2%, penalize other signals by 50%.
+        3. Combined edge capped at external edge + 1%.
         """
-        signals = self.compute_signals(snapshot)
+        market_type = detect_market_type(snapshot)
+        weights = WEIGHTS.get(market_type, WEIGHTS["other"])
+        signals = self.compute_signals(snapshot, market_type)
 
-        # Gate: require external odds validation
-        odds_signal = next((s for s in signals if s.name == "odds_value"), None)
-        if odds_signal is None or odds_signal.confidence == 0:
+        # Gate: require external validation
+        primary = self._get_primary_signal(signals, market_type)
+        if primary is None or primary.confidence == 0:
             return None
 
-        # Extract the raw odds edge
-        odds_edge = abs(odds_signal.metadata.get("edge", 0))
+        # Extract the raw external edge
+        ext_edge = abs(primary.metadata.get("edge", 0))
 
-        # Confidence penalty: if odds edge < 2%, halve confidence of non-odds signals
-        if odds_edge < 0.02:
+        # Confidence penalty: if external edge < 2%, halve non-primary confidences
+        if ext_edge < 0.02:
             for s in signals:
-                if s.name != "odds_value":
+                if s.name != primary.name:
                     s.confidence *= 0.5
 
-        estimated_prob, confidence = self.estimate_probability(signals)
+        estimated_prob, confidence = self.estimate_probability(signals, weights)
 
         # Edge = estimated probability - market price
         edge = estimated_prob - snapshot.price
 
-        # Edge cap: combined edge cannot exceed odds edge + 1%
-        # This ensures other signals can add a small boost but not create edge from nothing
-        max_allowed_edge = odds_edge + 0.01
+        # Edge cap: combined edge cannot exceed external edge + 1%
+        max_allowed_edge = ext_edge + 0.01
         if abs(edge) > max_allowed_edge:
             edge = max_allowed_edge if edge > 0 else -max_allowed_edge
 
@@ -113,9 +212,20 @@ class ProbabilityEstimator:
             return None
 
         side = "buy" if edge > 0 else "sell"
-
-        # Recompute estimated_prob from capped edge
         estimated_prob = snapshot.price + edge
+
+        # Log signals to SQLite for the dashboard
+        try:
+            from bot.trade_db import log_signals_for_slug
+            log_signals_for_slug(
+                slug=snapshot.slug,
+                market_type=market_type,
+                signals=signals,
+                polymarket_price=snapshot.price,
+                edge=edge,
+            )
+        except Exception:
+            pass  # DB errors must not block trading
 
         return TradeSignal(
             market_id=snapshot.market_id,

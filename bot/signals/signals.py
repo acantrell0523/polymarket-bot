@@ -4,6 +4,8 @@ from typing import Optional, Tuple
 from utils.models import MarketSnapshot, Signal
 from utils.config import SignalConfig
 from bot.signals.odds_api import OddsCache
+from bot.signals.cross_market import PredictItCache
+from bot.signals.crypto_api import CryptoCache
 
 
 def order_book_imbalance_signal(snapshot: MarketSnapshot, config: SignalConfig) -> Signal:
@@ -197,5 +199,102 @@ def liquidity_imbalance_signal(snapshot: MarketSnapshot, config: SignalConfig) -
             "top_imbalance": float(top_imbalance),
             "bid_concentration": float(bid_concentration),
             "ask_concentration": float(ask_concentration),
+        },
+    )
+
+
+def cross_market_signal(
+    snapshot: MarketSnapshot,
+    config: SignalConfig,
+    predictit_cache: Optional[PredictItCache] = None,
+) -> Signal:
+    """Compare Polymarket price to PredictIt price on the same event.
+
+    Pure cross-market arbitrage: if PredictIt has 55% and Polymarket has 40%,
+    that's real edge.
+
+    Returns confidence=0 if no PredictIt match found.
+    """
+    if not predictit_cache:
+        return Signal(name="cross_market", value=0.5, confidence=0.0, direction="neutral",
+                      metadata={"reason": "no_predictit_cache"})
+
+    # Extract keywords from question for matching
+    question = snapshot.question
+    keywords = [w for w in question.replace("?", "").split() if len(w) > 3]
+
+    result = predictit_cache.get_probability(question, keywords)
+    if result is None:
+        return Signal(name="cross_market", value=0.5, confidence=0.0, direction="neutral",
+                      metadata={"reason": "no_predictit_match"})
+
+    predictit_prob, matched_name = result
+    polymarket_price = snapshot.price
+    edge = predictit_prob - polymarket_price
+
+    value = max(0.01, min(0.99, predictit_prob))
+    confidence = min(abs(edge) * 5, 0.9)  # Scale confidence with edge size
+
+    direction = "bullish" if edge > 0.02 else "bearish" if edge < -0.02 else "neutral"
+
+    return Signal(
+        name="cross_market",
+        value=float(value),
+        confidence=float(confidence),
+        direction=direction,
+        metadata={
+            "predictit_prob": float(predictit_prob),
+            "polymarket_price": float(polymarket_price),
+            "edge": float(edge),
+            "matched_contract": matched_name,
+        },
+    )
+
+
+def crypto_model_signal(
+    snapshot: MarketSnapshot,
+    config: SignalConfig,
+    crypto_cache: Optional[CryptoCache] = None,
+) -> Signal:
+    """Estimate crypto target probability using log-normal model and compare to Polymarket.
+
+    Uses current price, volatility, and time remaining to compute a model probability
+    for "Will X hit $Y by date Z?" markets.
+
+    Returns confidence=0 if we can't parse the market or fetch price data.
+    """
+    if not crypto_cache:
+        return Signal(name="crypto_model", value=0.5, confidence=0.0, direction="neutral",
+                      metadata={"reason": "no_crypto_cache"})
+
+    result = crypto_cache.estimate_probability(snapshot.question, snapshot.price)
+    if result is None:
+        return Signal(name="crypto_model", value=0.5, confidence=0.0, direction="neutral",
+                      metadata={"reason": "no_crypto_match"})
+
+    model_prob, meta = result
+    polymarket_price = snapshot.price
+    edge = model_prob - polymarket_price
+
+    value = max(0.01, min(0.99, model_prob))
+
+    # Confidence based on how much data we have and edge size
+    # Lower confidence for very long-dated markets (more uncertainty)
+    days = meta.get("days_remaining", 30)
+    time_confidence = max(0.3, 1.0 - (days / 365))
+    confidence = min(abs(edge) * 4, 0.8) * time_confidence
+
+    direction = "bullish" if edge > 0.02 else "bearish" if edge < -0.02 else "neutral"
+
+    return Signal(
+        name="crypto_model",
+        value=float(value),
+        confidence=float(confidence),
+        direction=direction,
+        metadata={
+            "model_prob": float(model_prob),
+            "polymarket_price": float(polymarket_price),
+            "edge": float(edge),
+            **{k: v for k, v in meta.items() if k != "model_prob"},
         },
     )
