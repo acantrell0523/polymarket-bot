@@ -246,17 +246,69 @@ class ExecutionEngine:
             return False
 
         try:
-            result = self._client.orders.close_position({
+            # Get the actual position size from the exchange
+            exchange_positions = self.get_exchange_positions()
+            if slug not in exchange_positions:
+                if self.logger:
+                    self.logger.warning("close_position_not_on_exchange", {
+                        "slug": slug,
+                        "message": "Position not on exchange, marking as abandoned",
+                    })
+                return True
+
+            ex_pos = exchange_positions[slug]
+            net_qty = int(ex_pos.get("netPosition", "0"))
+            qty_available = int(ex_pos.get("qtyAvailable", str(abs(net_qty))))
+
+            if net_qty == 0:
+                return True
+
+            # Determine intent: if we're long (net > 0), sell long. If short, buy short.
+            if net_qty > 0:
+                intent = "ORDER_INTENT_SELL_LONG"
+                sell_qty = qty_available
+            else:
+                intent = "ORDER_INTENT_BUY_SHORT"
+                sell_qty = abs(qty_available)
+
+            # Submit aggressive IOC sell at $0.01 to sweep the book
+            result = self._client.orders.create({
                 "marketSlug": slug,
+                "intent": intent,
+                "type": "ORDER_TYPE_LIMIT",
+                "price": {"value": "0.01", "currency": "USD"},
+                "quantity": sell_qty,
+                "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
             })
 
             if self.logger:
-                self.logger.info("live_position_closed", {
-                    "market_id": position.market_id,
+                self.logger.info("close_position_sell_submitted", {
                     "slug": slug,
-                    "side": position.side,
-                    "entry_price": position.entry_price,
+                    "intent": intent,
+                    "quantity": sell_qty,
                     "order_result": str(result),
+                })
+
+            # Verify the position is gone
+            import time
+            time.sleep(1)
+            remaining = self.get_exchange_positions()
+            if slug in remaining:
+                remaining_net = int(remaining[slug].get("netPosition", "0"))
+                if remaining_net != 0:
+                    if self.logger:
+                        self.logger.warning("close_position_partial", {
+                            "slug": slug,
+                            "original_net": net_qty,
+                            "remaining_net": remaining_net,
+                            "message": "Position partially closed",
+                        })
+                    return False
+
+            if self.logger:
+                self.logger.info("close_position_verified", {
+                    "slug": slug,
+                    "message": "Position confirmed closed on exchange",
                 })
             return True
 
@@ -268,13 +320,6 @@ class ExecutionEngine:
                     "slug": slug,
                     "error": err_str,
                 })
-            # If position doesn't exist on exchange, return True so
-            # the bot marks it as closed internally and stops retrying
             if "not found" in err_str.lower() or "no position" in err_str.lower():
-                if self.logger:
-                    self.logger.warning("close_position_not_on_exchange", {
-                        "slug": slug,
-                        "message": "Position not on exchange, marking as abandoned",
-                    })
                 return True
             return False
