@@ -1,105 +1,16 @@
-"""5 core signal functions for edge detection."""
+"""Signal functions for edge detection on Polymarket US."""
 
-import numpy as np
+from typing import Optional, Tuple
 from utils.models import MarketSnapshot, Signal
 from utils.config import SignalConfig
-
-
-def price_momentum_signal(snapshot: MarketSnapshot, config: SignalConfig) -> Signal:
-    """
-    Compute price momentum using linear regression slope of recent prices.
-    Positive slope = bullish momentum, negative = bearish.
-    """
-    lookback = config.momentum_lookback
-    prices = snapshot.price_history[-lookback:] if len(snapshot.price_history) >= lookback else snapshot.price_history
-
-    if len(prices) < 3:
-        return Signal(name="price_momentum", value=0.5, confidence=0.0, direction="neutral")
-
-    x = np.arange(len(prices), dtype=float)
-    y = np.array(prices, dtype=float)
-
-    # Linear regression
-    x_mean = x.mean()
-    y_mean = y.mean()
-    ss_xy = ((x - x_mean) * (y - y_mean)).sum()
-    ss_xx = ((x - x_mean) ** 2).sum()
-
-    if ss_xx == 0:
-        return Signal(name="price_momentum", value=0.5, confidence=0.0, direction="neutral")
-
-    slope = ss_xy / ss_xx
-
-    # R-squared for confidence
-    y_pred = slope * (x - x_mean) + y_mean
-    ss_res = ((y - y_pred) ** 2).sum()
-    ss_tot = ((y - y_mean) ** 2).sum()
-    r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
-    r_squared = max(0, min(1, r_squared))
-
-    # Normalize slope to a probability adjustment
-    # Positive slope -> value > 0.5 (bullish), negative -> < 0.5 (bearish)
-    normalized_slope = np.clip(slope * 10, -0.3, 0.3)
-    value = 0.5 + normalized_slope
-
-    direction = "bullish" if slope > 0 else "bearish" if slope < 0 else "neutral"
-
-    return Signal(
-        name="price_momentum",
-        value=float(value),
-        confidence=float(r_squared),
-        direction=direction,
-        metadata={"slope": float(slope), "r_squared": float(r_squared)},
-    )
-
-
-def volume_signal(snapshot: MarketSnapshot, config: SignalConfig) -> Signal:
-    """
-    Volume signal: compare current volume to average.
-    High relative volume suggests informed trading activity.
-    """
-    if snapshot.volume_24h <= 0:
-        return Signal(name="volume", value=0.5, confidence=0.0, direction="neutral")
-
-    # Use price history length as a proxy for average volume periods
-    # In production, we'd track volume history separately
-    # Higher volume + price rising = bullish volume confirmation
-    prices = snapshot.price_history
-    if len(prices) < 2:
-        return Signal(name="volume", value=0.5, confidence=0.3, direction="neutral")
-
-    # Volume-price relationship
-    recent_return = (prices[-1] - prices[-2]) / prices[-2] if prices[-2] != 0 else 0
-
-    # Volume factor: assume average volume = liquidity * 5 as a proxy
-    avg_volume_estimate = max(snapshot.liquidity * 5, 100)
-    volume_ratio = snapshot.volume_24h / avg_volume_estimate
-    volume_ratio = min(volume_ratio, 5.0)  # Cap at 5x
-
-    # High volume + positive return = bullish, high volume + negative return = bearish
-    if recent_return > 0:
-        value = 0.5 + min(volume_ratio * 0.05, 0.2)
-    elif recent_return < 0:
-        value = 0.5 - min(volume_ratio * 0.05, 0.2)
-    else:
-        value = 0.5
-
-    confidence = min(volume_ratio / 3, 1.0)
-    direction = "bullish" if value > 0.5 else "bearish" if value < 0.5 else "neutral"
-
-    return Signal(
-        name="volume",
-        value=float(value),
-        confidence=float(confidence),
-        direction=direction,
-        metadata={"volume_ratio": float(volume_ratio), "recent_return": float(recent_return)},
-    )
+from bot.signals.odds_api import OddsCache
 
 
 def order_book_imbalance_signal(snapshot: MarketSnapshot, config: SignalConfig) -> Signal:
-    """
-    Order book imbalance: ratio of bid depth to ask depth.
+    """Order book imbalance: ratio of bid depth to ask depth.
+
     More bids than asks = buying pressure = bullish.
+    Uses order book data already fetched from the US API.
     """
     ob = snapshot.order_book
     bid_depth = ob.bid_depth
@@ -129,87 +40,162 @@ def order_book_imbalance_signal(snapshot: MarketSnapshot, config: SignalConfig) 
     )
 
 
-def mean_reversion_signal(snapshot: MarketSnapshot, config: SignalConfig) -> Signal:
+def line_movement_signal(snapshot: MarketSnapshot, config: SignalConfig) -> Signal:
+    """Line movement: detect significant price changes from opening line.
+
+    If the price has moved significantly in one direction, that movement
+    carries information — the market is pricing in new information.
+    Uses the difference between current price and mid-range (0.5) as a proxy
+    for line movement, since we don't have historical opening prices.
+    Markets far from 0.5 have already moved and carry strong consensus.
     """
-    Mean reversion: z-score of current price vs rolling mean.
-    Extreme z-scores suggest price will revert toward the mean.
-    """
-    window = config.mean_reversion_window
-    prices = snapshot.price_history[-window:] if len(snapshot.price_history) >= window else snapshot.price_history
+    price = snapshot.price
 
-    if len(prices) < 5:
-        return Signal(name="mean_reversion", value=0.5, confidence=0.0, direction="neutral")
+    # How far from 50/50 — measures how much the line has moved
+    distance_from_even = abs(price - 0.5)
 
-    arr = np.array(prices, dtype=float)
-    mean = arr.mean()
-    std = arr.std()
+    if distance_from_even < 0.05:
+        # Near 50/50 — no strong line movement signal
+        return Signal(name="line_movement", value=0.5, confidence=0.1, direction="neutral")
 
-    if std < 1e-8:
-        return Signal(name="mean_reversion", value=0.5, confidence=0.0, direction="neutral")
-
-    z_score = (snapshot.price - mean) / std
-
-    # If price is above mean (positive z), expect reversion down -> bearish
-    # If price is below mean (negative z), expect reversion up -> bullish
-    # Only signal when z exceeds threshold
-    z_threshold = config.mean_reversion_z_threshold
-
-    if abs(z_score) < z_threshold * 0.5:
-        value = 0.5
-        confidence = 0.1
-        direction = "neutral"
-    elif z_score > 0:
-        # Price above mean, expect down
-        value = 0.5 - min(z_score * 0.1, 0.25)
-        confidence = min(abs(z_score) / (z_threshold * 2), 1.0)
-        direction = "bearish"
-    else:
-        # Price below mean, expect up
-        value = 0.5 + min(abs(z_score) * 0.1, 0.25)
-        confidence = min(abs(z_score) / (z_threshold * 2), 1.0)
+    # Strong favorites (price > 0.7 or < 0.3) have had significant line movement
+    # The signal says: trust the direction the line has moved
+    if price > 0.5:
+        # Line has moved toward YES — bullish
+        value = 0.5 + min(distance_from_even * 0.4, 0.2)
         direction = "bullish"
+    else:
+        # Line has moved toward NO — bearish
+        value = 0.5 - min(distance_from_even * 0.4, 0.2)
+        direction = "bearish"
+
+    confidence = min(distance_from_even * 2, 0.9)
 
     return Signal(
-        name="mean_reversion",
+        name="line_movement",
         value=float(value),
         confidence=float(confidence),
         direction=direction,
-        metadata={"z_score": float(z_score), "mean": float(mean), "std": float(std)},
+        metadata={"price": float(price), "distance_from_even": float(distance_from_even)},
     )
 
 
-def volatility_signal(snapshot: MarketSnapshot, config: SignalConfig) -> Signal:
+def odds_value_signal(
+    snapshot: MarketSnapshot,
+    config: SignalConfig,
+    odds_cache: Optional[OddsCache] = None,
+) -> Signal:
+    """Compare Polymarket price to consensus odds from major sportsbooks.
+
+    This is the most important signal. If external books have a team at 55%
+    but Polymarket has them at 40%, that's real edge.
+
+    Returns confidence=0 if no external odds are available, which blocks the trade.
     """
-    Volatility signal: recent return volatility.
-    High volatility = uncertainty = lower confidence in current price.
-    """
-    lookback = config.volatility_lookback
-    prices = snapshot.price_history[-lookback:] if len(snapshot.price_history) >= lookback else snapshot.price_history
+    if not odds_cache or not odds_cache.enabled:
+        return Signal(name="odds_value", value=0.5, confidence=0.0, direction="neutral",
+                      metadata={"reason": "no_odds_api_key"})
 
-    if len(prices) < 3:
-        return Signal(name="volatility", value=0.5, confidence=0.0, direction="neutral")
+    result = odds_cache.get_probability_for_slug(snapshot.slug)
+    if result is None:
+        return Signal(name="odds_value", value=0.5, confidence=0.0, direction="neutral",
+                      metadata={"reason": "no_matching_event"})
 
-    arr = np.array(prices, dtype=float)
-    returns = np.diff(arr) / arr[:-1]
-    returns = returns[np.isfinite(returns)]
+    consensus_prob, num_books = result
 
-    if len(returns) == 0:
-        return Signal(name="volatility", value=0.5, confidence=0.0, direction="neutral")
+    if num_books < 3:
+        return Signal(name="odds_value", value=0.5, confidence=0.0, direction="neutral",
+                      metadata={"reason": f"only_{num_books}_books", "consensus": consensus_prob})
 
-    vol = float(np.std(returns))
+    polymarket_price = snapshot.price
+    edge = consensus_prob - polymarket_price
 
-    # High volatility -> price is uncertain -> stay closer to 0.5
-    # Low volatility -> price is stable -> current price is more likely fair
-    # This signal doesn't have a directional bias, it modulates confidence
-    value = 0.5  # Neutral directional value
+    # The signal value IS the consensus probability — what the market "should" be priced at
+    value = max(0.01, min(0.99, consensus_prob))
 
-    # Confidence is inverse of volatility (stable markets = more confident in other signals)
-    confidence = float(np.clip(1.0 - vol * 5, 0.1, 1.0))
+    # Confidence scales with number of books and size of edge
+    confidence = min(num_books / 5, 1.0) * min(abs(edge) * 5, 1.0)
+    confidence = max(0.1, min(confidence, 1.0))
+
+    direction = "bullish" if edge > 0.02 else "bearish" if edge < -0.02 else "neutral"
 
     return Signal(
-        name="volatility",
+        name="odds_value",
         value=float(value),
         confidence=float(confidence),
-        direction="neutral",
-        metadata={"volatility": float(vol)},
+        direction=direction,
+        metadata={
+            "consensus_prob": float(consensus_prob),
+            "polymarket_price": float(polymarket_price),
+            "edge": float(edge),
+            "num_books": num_books,
+        },
+    )
+
+
+def liquidity_imbalance_signal(snapshot: MarketSnapshot, config: SignalConfig) -> Signal:
+    """Liquidity imbalance: asymmetry in order book depth suggests informed money.
+
+    Heavy liquidity on the bid side with thin asks suggests smart money
+    is accumulating YES. The opposite suggests smart money is selling.
+
+    Different from order_book_imbalance: this focuses on the ratio of
+    top-of-book depth (top 3 levels) vs total depth to detect concentrated
+    informed orders vs distributed retail flow.
+    """
+    ob = snapshot.order_book
+    bids = ob.bids
+    asks = ob.asks
+
+    if not bids or not asks:
+        return Signal(name="liquidity_imbalance", value=0.5, confidence=0.0, direction="neutral")
+
+    # Top-of-book depth (first 3 levels)
+    top_bid_depth = sum(level.size for level in bids[:3])
+    top_ask_depth = sum(level.size for level in asks[:3])
+    total_top = top_bid_depth + top_ask_depth
+
+    if total_top == 0:
+        return Signal(name="liquidity_imbalance", value=0.5, confidence=0.0, direction="neutral")
+
+    # Full depth
+    full_bid = ob.bid_depth
+    full_ask = ob.ask_depth
+    total_full = full_bid + full_ask
+
+    # Concentration ratio: what fraction of total depth is at the top?
+    # High concentration at top of book = likely informed/institutional
+    bid_concentration = top_bid_depth / full_bid if full_bid > 0 else 0
+    ask_concentration = top_ask_depth / full_ask if full_ask > 0 else 0
+
+    # Imbalance of top-of-book
+    top_imbalance = top_bid_depth / total_top
+
+    # Value: shift based on where concentrated liquidity sits
+    if top_imbalance > 0.6 and bid_concentration > 0.5:
+        # Heavy concentrated bids = informed buying
+        value = 0.5 + min((top_imbalance - 0.5) * 0.5, 0.2)
+        direction = "bullish"
+    elif top_imbalance < 0.4 and ask_concentration > 0.5:
+        # Heavy concentrated asks = informed selling
+        value = 0.5 - min((0.5 - top_imbalance) * 0.5, 0.2)
+        direction = "bearish"
+    else:
+        value = 0.5
+        direction = "neutral"
+
+    confidence = min(total_top / 500, 0.8)
+
+    return Signal(
+        name="liquidity_imbalance",
+        value=float(value),
+        confidence=float(confidence),
+        direction=direction,
+        metadata={
+            "top_bid": float(top_bid_depth),
+            "top_ask": float(top_ask_depth),
+            "top_imbalance": float(top_imbalance),
+            "bid_concentration": float(bid_concentration),
+            "ask_concentration": float(ask_concentration),
+        },
     )

@@ -19,19 +19,23 @@ class SlackAlerter:
         self.enabled = enabled and bool(webhook_url)
 
     def _post(self, color: str, text: str):
-        """Post a color-coded attachment to Slack. Fails silently."""
+        """Post a color-coded attachment to Slack."""
         if not self.enabled:
             return
         try:
-            requests.post(self.webhook_url, json={
+            resp = requests.post(self.webhook_url, json={
                 "attachments": [{
                     "color": color,
                     "text": text,
                     "footer": "Polymarket Bot",
                 }]
             }, timeout=5)
-        except Exception:
-            pass
+            if resp.status_code != 200:
+                import sys
+                print(f"[SLACK ERROR] {resp.status_code}: {resp.text}", file=sys.stderr)
+        except Exception as e:
+            import sys
+            print(f"[SLACK EXCEPTION] {e}", file=sys.stderr)
 
     def send_test(self):
         """Send test messages for each color."""

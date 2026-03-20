@@ -1,63 +1,41 @@
-"""Combines all signals into probability estimates and detects edge."""
+"""Combines signals into probability estimates and detects edge."""
 
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Tuple
 from utils.models import MarketSnapshot, Signal, TradeSignal
 from utils.config import SignalConfig
 from bot.signals.signals import (
-    price_momentum_signal,
-    volume_signal,
     order_book_imbalance_signal,
-    mean_reversion_signal,
-    volatility_signal,
+    line_movement_signal,
+    odds_value_signal,
+    liquidity_imbalance_signal,
 )
-from bot.signals.unusual_whales import (
-    smart_money_signal,
-    whale_flow_signal,
-    market_sentiment_signal,
-)
+from bot.signals.odds_api import OddsCache
 
 
 class ProbabilityEstimator:
-    """
-    Combines all 8 signals into a single probability estimate.
-    Uses confidence-weighted averaging.
-    """
+    """Combines 4 signals into a single probability estimate."""
 
-    def __init__(self, config: SignalConfig):
+    def __init__(self, config: SignalConfig, odds_cache: Optional[OddsCache] = None):
         self.config = config
+        self.odds_cache = odds_cache
         self.weights = {
-            "price_momentum": config.price_momentum_weight,
-            "volume": config.volume_signal_weight,
             "order_book_imbalance": config.order_book_imbalance_weight,
-            "mean_reversion": config.mean_reversion_weight,
-            "volatility": config.volatility_signal_weight,
-            "smart_money": config.uw_smart_money_weight,
-            "whale_flow": config.uw_whale_flow_weight,
-            "market_sentiment": config.uw_market_sentiment_weight,
+            "line_movement": config.line_movement_weight,
+            "odds_value": config.odds_value_weight,
+            "liquidity_imbalance": config.liquidity_imbalance_weight,
         }
 
-    def compute_signals(
-        self, snapshot: MarketSnapshot, enrichment: Optional[Dict[str, Any]] = None
-    ) -> List[Signal]:
+    def compute_signals(self, snapshot: MarketSnapshot) -> List[Signal]:
         """Compute all signals for a market snapshot."""
-        signals = [
-            price_momentum_signal(snapshot, self.config),
-            volume_signal(snapshot, self.config),
+        return [
             order_book_imbalance_signal(snapshot, self.config),
-            mean_reversion_signal(snapshot, self.config),
-            volatility_signal(snapshot, self.config),
+            line_movement_signal(snapshot, self.config),
+            odds_value_signal(snapshot, self.config, self.odds_cache),
+            liquidity_imbalance_signal(snapshot, self.config),
         ]
 
-        # Add enrichment signals
-        signals.append(smart_money_signal(enrichment))
-        signals.append(whale_flow_signal(enrichment))
-        signals.append(market_sentiment_signal(enrichment))
-
-        return signals
-
     def estimate_probability(self, signals: List[Signal]) -> Tuple[float, float]:
-        """
-        Combine signals into a single probability estimate.
+        """Combine signals into a single probability estimate.
 
         Returns (estimated_probability, overall_confidence).
 
@@ -80,7 +58,6 @@ class ProbabilityEstimator:
         estimated_prob = weighted_sum / weight_sum
         estimated_prob = max(0.01, min(0.99, estimated_prob))
 
-        # Overall confidence: weighted average of individual confidences
         conf_sum = 0.0
         w_total = 0.0
         for signal in signals:
@@ -97,28 +74,48 @@ class ProbabilityEstimator:
         snapshot: MarketSnapshot,
         min_edge: float,
         max_edge: float,
-        enrichment: Optional[Dict[str, Any]] = None,
     ) -> Optional[TradeSignal]:
-        """
-        Run all signals, estimate probability, and detect if there's a tradeable edge.
+        """Run all signals, estimate probability, and detect tradeable edge.
 
-        Returns a TradeSignal if edge exceeds threshold, else None.
+        CRITICAL rules:
+        1. If odds_value has confidence=0 (no external odds), do NOT trade.
+        2. If odds-based edge < 2%, penalize all other signal confidences by 50%.
+        3. If odds-based edge < 3%, cap the combined edge at 3%.
         """
-        signals = self.compute_signals(snapshot, enrichment)
+        signals = self.compute_signals(snapshot)
+
+        # Gate: require external odds validation
+        odds_signal = next((s for s in signals if s.name == "odds_value"), None)
+        if odds_signal is None or odds_signal.confidence == 0:
+            return None
+
+        # Extract the raw odds edge
+        odds_edge = abs(odds_signal.metadata.get("edge", 0))
+
+        # Confidence penalty: if odds edge < 2%, halve confidence of non-odds signals
+        if odds_edge < 0.02:
+            for s in signals:
+                if s.name != "odds_value":
+                    s.confidence *= 0.5
+
         estimated_prob, confidence = self.estimate_probability(signals)
 
         # Edge = estimated probability - market price
         edge = estimated_prob - snapshot.price
 
-        # Check if edge exceeds thresholds
+        # Edge cap: combined edge cannot exceed odds edge + 1%
+        # This ensures other signals can add a small boost but not create edge from nothing
+        max_allowed_edge = odds_edge + 0.01
+        if abs(edge) > max_allowed_edge:
+            edge = max_allowed_edge if edge > 0 else -max_allowed_edge
+
         if abs(edge) < min_edge or abs(edge) > max_edge:
             return None
 
-        # Determine trade side
-        if edge > 0:
-            side = "buy"  # Underpriced -> buy
-        else:
-            side = "sell"  # Overpriced -> sell
+        side = "buy" if edge > 0 else "sell"
+
+        # Recompute estimated_prob from capped edge
+        estimated_prob = snapshot.price + edge
 
         return TradeSignal(
             market_id=snapshot.market_id,
@@ -127,7 +124,7 @@ class ProbabilityEstimator:
             estimated_prob=estimated_prob,
             market_price=snapshot.price,
             edge=edge,
-            position_size_usd=0.0,  # Filled by position sizer
+            position_size_usd=0.0,
             signals=signals,
             timestamp=snapshot.timestamp,
             slug=snapshot.slug,

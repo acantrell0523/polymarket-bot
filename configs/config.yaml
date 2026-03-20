@@ -51,7 +51,7 @@ wallet:
 # --- Trading Parameters ---
 trading:
   # Minimum edge (estimated_prob - market_price) to trigger a trade
-  min_edge_threshold: 0.02  # 2% (aggressive - catches more opportunities)
+  min_edge_threshold: 0.03  # 3% minimum edge required
   # Maximum edge — reject outliers that may indicate bad data
   max_edge_threshold: 0.40  # 40%
   # Position sizing method: "kelly" or "fixed_fractional"
@@ -75,31 +75,20 @@ trading:
   # Maximum number of concurrent open positions
   max_open_positions: 20
   # Paper trading mode (no real orders submitted)
-  paper_trading: false
+  paper_trading: true
 
 # --- Signal Weights ---
-# Weights for combining signals into a probability estimate.
-# Must sum to 1.0. Set a weight to 0 to disable that signal.
+# Weights must sum to 1.0. All signals use Polymarket US API or external odds data.
+# CRITICAL: odds_value requires THE_ODDS_API_KEY in .env. No external odds = no trade.
 signals:
-  # --- Core signals (work without any external API) ---
-  price_momentum_weight: 0.20
-  volume_signal_weight: 0.15
-  order_book_imbalance_weight: 0.25
-  mean_reversion_weight: 0.10
-  volatility_signal_weight: 0.05
-  # --- Unusual Whales signals (require UW API key) ---
-  # When UW is disabled, set these to 0 and redistribute to core signals above.
-  # When UW is enabled, these add smart money/whale/sentiment data.
-  uw_smart_money_weight: 0.10     # Prediction market smart money positioning
-  uw_whale_flow_weight: 0.10      # Whale accumulation and unusual activity
-  uw_market_sentiment_weight: 0.05 # Macro market tide from options flow
-  # Lookback windows (number of data points)
-  momentum_lookback: 20
-  volume_lookback: 10
-  volatility_lookback: 30
-  # Mean reversion parameters
-  mean_reversion_window: 50
-  mean_reversion_z_threshold: 1.5
+  # Consensus odds from major sportsbooks vs Polymarket price (primary signal)
+  odds_value_weight: 0.45
+  # Order book bid/ask depth ratio from US API
+  order_book_imbalance_weight: 0.20
+  # How far the current price has moved from 50/50
+  line_movement_weight: 0.20
+  # Top-of-book depth concentration detecting informed flow
+  liquidity_imbalance_weight: 0.15
 
 # --- Market Filters ---
 filters:

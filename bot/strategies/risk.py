@@ -1,9 +1,11 @@
 """Risk management: stop-loss, take-profit, daily loss limit."""
 
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from utils.models import Position
 from utils.config import TradingConfig
+
+MIN_HOLD_SECONDS = 60  # Minimum time before take-profit can trigger
 
 
 class RiskManager:
@@ -55,9 +57,19 @@ class RiskManager:
             return "stop_loss"
 
         # Take-profit: close when price converges to estimated fair value
+        # Only after minimum hold time to prevent immediate exit on entry
         edge_remaining = abs(estimated_prob - current_price)
         if edge_remaining <= self.config.take_profit_threshold:
-            return "take_profit"
+            if position.entry_time:
+                now = datetime.now(timezone.utc)
+                entry = position.entry_time
+                if entry.tzinfo is None:
+                    entry = entry.replace(tzinfo=timezone.utc)
+                held_seconds = (now - entry).total_seconds()
+                if held_seconds >= MIN_HOLD_SECONDS:
+                    return "take_profit"
+            else:
+                return "take_profit"
 
         # Position resolved: price hit 0 or 1
         if current_price <= 0.01 or current_price >= 0.99:

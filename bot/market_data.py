@@ -273,17 +273,13 @@ class MarketDataClient:
             if market_sides:
                 token_id = market_sides[0].get("identifier", "")
 
-            # Fetch order book from US API first, fall back to CLOB
+            # Fetch order book from US API
             order_book = self.get_us_order_book(slug)
-            if order_book.bid_depth == 0 and order_book.ask_depth == 0 and token_id:
-                order_book = self.get_order_book(token_id)
 
-            # Fetch price history from CLOB if we have a token_id
-            price_history = []
-            if token_id:
-                price_history = self.get_price_history(token_id)
+            # No price history needed — signals use order book and external odds
+            price_history = [price]
 
-            # Skip markets that have no price history AND no order book data
+            # Skip markets with no order book data
             has_order_book = order_book.bid_depth > 0 or order_book.ask_depth > 0
             if not price_history and not has_order_book:
                 return None

@@ -48,19 +48,10 @@ class TradingConfig:
 
 @dataclass
 class SignalConfig:
-    price_momentum_weight: float = 0.20
-    volume_signal_weight: float = 0.15
-    order_book_imbalance_weight: float = 0.25
-    mean_reversion_weight: float = 0.10
-    volatility_signal_weight: float = 0.05
-    uw_smart_money_weight: float = 0.10
-    uw_whale_flow_weight: float = 0.10
-    uw_market_sentiment_weight: float = 0.05
-    momentum_lookback: int = 20
-    volume_lookback: int = 10
-    volatility_lookback: int = 30
-    mean_reversion_window: int = 50
-    mean_reversion_z_threshold: float = 1.5
+    order_book_imbalance_weight: float = 0.20
+    line_movement_weight: float = 0.20
+    odds_value_weight: float = 0.45
+    liquidity_imbalance_weight: float = 0.15
 
 
 @dataclass
@@ -150,6 +141,7 @@ class BotConfig:
     reporting: ReportingConfig = field(default_factory=ReportingConfig)
     alerts: AlertConfig = field(default_factory=AlertConfig)
     private_key: str = ""
+    odds_api_key: str = ""
 
 
 def _apply_dict(obj, d: Dict[str, Any]):
@@ -218,5 +210,8 @@ def load_config(config_path: str = "configs/config.yaml", env_path: str = ".env"
     env_webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
     if env_webhook:
         config.alerts.slack_webhook_url = env_webhook
+
+    # Load The Odds API key from environment
+    config.odds_api_key = os.environ.get("THE_ODDS_API_KEY", "")
 
     return config

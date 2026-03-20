@@ -32,7 +32,6 @@ class TradingBot:
             console=config.logging.console,
         )
         self.market_data = MarketDataClient(config.api, self.logger, config.filters)
-        self.estimator = ProbabilityEstimator(config.signals)
         self.sizer = PositionSizer(config.trading)
         self.risk = RiskManager(config.trading)
         self.executor = ExecutionEngine(config, self.logger)
@@ -40,6 +39,21 @@ class TradingBot:
             webhook_url=config.alerts.slack_webhook_url,
             enabled=config.alerts.enabled,
         )
+
+        # Initialize odds cache for external odds comparison
+        from bot.signals.odds_api import OddsCache
+        self.odds_cache = OddsCache(
+            api_key=config.odds_api_key,
+            cache_ttl=300,
+        )
+        if not self.odds_cache.enabled:
+            self.logger.warning("odds_api_disabled", {
+                "message": "THE_ODDS_API_KEY not set — bot will not trade (no external validation)"
+            })
+
+        # Estimator with odds cache
+        self.estimator = ProbabilityEstimator(config.signals, self.odds_cache)
+
         # Fetch real balance from exchange for live mode
         initial_bankroll = config.backtest.initial_bankroll_usd
         if not config.trading.paper_trading and self.executor._client:
@@ -60,45 +74,23 @@ class TradingBot:
         )
         self.running = True
 
-        # Live-game estimator with aggressive signal weights
+        # Live-game estimator with aggressive weights
         live_signal_config = copy.deepcopy(config.signals)
-        live_signal_config.order_book_imbalance_weight = 0.35
-        live_signal_config.price_momentum_weight = 0.30
-        live_signal_config.volume_signal_weight = 0.10
-        live_signal_config.mean_reversion_weight = 0.08
-        live_signal_config.volatility_signal_weight = 0.02
-        live_signal_config.uw_smart_money_weight = 0.07
-        live_signal_config.uw_whale_flow_weight = 0.05
-        live_signal_config.uw_market_sentiment_weight = 0.03
-        self.live_estimator = ProbabilityEstimator(live_signal_config)
+        live_signal_config.odds_value_weight = 0.40
+        live_signal_config.order_book_imbalance_weight = 0.25
+        live_signal_config.line_movement_weight = 0.15
+        live_signal_config.liquidity_imbalance_weight = 0.20
+        self.live_estimator = ProbabilityEstimator(live_signal_config, self.odds_cache)
 
         # Live-game trading overrides
         self.live_min_edge = 0.015
         self.live_take_profit = 0.03
         self.live_scan_interval = 3
-        self.full_scan_interval = 60  # full market scan every 60s
+        self.full_scan_interval = 60
 
         # Cached market list from last full scan
         self._cached_markets: List[Dict] = []
         self._last_full_scan = 0.0
-
-        # On-chain enrichment client (optional)
-        self.onchain_client = None
-        if config.onchain.enabled:
-            try:
-                sys.path.insert(0, ".")
-                from onchain import OnChainEnrichmentClient
-                self.onchain_client = OnChainEnrichmentClient(
-                    clob_url=config.api.clob_url,
-                    gamma_url=config.api.gamma_url,
-                    logger=self.logger,
-                    max_rps=config.onchain.max_requests_per_second,
-                    cache_ttl=config.onchain.cache_ttl_seconds,
-                )
-            except ImportError:
-                self.logger.warning("onchain_import_failed", {
-                    "message": "OnChainEnrichmentClient not available, running without enrichment"
-                })
 
     def _check_supervisor_flags(self) -> bool:
         """Check if supervisor has halted or paused trading. Returns True if OK to trade."""
@@ -121,15 +113,6 @@ class TradingBot:
             except Exception:
                 os.remove(pause_path)
         return True
-
-    def _should_enrich(self, has_edge: bool) -> bool:
-        if not self.onchain_client:
-            return False
-        if self.config.onchain.enrich_all_markets:
-            return True
-        if self.config.onchain.enrich_on_edge_only and has_edge:
-            return True
-        return False
 
     def _is_live_market(self, market: Dict) -> bool:
         """Check if a market's game is currently in progress."""
@@ -167,16 +150,12 @@ class TradingBot:
             max_edge=self.config.trading.max_edge_threshold,
         )
 
-        if self._should_enrich(trade_signal is not None) and trade_signal is not None:
-            enrichment = self.onchain_client.get_enrichment_for_market(snapshot)
-            trade_signal = estimator.detect_edge(
-                snapshot,
-                min_edge=min_edge,
-                max_edge=self.config.trading.max_edge_threshold,
-                enrichment=enrichment,
-            )
-
         if trade_signal is None:
+            return
+
+        # Skip if we already have a position on this market
+        slug = snapshot.slug
+        if any(p.slug == slug for p in self.portfolio.get_open_positions()):
             return
 
         if not self.risk.can_open_position(self.portfolio.positions):
