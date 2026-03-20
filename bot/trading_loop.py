@@ -38,8 +38,20 @@ class TradingBot:
             webhook_url=config.alerts.slack_webhook_url,
             enabled=config.alerts.enabled,
         )
+        # Fetch real balance from exchange for live mode
+        initial_bankroll = config.backtest.initial_bankroll_usd
+        if not config.trading.paper_trading and self.executor._client:
+            try:
+                bal = self.executor._client.account.balances()
+                balances = bal.get("balances", [])
+                if balances:
+                    initial_bankroll = float(balances[0].get("currentBalance", initial_bankroll))
+                    self.logger.info("bankroll_from_exchange", {"balance": initial_bankroll})
+            except Exception as e:
+                self.logger.warning("bankroll_fetch_failed", {"error": str(e)})
+
         self.portfolio = Portfolio(
-            initial_bankroll=config.backtest.initial_bankroll_usd,
+            initial_bankroll=initial_bankroll,
             logger=self.logger,
             alerter=self.alerter,
             alert_config=config.alerts,
@@ -231,6 +243,56 @@ class TradingBot:
         if has_live_games:
             self.risk.config.take_profit_threshold = original_tp
 
+    def sync_from_exchange(self):
+        """Rebuild internal position state from the exchange's actual positions."""
+        exchange_positions = self.executor.get_exchange_positions()
+        if not exchange_positions:
+            self.logger.warning("sync_no_exchange_positions", {
+                "message": "No positions returned from exchange"
+            })
+            return
+
+        # Clear existing internal positions
+        old_count = len(self.portfolio.get_open_positions())
+        self.portfolio.positions = []
+
+        from utils.models import Position
+        for slug, p_data in exchange_positions.items():
+            net = int(p_data.get("netPosition", "0"))
+            if net == 0:
+                continue
+
+            cost_val = float(p_data.get("cost", {}).get("value", "0"))
+            cash_val = float(p_data.get("cashValue", {}).get("value", "0"))
+            qty = abs(net)
+            entry_price = cost_val / qty if qty > 0 else 0
+            current_price_est = cash_val / qty if qty > 0 else entry_price
+            side = "buy" if net > 0 else "sell"
+
+            meta = p_data.get("marketMetadata", {})
+            title = meta.get("title", slug)
+
+            position = Position(
+                market_id=slug,
+                token_id=slug,
+                side=side,
+                entry_price=entry_price,
+                size_usd=cost_val,
+                quantity=qty,
+                estimated_prob=0.5,
+                entry_time=datetime.now(timezone.utc),
+                current_price=current_price_est,
+                slug=slug,
+            )
+            self.portfolio.positions.append(position)
+
+        new_count = len(self.portfolio.get_open_positions())
+        self.logger.info("sync_complete", {
+            "old_internal_positions": old_count,
+            "exchange_positions": len(exchange_positions),
+            "synced_positions": new_count,
+        })
+
     def _do_full_scan(self) -> List[Dict]:
         """Full market scan — fetches all markets, processes everything."""
         markets = self.market_data.get_active_markets()
@@ -293,6 +355,11 @@ class TradingBot:
         print(f"  Full scan: {self.full_scan_interval}s (all markets)")
         print(f"  Edge threshold: {self.config.trading.min_edge_threshold*100:.1f}% "
               f"(live: {self.live_min_edge*100:.1f}%)")
+
+        # Sync internal state from exchange
+        if not self.config.trading.paper_trading:
+            print("  Syncing positions from exchange...")
+            self.sync_from_exchange()
 
         # Log open positions
         self._log_open_positions()

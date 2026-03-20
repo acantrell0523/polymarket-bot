@@ -61,7 +61,7 @@ trading:
   # Kelly fraction multiplier (use half-Kelly for safety)
   kelly_fraction: 0.5
   # Maximum position size in USDC per single trade
-  max_position_size_usd: 20.0
+  max_position_size_usd: 10.0
   # Minimum position size in USDC (below this, skip the trade)
   min_position_size_usd: 1.0
   # Maximum total portfolio exposure in USDC across all open positions
@@ -73,7 +73,7 @@ trading:
   # Daily loss limit in USDC — halt all trading when breached
   daily_loss_limit_usd: 200.0
   # Maximum number of concurrent open positions
-  max_open_positions: 40
+  max_open_positions: 20
   # Paper trading mode (no real orders submitted)
   paper_trading: false
 

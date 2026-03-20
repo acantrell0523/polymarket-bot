@@ -137,20 +137,46 @@ class ExecutionEngine:
                 "type": "ORDER_TYPE_LIMIT",
                 "price": {"value": str(price), "currency": "USD"},
                 "quantity": quantity,
-                "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL",
+                "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
             })
 
-            # Estimate fees (taker)
+            # Check if the order actually filled
+            order_id = None
+            executions = []
+            if isinstance(result, dict):
+                order_id = result.get("id", "")
+                executions = result.get("executions", [])
+
+            if not executions:
+                # Order submitted but nothing filled — do NOT create a position
+                if self.logger:
+                    self.logger.warning("live_trade_no_fill", {
+                        "market_id": signal.market_id,
+                        "slug": market_slug,
+                        "side": signal.side,
+                        "price": price,
+                        "quantity": quantity,
+                        "order_id": order_id,
+                        "message": "IOC order got no fills, no position created",
+                    })
+                return None
+
+            # Order filled (fully or partially)
+            filled_qty = sum(int(e.get("quantity", e.get("qty", 0))) for e in executions)
+            if filled_qty <= 0:
+                filled_qty = quantity  # fallback if execution format differs
+
+            filled_size = filled_qty * price
             fee_rate = 0.02
-            fees = size_usd * fee_rate
+            fees = filled_size * fee_rate
 
             trade = Trade(
                 market_id=signal.market_id,
                 token_id=signal.token_id,
                 side=signal.side,
                 price=price,
-                quantity=quantity,
-                size_usd=size_usd,
+                quantity=filled_qty,
+                size_usd=filled_size,
                 timestamp=signal.timestamp or datetime.now(timezone.utc),
                 trade_type=trade_type,
                 fees=fees,
@@ -159,16 +185,18 @@ class ExecutionEngine:
             )
 
             if self.logger:
-                self.logger.info("live_trade_executed", {
+                self.logger.info("live_trade_filled", {
                     "market_id": signal.market_id,
                     "slug": market_slug,
                     "side": signal.side,
                     "intent": intent,
                     "price": price,
-                    "size_usd": size_usd,
-                    "quantity": quantity,
+                    "requested_qty": quantity,
+                    "filled_qty": filled_qty,
+                    "size_usd": filled_size,
                     "edge": signal.edge,
-                    "order_result": str(result),
+                    "order_id": order_id,
+                    "executions": len(executions),
                 })
 
             return trade
@@ -181,6 +209,18 @@ class ExecutionEngine:
                     "error": str(e),
                 })
             return None
+
+    def get_exchange_positions(self) -> dict:
+        """Fetch actual positions from the exchange. Returns {slug: position_data}."""
+        if not self._client:
+            return {}
+        try:
+            result = self._client.portfolio.positions()
+            return result.get("positions", {}) if isinstance(result, dict) else {}
+        except Exception as e:
+            if self.logger:
+                self.logger.error("fetch_exchange_positions_failed", {"error": str(e)})
+            return {}
 
     def close_position(self, position: Position) -> bool:
         """Close a position by selling via the Polymarket US SDK.
@@ -221,10 +261,20 @@ class ExecutionEngine:
             return True
 
         except Exception as e:
+            err_str = str(e)
             if self.logger:
                 self.logger.error("close_position_failed", {
                     "market_id": position.market_id,
                     "slug": slug,
-                    "error": str(e),
+                    "error": err_str,
                 })
+            # If position doesn't exist on exchange, return True so
+            # the bot marks it as closed internally and stops retrying
+            if "not found" in err_str.lower() or "no position" in err_str.lower():
+                if self.logger:
+                    self.logger.warning("close_position_not_on_exchange", {
+                        "slug": slug,
+                        "message": "Position not on exchange, marking as abandoned",
+                    })
+                return True
             return False
