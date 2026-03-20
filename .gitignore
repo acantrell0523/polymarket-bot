@@ -1,0 +1,23 @@
+# Environment and secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+
+# Test and cache
+.pytest_cache/
+
+# Generated outputs
+reports/
+data/historical/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Claude Code
+.claude/
