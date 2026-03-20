@@ -159,21 +159,74 @@ class TradingBot:
         if trade:
             self.portfolio.open_position(trade_signal, trade)
 
-    def check_positions(self, has_live_games: bool = False):
-        """Check all open positions for stop-loss/take-profit."""
+    def check_positions(self, has_live_games: bool = False, cycle: int = 0):
+        """Check all open positions: fetch live prices, check risk, close via API."""
         original_tp = self.risk.config.take_profit_threshold
         if has_live_games:
             self.risk.config.take_profit_threshold = self.live_take_profit
 
-        for position in self.portfolio.get_open_positions():
+        open_positions = self.portfolio.get_open_positions()
+        log_diagnostics = (cycle % 10 == 0) and cycle > 0 and open_positions
+
+        for position in open_positions:
+            # Fetch live price from the exchange
+            slug = position.slug or position.market_id
+            live_price = self.market_data.get_live_price(slug)
+
+            if live_price is not None:
+                position.current_price = live_price
+            # If we can't get a price, keep the last known price
+
+            # Compute unrealized P&L for diagnostics
+            if position.side == "buy":
+                pnl_per_unit = position.current_price - position.entry_price
+            else:
+                pnl_per_unit = position.entry_price - position.current_price
+            pnl_pct = pnl_per_unit / position.entry_price if position.entry_price > 0 else 0
+            edge_remaining = abs(position.estimated_prob - position.current_price)
+
+            # Log diagnostics every 10th cycle
+            if log_diagnostics:
+                would_sl = pnl_pct <= -self.risk.config.stop_loss_threshold
+                would_tp = edge_remaining <= self.risk.config.take_profit_threshold
+                self.logger.info("position_check", {
+                    "slug": slug,
+                    "side": position.side,
+                    "entry": position.entry_price,
+                    "current": position.current_price,
+                    "pnl_pct": round(pnl_pct * 100, 1),
+                    "edge_remaining": round(edge_remaining * 100, 1),
+                    "sl_threshold": self.risk.config.stop_loss_threshold,
+                    "tp_threshold": self.risk.config.take_profit_threshold,
+                    "would_stop_loss": would_sl,
+                    "would_take_profit": would_tp,
+                })
+
+            # Check risk thresholds
             close_reason = self.risk.check_position(
                 position, position.current_price, position.estimated_prob
             )
             if close_reason:
-                self.portfolio.close_position(
-                    position, position.current_price, close_reason
-                )
-                self.risk.record_pnl(position.realized_pnl)
+                # Submit close order to the exchange
+                closed_on_exchange = self.executor.close_position(position)
+                if closed_on_exchange:
+                    self.portfolio.close_position(
+                        position, position.current_price, close_reason
+                    )
+                    self.risk.record_pnl(position.realized_pnl)
+                    self.logger.info("position_exit_complete", {
+                        "slug": slug,
+                        "reason": close_reason,
+                        "entry": position.entry_price,
+                        "exit": position.current_price,
+                        "pnl": round(position.realized_pnl, 2),
+                    })
+                else:
+                    self.logger.error("position_exit_failed", {
+                        "slug": slug,
+                        "reason": close_reason,
+                        "message": "Close order failed on exchange, position remains open",
+                    })
 
         if has_live_games:
             self.risk.config.take_profit_threshold = original_tp
@@ -286,7 +339,7 @@ class TradingBot:
                             self.process_market(snapshot)
 
                     has_live = len(live_markets) > 0
-                    self.check_positions(has_live)
+                    self.check_positions(has_live, cycle=cycle)
                     self.portfolio.record_equity()
 
                     stats = self.portfolio.get_stats()
@@ -312,7 +365,7 @@ class TradingBot:
                         })
 
                         self._do_live_scan(live_markets)
-                        self.check_positions(has_live_games=True)
+                        self.check_positions(has_live_games=True, cycle=cycle)
 
                         self.logger.info("live_scan_complete", {
                             "cycle": cycle,

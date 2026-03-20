@@ -97,6 +97,7 @@ class Position:
     close_price: float = 0.0
     close_time: Optional[datetime] = None
     realized_pnl: float = 0.0
+    slug: str = ""
 
 
 @dataclass

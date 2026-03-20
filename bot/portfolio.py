@@ -33,6 +33,7 @@ class Portfolio:
             estimated_prob=signal.estimated_prob,
             entry_time=trade.timestamp,
             current_price=trade.price,
+            slug=signal.slug,
         )
 
         self.positions.append(position)

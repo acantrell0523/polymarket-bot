@@ -138,6 +138,25 @@ class MarketDataClient:
         except (ValueError, TypeError):
             return None
 
+    def get_live_price(self, slug: str) -> Optional[float]:
+        """Fetch current price for a market via the BBO endpoint."""
+        url = f"{self.us_api_url}/v1/markets/{slug}/bbo"
+        data = self._get(url)
+        if not data or not isinstance(data, dict):
+            return None
+        market_data = data.get("marketData", data)
+        # Try lastTradePx first, then currentPx
+        for field in ("lastTradePx", "currentPx"):
+            px = market_data.get(field)
+            if px and isinstance(px, dict):
+                try:
+                    val = float(px.get("value", 0))
+                    if val > 0:
+                        return val
+                except (ValueError, TypeError):
+                    pass
+        return None
+
     def get_us_order_book(self, slug: str) -> OrderBook:
         """Fetch order book from Polymarket US API."""
         url = f"{self.us_api_url}/v1/markets/{slug}/book"

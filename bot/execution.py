@@ -3,7 +3,7 @@
 import os
 from datetime import datetime, timezone
 from typing import Optional
-from utils.models import Trade, TradeSignal
+from utils.models import Trade, TradeSignal, Position
 from utils.config import BotConfig, TradingConfig
 from utils.logger import TradingLogger
 
@@ -181,3 +181,50 @@ class ExecutionEngine:
                     "error": str(e),
                 })
             return None
+
+    def close_position(self, position: Position) -> bool:
+        """Close a position by selling via the Polymarket US SDK.
+
+        Returns True if the close order was submitted successfully.
+        """
+        slug = position.slug or position.market_id
+
+        if self.config.paper_trading:
+            if self.logger:
+                self.logger.info("paper_position_closed", {
+                    "market_id": position.market_id,
+                    "slug": slug,
+                    "side": position.side,
+                })
+            return True
+
+        if not self._client:
+            if self.logger:
+                self.logger.error("close_position_no_client", {
+                    "message": "Polymarket US SDK not initialized"
+                })
+            return False
+
+        try:
+            result = self._client.orders.close_position({
+                "marketSlug": slug,
+            })
+
+            if self.logger:
+                self.logger.info("live_position_closed", {
+                    "market_id": position.market_id,
+                    "slug": slug,
+                    "side": position.side,
+                    "entry_price": position.entry_price,
+                    "order_result": str(result),
+                })
+            return True
+
+        except Exception as e:
+            if self.logger:
+                self.logger.error("close_position_failed", {
+                    "market_id": position.market_id,
+                    "slug": slug,
+                    "error": str(e),
+                })
+            return False
