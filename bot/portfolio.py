@@ -66,9 +66,22 @@ class Portfolio:
         return position
 
     def close_position(self, position: Position, current_price: float,
-                       reason: str, timestamp: Optional[datetime] = None) -> float:
+                       reason: str, timestamp: Optional[datetime] = None,
+                       exchange_pnl: Optional[float] = None) -> float:
         """
         Close a position and realize P&L.
+
+        For SHORT (sell) positions that resolve:
+          - We sold shares at entry_price, outcome went to 0 → we keep everything
+          - P&L = entry_price * quantity (minus fees)
+
+        For LONG (buy) positions that resolve:
+          - We bought shares at entry_price, outcome went to 1 → payout is quantity
+          - P&L = (1.0 - entry_price) * quantity (minus fees)
+
+        For non-resolved exits, P&L = price movement * quantity.
+
+        If exchange_pnl is provided (from the exchange API), use that as source of truth.
 
         Returns realized P&L.
         """
@@ -77,17 +90,50 @@ class Portfolio:
 
         close_time = timestamp or datetime.now(timezone.utc)
 
-        if position.side == "buy":
-            pnl_per_unit = current_price - position.entry_price
+        if exchange_pnl is not None:
+            # Exchange-reported P&L is the source of truth
+            realized_pnl = exchange_pnl
+            close_fees = 0.0  # already accounted for by exchange
+        elif reason == "resolved":
+            # Market resolved — settlement P&L
+            if current_price <= 0.01:
+                # Outcome resolved NO (price → 0)
+                if position.side == "sell":
+                    # SHORT wins: we sold at entry_price, outcome worth 0
+                    realized_pnl = position.entry_price * position.quantity
+                    close_fees = 0.0  # no trade on settlement
+                else:
+                    # LONG loses: we bought at entry_price, outcome worth 0
+                    realized_pnl = -position.entry_price * position.quantity
+                    close_fees = 0.0
+            elif current_price >= 0.99:
+                # Outcome resolved YES (price → 1)
+                if position.side == "buy":
+                    # LONG wins: payout = 1.0 per share, cost = entry_price
+                    realized_pnl = (1.0 - position.entry_price) * position.quantity
+                    close_fees = 0.0
+                else:
+                    # SHORT loses: we owe 1.0 per share, received entry_price
+                    realized_pnl = -(1.0 - position.entry_price) * position.quantity
+                    close_fees = 0.0
+            else:
+                # Resolved at an intermediate price (e.g., auto-settle)
+                if position.side == "buy":
+                    pnl_per_unit = current_price - position.entry_price
+                else:
+                    pnl_per_unit = position.entry_price - current_price
+                realized_pnl = pnl_per_unit * position.quantity
+                close_fees = 0.0  # settlement, no taker fee
         else:
-            pnl_per_unit = position.entry_price - current_price
-
-        realized_pnl = pnl_per_unit * position.quantity
-
-        # Close fees
-        close_value = current_price * position.quantity
-        close_fees = close_value * 0.02  # 2% taker fee
-        realized_pnl -= close_fees
+            # Active close (not resolved) — standard P&L
+            if position.side == "buy":
+                pnl_per_unit = current_price - position.entry_price
+            else:
+                pnl_per_unit = position.entry_price - current_price
+            realized_pnl = pnl_per_unit * position.quantity
+            close_value = current_price * position.quantity
+            close_fees = close_value * 0.02  # 2% taker fee
+            realized_pnl -= close_fees
 
         position.status = "closed"
         position.close_reason = reason
@@ -98,6 +144,7 @@ class Portfolio:
         self.bankroll += realized_pnl
 
         # Record exit trade
+        close_value = current_price * position.quantity
         exit_trade = Trade(
             market_id=position.market_id,
             token_id=position.token_id,
@@ -108,7 +155,7 @@ class Portfolio:
             timestamp=close_time,
             trade_type="exit",
             fees=close_fees,
-            is_paper=True,
+            is_paper=False,
         )
         self.trades.append(exit_trade)
 
@@ -116,9 +163,11 @@ class Portfolio:
             self.logger.info("position_closed", {
                 "market_id": position.market_id,
                 "reason": reason,
+                "side": position.side,
                 "entry_price": position.entry_price,
                 "close_price": current_price,
-                "pnl": realized_pnl,
+                "pnl": round(realized_pnl, 2),
+                "exchange_pnl": round(exchange_pnl, 2) if exchange_pnl is not None else None,
             })
 
         if self.alerter and self.alert_config and self.alert_config.on_trade_close:

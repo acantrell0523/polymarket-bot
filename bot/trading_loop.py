@@ -255,6 +255,78 @@ class TradingBot:
                 # Log edge snapshot for this trade
                 self._log_edge_entry(trade_signal, snapshot)
 
+    def _get_exchange_pnl(self, slug: str, position) -> Optional[float]:
+        """Get actual P&L from the exchange for a closed position.
+
+        Checks the exchange balance change or position settlement data.
+        Returns None if unavailable (falls back to bot calculation).
+        """
+        if not self.executor._client:
+            return None
+        try:
+            # Check if the position still exists on exchange
+            positions = self.executor.get_exchange_positions()
+            if slug in positions:
+                ex_pos = positions[slug]
+                cost = float(ex_pos.get("cost", {}).get("value", "0"))
+                cash_value = float(ex_pos.get("cashValue", {}).get("value", "0"))
+                net = int(ex_pos.get("netPosition", "0"))
+                if net == 0:
+                    # Position closed — P&L = cashValue - cost
+                    return cash_value - cost
+            # Position not on exchange anymore — it settled
+            # For resolved markets, calculate from known settlement
+            return None
+        except Exception:
+            return None
+
+    def _reconcile_pnl(self):
+        """Compare bot's internal P&L tracking to exchange balance.
+
+        Logs a warning if they differ by more than $1.
+        """
+        if not self.executor._client:
+            return
+        try:
+            bal = self.executor._client.account.balances()
+            balances = bal.get("balances", [])
+            if not balances:
+                return
+            exchange_balance = float(balances[0].get("currentBalance", 0))
+            bot_bankroll = self.portfolio.bankroll
+
+            # Get value of open positions
+            positions = self.executor.get_exchange_positions()
+            pos_value = 0.0
+            for slug, p in positions.items():
+                pos_value += float(p.get("cashValue", {}).get("value", "0"))
+
+            exchange_total = exchange_balance + pos_value
+            diff = abs(exchange_total - bot_bankroll)
+
+            if diff > 1.0:
+                self.logger.warning("pnl_reconciliation_mismatch", {
+                    "exchange_balance": round(exchange_balance, 2),
+                    "exchange_positions_value": round(pos_value, 2),
+                    "exchange_total": round(exchange_total, 2),
+                    "bot_bankroll": round(bot_bankroll, 2),
+                    "difference": round(diff, 2),
+                })
+                # Sync bankroll to exchange reality
+                self.portfolio.bankroll = exchange_total
+                self.logger.info("bankroll_synced_to_exchange", {
+                    "old": round(bot_bankroll, 2),
+                    "new": round(exchange_total, 2),
+                })
+            else:
+                self.logger.info("pnl_reconciliation_ok", {
+                    "exchange_total": round(exchange_total, 2),
+                    "bot_bankroll": round(bot_bankroll, 2),
+                    "diff": round(diff, 2),
+                })
+        except Exception as e:
+            self.logger.error("pnl_reconciliation_failed", {"error": str(e)})
+
     def _check_live_ncaa_edges(self):
         """Check live NCAA game odds for fast-moving edges.
 
@@ -407,16 +479,22 @@ class TradingBot:
                 # Submit close order to the exchange
                 closed_on_exchange = self.executor.close_position(position)
                 if closed_on_exchange:
+                    # Try to get exchange-reported P&L as source of truth
+                    exchange_pnl = self._get_exchange_pnl(slug, position)
+
                     self.portfolio.close_position(
-                        position, position.current_price, close_reason
+                        position, position.current_price, close_reason,
+                        exchange_pnl=exchange_pnl,
                     )
                     self.risk.record_pnl(position.realized_pnl)
                     self.logger.info("position_exit_complete", {
                         "slug": slug,
                         "reason": close_reason,
+                        "side": position.side,
                         "entry": position.entry_price,
                         "exit": position.current_price,
                         "pnl": round(position.realized_pnl, 2),
+                        "exchange_pnl": round(exchange_pnl, 2) if exchange_pnl is not None else None,
                     })
                     # Smart re-entry: loss = 10min cooldown, win (>$2) = immediate
                     import time as _time
@@ -606,6 +684,10 @@ class TradingBot:
                     has_live = len(live_markets) > 0
                     self.check_positions(has_live, cycle=cycle)
                     self.portfolio.record_equity()
+
+                    # P&L reconciliation every ~10 minutes (every 10th full scan)
+                    if cycle % 200 == 0 and cycle > 0:
+                        self._reconcile_pnl()
 
                     stats = self.portfolio.get_stats()
                     self.logger.info("full_scan_complete", {
