@@ -272,14 +272,27 @@ class ExecutionEngine:
                 sell_qty = abs(qty_available)
 
             # Submit aggressive IOC sell at $0.01 to sweep the book
-            result = self._client.orders.create({
-                "marketSlug": slug,
-                "intent": intent,
-                "type": "ORDER_TYPE_LIMIT",
-                "price": {"value": "0.01", "currency": "USD"},
-                "quantity": sell_qty,
-                "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
-            })
+            try:
+                result = self._client.orders.create({
+                    "marketSlug": slug,
+                    "intent": intent,
+                    "type": "ORDER_TYPE_LIMIT",
+                    "price": {"value": "0.01", "currency": "USD"},
+                    "quantity": sell_qty,
+                    "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+                })
+            except Exception as order_err:
+                err_msg = str(order_err).lower()
+                # Market resolved/closed — position will settle automatically
+                if any(k in err_msg for k in ("resolved", "closed", "settled", "not found", "inactive")):
+                    if self.logger:
+                        self.logger.info("close_position_market_resolved", {
+                            "slug": slug,
+                            "message": "Market resolved, position will auto-settle",
+                            "error": str(order_err),
+                        })
+                    return True
+                raise
 
             if self.logger:
                 self.logger.info("close_position_sell_submitted", {
@@ -296,6 +309,21 @@ class ExecutionEngine:
             if slug in remaining:
                 remaining_net = int(remaining[slug].get("netPosition", "0"))
                 if remaining_net != 0:
+                    # Check if the order had no executions — likely a resolved market
+                    executions = result.get("executions", []) if isinstance(result, dict) else []
+                    if not executions:
+                        self._close_failures = getattr(self, "_close_failures", {})
+                        self._close_failures[slug] = self._close_failures.get(slug, 0) + 1
+                        if self._close_failures[slug] >= 3:
+                            # 3 consecutive failed closes — market is resolved or illiquid
+                            if self.logger:
+                                self.logger.info("close_position_auto_settle", {
+                                    "slug": slug,
+                                    "attempts": self._close_failures[slug],
+                                    "message": "3 failed closes, marking as auto-settling",
+                                })
+                            del self._close_failures[slug]
+                            return True
                     if self.logger:
                         self.logger.warning("close_position_partial", {
                             "slug": slug,
