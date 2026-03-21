@@ -61,6 +61,12 @@ class TradingBot:
                 "message": "THE_ODDS_API_KEY not set — sports markets will not trade"
             })
 
+        self.logger.info("slack_alerter_status", {
+            "enabled": self.alerter.enabled,
+            "webhook_set": bool(self.alerter.webhook_url),
+            "webhook_len": len(self.alerter.webhook_url) if self.alerter.webhook_url else 0,
+        })
+
         # Estimator with all caches
         self.estimator = ProbabilityEstimator(
             config.signals, self.odds_cache, self.predictit_cache, self.crypto_cache,

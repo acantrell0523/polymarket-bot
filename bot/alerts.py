@@ -37,6 +37,10 @@ class SlackAlerter:
             import sys
             print(f"[SLACK EXCEPTION] {e}", file=sys.stderr)
 
+    def is_configured(self) -> bool:
+        """Check if Slack is properly configured."""
+        return self.enabled and bool(self.webhook_url)
+
     def send_test(self):
         """Send test messages for each color."""
         self._post(COLOR_GREEN, ":white_check_mark: *Test* — Green (trade closed, profit)")
