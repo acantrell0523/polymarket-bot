@@ -6,6 +6,7 @@ from utils.models import Position
 from utils.config import TradingConfig
 
 MIN_HOLD_SECONDS = 600  # 10 minutes — no exit under 10min except 25% stop-loss
+LET_IT_RIDE_THRESHOLD = 0.70  # When price hits 70%+, hold for full resolution payout
 
 
 class RiskManager:
@@ -93,6 +94,21 @@ class RiskManager:
 
         if held_seconds < MIN_HOLD_SECONDS:
             return None
+
+        # --- LET WINNERS RIDE ---
+        # If the current probability is 70%+ in our favor, hold for full
+        # resolution payout ($1.00/share) instead of cashing out early.
+        # Only stop-loss and resolved can override this.
+        is_riding = False
+        if position.side == "buy" and current_price >= LET_IT_RIDE_THRESHOLD:
+            is_riding = True
+        elif position.side == "sell" and current_price <= (1.0 - LET_IT_RIDE_THRESHOLD):
+            is_riding = True
+
+        if is_riding:
+            # Winner is riding — suppress all exits except stop-loss and resolved
+            # (both already checked above this point)
+            return "let_it_ride"  # signal to caller: hold, don't close
 
         # 3. Aggressive exit: up 30%+ from entry
         if gain_pct >= self.config.aggressive_exit_pct:

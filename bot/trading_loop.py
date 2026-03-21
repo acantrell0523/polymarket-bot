@@ -416,6 +416,31 @@ class TradingBot:
             close_reason = self.risk.check_position(
                 position, position.current_price, position.estimated_prob
             )
+
+            # Let winners ride — don't close, alert instead
+            if close_reason == "let_it_ride":
+                if not getattr(position, '_ride_alerted', False):
+                    potential_payout = position.quantity * 1.0  # $1/share at resolution
+                    self.logger.info("let_it_ride", {
+                        "slug": slug,
+                        "side": position.side,
+                        "current_price": position.current_price,
+                        "entry_price": position.entry_price,
+                        "potential_payout": round(potential_payout, 2),
+                    })
+                    if self.alerter:
+                        self.alerter._post("#36a64f",
+                            f":rocket: *Position Riding*\n"
+                            f"`{slug}`\n"
+                            f"Side: `{position.side.upper()}`  |  "
+                            f"Entry: `{position.entry_price:.3f}`  |  "
+                            f"Now: `{position.current_price:.3f}`\n"
+                            f"Holding for full payout. "
+                            f"Potential: `${potential_payout:.2f}`"
+                        )
+                    position._ride_alerted = True
+                continue
+
             if close_reason:
                 # Submit close order to the exchange
                 closed_on_exchange = self.executor.close_position(position)
