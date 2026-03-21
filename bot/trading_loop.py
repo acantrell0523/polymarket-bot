@@ -44,10 +44,17 @@ class TradingBot:
         from bot.signals.odds_api import OddsCache
         from bot.signals.cross_market import PredictItCache
         from bot.signals.crypto_api import CryptoCache
+        from bot.signals.sports_data import ESPNCache, GameContextAnalyzer
 
         self.odds_cache = OddsCache(api_key=config.odds_api_key, cache_ttl=300)
         self.predictit_cache = PredictItCache(cache_ttl=300)
         self.crypto_cache = CryptoCache(cache_ttl=300)
+        self.espn_cache = ESPNCache(cache_ttl=300)
+        self.game_context = GameContextAnalyzer(self.espn_cache)
+
+        # Live odds tracker for NCAA in-game edges
+        from bot.signals.live_odds import LiveOddsTracker
+        self.live_odds_tracker = LiveOddsTracker(cache_ttl=30)
 
         if not self.odds_cache.enabled:
             self.logger.warning("odds_api_disabled", {
@@ -57,6 +64,7 @@ class TradingBot:
         # Estimator with all caches
         self.estimator = ProbabilityEstimator(
             config.signals, self.odds_cache, self.predictit_cache, self.crypto_cache,
+            self.espn_cache, self.game_context,
         )
 
         # Fetch real balance from exchange for live mode
@@ -91,6 +99,7 @@ class TradingBot:
         live_signal_config.liquidity_imbalance_weight = 0.20
         self.live_estimator = ProbabilityEstimator(
             live_signal_config, self.odds_cache, self.predictit_cache, self.crypto_cache,
+            self.espn_cache, self.game_context,
         )
 
         # Live-game trading overrides — use same edge threshold as config
@@ -167,18 +176,29 @@ class TradingBot:
     def process_markets(self, snapshots: list):
         """Rank all opportunities by edge size and execute the best ones."""
         import time as _time
+        from bot.edge_log import extract_game_id, get_open_game_ids
 
         # Collect all edges
         opportunities = []
-        open_slugs = {p.slug for p in self.portfolio.get_open_positions()}
+        open_positions = self.portfolio.get_open_positions()
+        open_slugs = {p.slug for p in open_positions}
+
+        # Build game correlation map — one position per game max
+        open_games = get_open_game_ids(open_positions)
 
         for snapshot in snapshots:
             if not snapshot:
                 continue
             slug = snapshot.slug
 
-            # Skip if already holding
+            # Skip if already holding this exact market
             if slug in open_slugs:
+                continue
+
+            # Skip if we already have a position on the same game
+            # (correlated market detection: moneyline + spread on same game = bad)
+            game_id = extract_game_id(slug)
+            if game_id in open_games:
                 continue
 
             # Skip if in cooldown
@@ -200,9 +220,17 @@ class TradingBot:
         if slots <= 0:
             return
 
+        # Track games we're about to open in this batch to avoid duplicates
+        games_opening = set()
+
         for trade_signal, snapshot in opportunities[:slots]:
             if not self.risk.can_open_position(self.portfolio.positions):
                 break
+
+            # One position per game within the same batch
+            game_id = extract_game_id(trade_signal.slug)
+            if game_id in games_opening or game_id in open_games:
+                continue
 
             exposure = self.portfolio.get_total_exposure()
             size = self.sizer.size_position(trade_signal, self.portfolio.bankroll, exposure)
@@ -216,6 +244,111 @@ class TradingBot:
             trade = self.executor.execute_trade(trade_signal)
             if trade:
                 self.portfolio.open_position(trade_signal, trade)
+                self.risk.record_trade_opened()
+                games_opening.add(game_id)
+                # Log edge snapshot for this trade
+                self._log_edge_entry(trade_signal, snapshot)
+
+    def _check_live_ncaa_edges(self):
+        """Check live NCAA game odds for fast-moving edges.
+
+        During March Madness, sportsbook lines move fast on momentum swings.
+        If ESPN's live line moved 5%+ but Polymarket hasn't caught up, trade.
+        """
+        try:
+            # Build current Polymarket prices for NCAA markets
+            poly_prices = {}
+            for pos in self.portfolio.get_open_positions():
+                if "cbb" in (pos.slug or ""):
+                    poly_prices[pos.slug] = pos.current_price
+
+            # Also include markets we could open
+            for market in self._cached_markets:
+                slug = market.get("slug", "")
+                if "cbb" not in slug:
+                    continue
+                snapshot = self.market_data.build_snapshot(market)
+                if snapshot and snapshot.is_live:
+                    poly_prices[slug] = snapshot.price
+
+            if not poly_prices:
+                return
+
+            edges = self.live_odds_tracker.detect_live_edges(
+                poly_prices, min_edge=0.05
+            )
+
+            for edge in edges:
+                self.logger.info("live_ncaa_edge_detected", {
+                    "slug": edge["slug"],
+                    "poly": edge["poly_price"],
+                    "espn": edge["espn_prob"],
+                    "edge": round(edge["edge"] * 100, 1),
+                    "status": edge["status"],
+                    "score": f"{edge['away_score']}-{edge['home_score']}",
+                })
+        except Exception as e:
+            self.logger.error("live_ncaa_edge_check_failed", {"error": str(e)})
+
+    def _record_closing_lines(self, live_markets: List[Dict]):
+        """When a game transitions to live, record the closing line for CLV tracking."""
+        try:
+            from bot.edge_log import record_closing_line
+            for market in live_markets:
+                slug = market.get("slug", "")
+                if not slug:
+                    continue
+                # Get consensus at tip-off
+                result = self.odds_cache.get_probability_for_slug(slug)
+                if result:
+                    consensus, _ = result
+                    live_price = self.market_data.get_live_price(slug)
+                    if live_price:
+                        record_closing_line(slug, consensus, live_price)
+        except Exception:
+            pass  # CLV recording must not break trading
+
+    def _log_edge_entry(self, trade_signal, snapshot):
+        """Log full edge snapshot when a trade is opened."""
+        try:
+            from bot.edge_log import (
+                insert_edge_log, build_edge_snapshot_for_signal, classify_edge_pattern,
+                check_resolution_flag,
+            )
+            sig_snapshot = build_edge_snapshot_for_signal(
+                trade_signal, self.odds_cache, trade_signal.slug
+            )
+            pattern = classify_edge_pattern(sig_snapshot)
+
+            # Check for resolution ambiguity
+            res_flag = check_resolution_flag(trade_signal.slug, getattr(trade_signal, '_question', ''))
+
+            # Extract consensus and book info from odds_value signal metadata
+            odds_meta = sig_snapshot["signals"].get("odds_value", {}).get("metadata", {})
+            consensus = odds_meta.get("consensus_prob", 0)
+            books_used = odds_meta.get("books_used", "")
+            num_books = odds_meta.get("num_books", 0)
+
+            # Extract league from slug
+            parts = trade_signal.slug.split("-")
+            league = parts[1].upper() if len(parts) >= 2 else ""
+
+            insert_edge_log(
+                slug=trade_signal.slug,
+                polymarket_price=trade_signal.market_price,
+                consensus_price=consensus,
+                books_used=books_used,
+                num_books=num_books,
+                edge_at_entry=trade_signal.edge,
+                signal_snapshot=sig_snapshot,
+                edge_pattern=pattern,
+                is_live_game=getattr(trade_signal, "_is_live", False),
+                league=league,
+                market_type="sports" if league else "",
+                resolution_flag=res_flag,
+            )
+        except Exception:
+            pass  # Edge logging must not break trading
 
     def check_positions(self, has_live_games: bool = False, cycle: int = 0):
         """Check all open positions: fetch live prices, check risk, close via API."""
@@ -489,6 +622,14 @@ class TradingBot:
                             "cycle": cycle,
                             "live_count": len(live_markets),
                         })
+
+                        # Record closing lines for CLV tracking (once per game start)
+                        if cycle % 20 == 1:  # every ~60s during live scans
+                            self._record_closing_lines(live_markets)
+
+                        # Check live NCAA odds for fast-moving edges
+                        if cycle % 10 == 0:  # every ~30s
+                            self._check_live_ncaa_edges()
 
                         self._do_live_scan(live_markets)
                         self.check_positions(has_live_games=True, cycle=cycle)

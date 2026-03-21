@@ -20,10 +20,12 @@ from bot.signals.signals import (
     liquidity_imbalance_signal,
     cross_market_signal,
     crypto_model_signal,
+    sports_context_signal,
 )
 from bot.signals.odds_api import OddsCache
 from bot.signals.cross_market import PredictItCache
 from bot.signals.crypto_api import CryptoCache
+from bot.signals.sports_data import ESPNCache, GameContextAnalyzer
 
 
 # Market type detection patterns
@@ -42,10 +44,11 @@ POLITICS_KEYWORDS = re.compile(
 # Weights per market type
 WEIGHTS = {
     "sports": {
-        "odds_value": 0.45,
-        "order_book_imbalance": 0.20,
+        "odds_value": 0.40,
+        "sports_context": 0.15,
         "line_movement": 0.20,
-        "liquidity_imbalance": 0.15,
+        "order_book_imbalance": 0.15,
+        "liquidity_imbalance": 0.10,
     },
     "crypto": {
         "crypto_model": 0.45,
@@ -93,11 +96,15 @@ class ProbabilityEstimator:
         odds_cache: Optional[OddsCache] = None,
         predictit_cache: Optional[PredictItCache] = None,
         crypto_cache: Optional[CryptoCache] = None,
+        espn_cache: Optional[ESPNCache] = None,
+        game_context_analyzer: Optional[GameContextAnalyzer] = None,
     ):
         self.config = config
         self.odds_cache = odds_cache
         self.predictit_cache = predictit_cache
         self.crypto_cache = crypto_cache
+        self.espn_cache = espn_cache
+        self.game_context_analyzer = game_context_analyzer
 
     def compute_signals(self, snapshot: MarketSnapshot, market_type: str) -> List[Signal]:
         """Compute signals appropriate for the market type."""
@@ -109,6 +116,9 @@ class ProbabilityEstimator:
         if market_type == "sports":
             signals.append(odds_value_signal(snapshot, self.config, self.odds_cache))
             signals.append(line_movement_signal(snapshot, self.config))
+            signals.append(sports_context_signal(
+                snapshot, self.config, self.espn_cache, self.game_context_analyzer
+            ))
         elif market_type == "crypto":
             signals.append(crypto_model_signal(snapshot, self.config, self.crypto_cache))
             signals.append(cross_market_signal(snapshot, self.config, self.predictit_cache))

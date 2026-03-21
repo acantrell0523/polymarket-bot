@@ -26,7 +26,9 @@ class PositionSizer:
         if available <= 0:
             return 0.0
 
-        if self.config.position_sizing_method == "kelly":
+        if self.config.position_sizing_method == "tiered_kelly":
+            size = self._tiered_kelly_size(signal)
+        elif self.config.position_sizing_method == "kelly":
             size = self._kelly_size(signal, bankroll)
         else:
             size = self._fixed_fractional_size(bankroll)
@@ -75,6 +77,21 @@ class PositionSizer:
         kelly_f *= self.config.kelly_fraction
 
         return kelly_f * bankroll
+
+    def _tiered_kelly_size(self, signal: TradeSignal) -> float:
+        """Tiered Kelly: bet more on bigger edges.
+
+        5-7% edge  → $15
+        7-10% edge → $25
+        10%+ edge  → $35
+        """
+        abs_edge = abs(signal.edge) * 100  # convert to percentage
+        if abs_edge >= 10:
+            return 35.0
+        elif abs_edge >= 7:
+            return 25.0
+        else:
+            return 15.0
 
     def _fixed_fractional_size(self, bankroll: float) -> float:
         """Fixed fractional: flat percentage of bankroll."""

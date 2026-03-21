@@ -1,190 +1,110 @@
-# ============================================================================
-# Polymarket Trading Bot - Master Configuration
-# ============================================================================
-# All parameters are configurable. No hardcoded values in the codebase.
-# Copy this file and modify for different strategies/backtests.
-# ============================================================================
-
-# --- API & Authentication ---
 api:
-  # Polymarket CLOB API endpoint
-  clob_url: "https://clob.polymarket.com"
-  # Gamma API for market metadata
-  gamma_url: "https://gamma-api.polymarket.com"
-  # The Graph subgraph endpoint for historical data
-  subgraph_url: "https://api.thegraph.com/subgraphs/name/polymarket/polymarket-matic"
-  # Polling interval in seconds for the main scan loop
+  clob_url: https://clob.polymarket.com
+  gamma_url: https://gamma-api.polymarket.com
+  subgraph_url: https://api.thegraph.com/subgraphs/name/polymarket/polymarket-matic
   scan_interval_seconds: 5
-  # Rate limit: max requests per second to CLOB API
   max_requests_per_second: 5
-  # Retry configuration
   max_retries: 3
-  retry_backoff_base: 2.0  # Exponential backoff base (seconds)
-
-# --- On-Chain Enrichment (FREE, no API key needed) ---
-# Derives smart money, whale flow, and sentiment signals from
-# Polymarket's own public data (CLOB trades, Gamma API, cross-market analysis).
-# This replaces the paid Unusual Whales API with free alternatives.
+  retry_backoff_base: 2.0
 onchain:
-  # Enabled by default since it's completely free
   enabled: true
-  # Rate limit for enrichment API calls
   max_requests_per_second: 3
-  # How long to cache responses (seconds)
   cache_ttl_seconds: 120
-  # Enrich every scanned market each cycle (slower but comprehensive)
   enrich_all_markets: false
-  # Only enrich markets that already pass initial edge detection (faster)
-  # Two-pass: detect edge with core signals, then enrich+refine with on-chain data
   enrich_on_edge_only: true
-  # Minimum trades needed for reliable whale/smart money analysis
   min_trades_for_analysis: 20
-
-# --- Wallet / Chain ---
 wallet:
-  # Private key loaded from .env (POLYMARKET_PRIVATE_KEY)
-  # Chain ID for Polygon
   chain_id: 137
-  # Approval proxy for Polymarket's CLOB
-  approval_amount: "1000000000"  # 1B USDC units (6 decimals)
-
-# --- Trading Parameters ---
+  approval_amount: '1000000000'
 trading:
-  # Minimum edge (estimated_prob - market_price) to trigger a trade
-  min_edge_threshold: 0.05  # 5% — only trade significant disagreements
-  # Maximum edge — reject outliers that may indicate bad data
-  max_edge_threshold: 0.40  # 40%
-  # Position sizing method: "kelly" or "fixed_fractional"
-  position_sizing_method: "fixed_fractional"
-  # Fixed fractional: fraction of bankroll per trade
+  min_edge_threshold: 0.05
+  max_edge_threshold: 0.4
+  position_sizing_method: fixed_fractional
   fixed_fraction: 0.15
-  # Kelly fraction multiplier (use half-Kelly for safety)
   kelly_fraction: 0.5
-  # Maximum position size in USDC per single trade
   max_position_size_usd: 25.0
-  # Minimum position size in USDC (below this, skip the trade)
+  max_daily_trades: 15
   min_position_size_usd: 5.0
-  # Maximum total portfolio exposure in USDC across all open positions
   max_portfolio_exposure_usd: 500.0
-  # Stop-loss threshold: close position if unrealized loss exceeds this fraction
-  stop_loss_threshold: 0.25  # 25% loss triggers stop-loss
-  # Take-profit threshold: close position when price converges within this of fair value
+  stop_loss_threshold: 0.25
   take_profit_threshold: 0.05
-  # Minimum profit in USD before take-profit can trigger
   minimum_take_profit_usd: 5.0
-  # Aggressive exit: close if position is up this % from entry
-  aggressive_exit_pct: 0.30  # 30% gain = close
-  # Trailing stop: if position was up this much and drops back, close it
-  trailing_stop_activation_pct: 0.15  # activate trailing stop after 15% gain
-  trailing_stop_pct: 0.10  # close if drops 10% from peak (e.g., was +15%, now +5%)
-  # Daily loss limit in USDC — halt all trading when breached
+  aggressive_exit_pct: 0.3
+  trailing_stop_activation_pct: 0.15
+  trailing_stop_pct: 0.1
   daily_loss_limit_usd: 200.0
-  # Maximum number of concurrent open positions
   max_open_positions: 5
-  # Paper trading mode (no real orders submitted)
   paper_trading: true
-
-# --- Signal Weights ---
-# Weights must sum to 1.0. All signals use Polymarket US API or external odds data.
-# CRITICAL: odds_value requires THE_ODDS_API_KEY in .env. No external odds = no trade.
 signals:
-  # Consensus odds from major sportsbooks vs Polymarket price (primary signal)
-  odds_value_weight: 0.45
-  # Order book bid/ask depth ratio from US API
-  order_book_imbalance_weight: 0.20
-  # How far the current price has moved from 50/50
+  odds_value_weight: 0.40
+  sports_context_weight: 0.15
   line_movement_weight: 0.20
-  # Top-of-book depth concentration detecting informed flow
-  liquidity_imbalance_weight: 0.15
-
-# --- Market Filters ---
+  order_book_imbalance_weight: 0.15
+  liquidity_imbalance_weight: 0.10
 filters:
-  # Minimum daily volume (USDC) for a market to be considered
   min_daily_volume_usd: 500.0
-  # Minimum liquidity depth (USDC within 5% of mid) for a market
   min_liquidity_usd: 200.0
-  # Only trade markets expiring at least this many hours in the future
   min_hours_to_expiry: 1
-  # Skip markets resolving more than this many hours from now (focus on short-term)
   max_hours_to_expiry: 48
-  # Skip markets with fewer than this many historical price points
   min_price_history_length: 10
-  # Market categories to include (empty list = all categories)
   include_categories: []
-  # Market categories to exclude
   exclude_categories: []
-
-# --- Backtesting ---
 backtest:
-  # Path to historical data directory
-  data_dir: "./data/historical"
-  # Date range for backtest (ISO format)
-  start_date: "2024-01-01"
-  end_date: "2024-12-31"
-  # Starting bankroll for backtest
+  data_dir: ./data/historical
+  start_date: '2024-01-01'
+  end_date: '2024-12-31'
   initial_bankroll_usd: 200.0
-  # Slippage model: "fixed" or "depth_based"
-  slippage_model: "depth_based"
-  # Fixed slippage in basis points (used if model=fixed)
-  fixed_slippage_bps: 50  # 0.5%
-  # Depth-based slippage multiplier (higher = more slippage for thin books)
+  slippage_model: depth_based
+  fixed_slippage_bps: 50
   depth_slippage_multiplier: 0.001
-  # Polymarket fee structure
-  maker_fee_bps: 0    # Makers pay 0 on Polymarket
-  taker_fee_bps: 200  # Takers pay ~2%
-  # Simulated latency in milliseconds
+  maker_fee_bps: 0
+  taker_fee_bps: 200
   latency_ms: 500
-  # Benchmark targets
   benchmark_win_rate: 0.62
   benchmark_trade_count: 366
-
-# --- Parameter Sweep (Sensitivity Analysis) ---
 sweep:
-  # Edge thresholds to test
-  edge_thresholds: [0.03, 0.05, 0.07, 0.10, 0.15]
-  # Position sizing methods to test
-  sizing_methods: ["kelly", "fixed_fractional"]
-  # Kelly fractions to test (only applies when method=kelly)
-  kelly_fractions: [0.25, 0.5, 0.75, 1.0]
-  # Fixed fractions to test (only applies when method=fixed_fractional)
-  fixed_fractions: [0.01, 0.02, 0.05, 0.10]
-  # Stop-loss levels to test
-  stop_loss_levels: [0.05, 0.10, 0.15, 0.20, 0.30]
-  # Number of parallel workers for sweep
+  edge_thresholds:
+  - 0.03
+  - 0.05
+  - 0.07
+  - 0.1
+  - 0.15
+  sizing_methods:
+  - kelly
+  - fixed_fractional
+  kelly_fractions:
+  - 0.25
+  - 0.5
+  - 0.75
+  - 1.0
+  fixed_fractions:
+  - 0.01
+  - 0.02
+  - 0.05
+  - 0.1
+  stop_loss_levels:
+  - 0.05
+  - 0.1
+  - 0.15
+  - 0.2
+  - 0.3
   max_workers: 4
-
-# --- Logging ---
 logging:
-  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
-  # Log file path (relative to project root)
-  file: "./reports/trading.log"
-  # Also log to stdout
+  level: INFO
+  file: ./reports/trading.log
   console: true
-  # Log every scan cycle (verbose — set to false in production)
   log_scans: true
-  # Log full order book snapshots (very verbose)
   log_order_books: false
-
-# --- Reporting ---
 reporting:
-  # Output directory for backtest reports
-  output_dir: "./reports"
-  # Chart format: "png" or "html" (html uses plotly)
-  chart_format: "png"
-  # Export results as JSON alongside charts
+  output_dir: ./reports
+  chart_format: png
   export_json: true
-  # Export results as CSV
   export_csv: true
-
-# --- Alerts ---
 alerts:
   enabled: true
-  # Slack webhook URL (loaded from .env SLACK_WEBHOOK_URL)
-  slack_webhook_url: ""
-  # Which events trigger alerts
+  slack_webhook_url: ''
   on_trade_open: true
   on_trade_close: true
   on_daily_summary: true
-  # Hour (UTC) to send daily summary (22 = 10 PM UTC / ~6 PM ET)
   daily_summary_hour: 22
   on_error: true

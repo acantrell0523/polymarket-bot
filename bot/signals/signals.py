@@ -6,6 +6,7 @@ from utils.config import SignalConfig
 from bot.signals.odds_api import OddsCache
 from bot.signals.cross_market import PredictItCache
 from bot.signals.crypto_api import CryptoCache
+from bot.signals.sports_data import ESPNCache, GameContextAnalyzer
 
 
 def order_book_imbalance_signal(snapshot: MarketSnapshot, config: SignalConfig) -> Signal:
@@ -105,12 +106,57 @@ def odds_value_signal(
 
     consensus_prob, num_books = result
 
-    if num_books < 3:
+    # Minimum 2 books for any trade, 3 books for edges over 7%
+    if num_books < 2:
         return Signal(name="odds_value", value=0.5, confidence=0.0, direction="neutral",
                       metadata={"reason": f"only_{num_books}_books", "consensus": consensus_prob})
 
     polymarket_price = snapshot.price
+
+    # Check for sharp book consensus (Pinnacle, Circa)
+    # If sharp books disagree with overall consensus, weight sharp books more heavily
+    sharp_consensus = 0.0
+    books_used = ""
+    consensus_data = odds_cache.get_consensus_odds(snapshot.slug)
+    if consensus_data:
+        sharp_probs = consensus_data.get("sharp_probs", {})
+        books_used = consensus_data.get("books_used", "")
+        if sharp_probs:
+            # Find the team we care about
+            for team_name, prob in sharp_probs.items():
+                if team_name.lower() == "draw":
+                    continue
+                parts = snapshot.slug.split("-")
+                outcome_abbr = parts[-1] if len(parts) > 5 else (parts[2] if len(parts) > 2 else "")
+                if odds_cache._team_matches(outcome_abbr, team_name):
+                    sharp_consensus = prob
+                    break
+            # If sharp books differ from overall by 3%+, blend toward sharp
+            if sharp_consensus > 0 and abs(sharp_consensus - consensus_prob) >= 0.03:
+                # Weight sharp 60%, overall 40%
+                consensus_prob = sharp_consensus * 0.6 + consensus_prob * 0.4
+
     edge = consensus_prob - polymarket_price
+
+    # Record line movement for tracking
+    try:
+        from bot.edge_log import record_line_movement
+        record_line_movement(
+            slug=snapshot.slug,
+            consensus_prob=consensus_prob,
+            polymarket_price=polymarket_price,
+            num_books=num_books,
+            sharp_consensus=sharp_consensus,
+            overall_consensus=consensus_prob,
+        )
+    except Exception:
+        pass
+
+    # Require 3 books for edges over 7% — large edges from a single source are unreliable
+    if abs(edge) > 0.07 and num_books < 3:
+        return Signal(name="odds_value", value=0.5, confidence=0.0, direction="neutral",
+                      metadata={"reason": f"edge_{abs(edge)*100:.0f}pct_needs_3_books_have_{num_books}",
+                                "consensus": consensus_prob, "edge": edge})
 
     # The signal value IS the consensus probability — what the market "should" be priced at
     value = max(0.01, min(0.99, consensus_prob))
@@ -118,6 +164,12 @@ def odds_value_signal(
     # Confidence scales with number of books and size of edge
     confidence = min(num_books / 5, 1.0) * min(abs(edge) * 5, 1.0)
     confidence = max(0.1, min(confidence, 1.0))
+
+    # Boost confidence if sharp books agree with the direction
+    if sharp_consensus > 0:
+        sharp_edge = sharp_consensus - polymarket_price
+        if (sharp_edge > 0 and edge > 0) or (sharp_edge < 0 and edge < 0):
+            confidence = min(confidence * 1.15, 1.0)
 
     direction = "bullish" if edge > 0.02 else "bearish" if edge < -0.02 else "neutral"
 
@@ -131,6 +183,8 @@ def odds_value_signal(
             "polymarket_price": float(polymarket_price),
             "edge": float(edge),
             "num_books": num_books,
+            "sharp_consensus": float(sharp_consensus),
+            "books_used": books_used,
         },
     )
 
@@ -247,6 +301,71 @@ def cross_market_signal(
             "polymarket_price": float(polymarket_price),
             "edge": float(edge),
             "matched_contract": matched_name,
+        },
+    )
+
+
+def sports_context_signal(
+    snapshot: MarketSnapshot,
+    config: SignalConfig,
+    espn_cache=None,
+    game_context_analyzer=None,
+) -> Signal:
+    """Game context signal using ESPN data: home advantage, fatigue, tournament context.
+
+    Modifies confidence in the direction the game context suggests.
+    """
+    if not espn_cache or not game_context_analyzer:
+        return Signal(name="sports_context", value=0.5, confidence=0.0, direction="neutral",
+                      metadata={"reason": "no_espn_cache"})
+
+    # Parse sport and teams from slug
+    parts = snapshot.slug.split("-")
+    if len(parts) < 4:
+        return Signal(name="sports_context", value=0.5, confidence=0.0, direction="neutral",
+                      metadata={"reason": "unparseable_slug"})
+
+    sport_abbr = parts[1]
+    sport_map = {"nba": "basketball_nba", "cbb": "basketball_ncaab"}
+    sport_key = sport_map.get(sport_abbr)
+    if not sport_key:
+        return Signal(name="sports_context", value=0.5, confidence=0.0, direction="neutral",
+                      metadata={"reason": f"unsupported_sport_{sport_abbr}"})
+
+    home_abbr = parts[2]
+    away_abbr = parts[3]
+
+    context = game_context_analyzer.analyze(sport_key, home_abbr, away_abbr)
+
+    modifier = context.get("context_modifier", 0)
+    # Value: 0.5 + modifier (home advantage pushes toward home team winning)
+    value = max(0.01, min(0.99, 0.5 + modifier))
+
+    # Confidence based on how much context data we have
+    confidence = 0.0
+    if abs(modifier) > 0.01:
+        confidence = min(abs(modifier) * 5, 0.7)
+
+    # Boost confidence if we detected fatigue
+    if context.get("fatigue_home") or context.get("fatigue_away"):
+        confidence = max(confidence, 0.5)
+
+    direction = "bullish" if modifier > 0.01 else "bearish" if modifier < -0.01 else "neutral"
+
+    return Signal(
+        name="sports_context",
+        value=float(value),
+        confidence=float(confidence),
+        direction=direction,
+        metadata={
+            "home_advantage": context.get("home_advantage", 0),
+            "fatigue_home": context.get("fatigue_home", False),
+            "fatigue_away": context.get("fatigue_away", False),
+            "is_conference_tourney": context.get("is_conference_tourney", False),
+            "home_record": context.get("home_record", ""),
+            "away_record": context.get("away_record", ""),
+            "context_modifier": modifier,
+            "neutral_site": context.get("neutral_site", False),
         },
     )
 

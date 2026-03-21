@@ -15,8 +15,14 @@ from apscheduler.triggers.cron import CronTrigger
 
 from utils.config import load_config, BotConfig
 from utils.logger import TradingLogger
-from bot.alerts import SlackAlerter, COLOR_GREEN, COLOR_RED, COLOR_GRAY, COLOR_ORANGE
+from bot.alerts import SlackAlerter, COLOR_GREEN, COLOR_RED, COLOR_GRAY, COLOR_ORANGE, COLOR_BLUE
 from bot import trade_db
+from bot.edge_log import (
+    generate_edge_validation_report,
+    format_edge_report_slack,
+    run_morning_scan,
+    format_morning_briefing,
+)
 
 
 # File-based kill switch: trading_loop checks this file
@@ -349,6 +355,9 @@ class Supervisor:
             # 5. Send Slack report (after 5 min delay simulated by scheduler offset)
             self._send_daily_report(metrics, by_type, param_changes)
 
+            # 6. Run edge validation report
+            self.run_edge_validation()
+
             self.logger.info("daily_review_complete", {
                 "trades": metrics["total_trades"],
                 "pnl": metrics["total_pnl"],
@@ -418,6 +427,67 @@ class Supervisor:
                 lines.append(f"  :gear: {c}")
 
         self.alerter._post(color, "\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # Edge validation (runs as part of daily review)
+    # ------------------------------------------------------------------
+
+    def run_edge_validation(self):
+        """Run edge validation report and send to Slack."""
+        try:
+            report = generate_edge_validation_report(days=1)
+            if report.get("completed_entries", 0) == 0:
+                self.logger.info("edge_validation_skipped", {"reason": "no completed edge entries"})
+                return
+            text = format_edge_report_slack(report)
+            self.alerter.edge_report(text)
+            self.logger.info("edge_validation_sent", {
+                "entries": report["completed_entries"],
+            })
+        except Exception as e:
+            self.logger.error("edge_validation_failed", {"error": str(e)})
+
+    # ------------------------------------------------------------------
+    # Morning briefing (8 AM ET)
+    # ------------------------------------------------------------------
+
+    def morning_briefing(self):
+        """Scan all markets and send the top edge opportunities to Slack."""
+        self.logger.info("morning_briefing_start", {})
+        try:
+            from bot.market_data import MarketDataClient
+            from bot.signals.estimator import ProbabilityEstimator
+            from bot.signals.odds_api import OddsCache
+            from bot.signals.sports_data import ESPNCache, GameContextAnalyzer
+
+            odds_cache = OddsCache(api_key=self.config.odds_api_key, cache_ttl=300)
+            espn_cache = ESPNCache(cache_ttl=300)
+
+            if not odds_cache.enabled:
+                self.logger.warning("morning_briefing_skipped", {"reason": "no odds API key"})
+                return
+
+            market_data = MarketDataClient(
+                self.config.api, self.logger, self.config.filters
+            )
+            estimator = ProbabilityEstimator(
+                self.config.signals, odds_cache,
+                espn_cache=espn_cache,
+                game_context_analyzer=GameContextAnalyzer(espn_cache),
+            )
+
+            opportunities = run_morning_scan(
+                market_data, estimator, odds_cache, self.config
+            )
+            text = format_morning_briefing(opportunities)
+            self.alerter.morning_briefing(text)
+
+            self.logger.info("morning_briefing_sent", {
+                "opportunities": len(opportunities),
+            })
+        except Exception as e:
+            self.logger.error("morning_briefing_failed", {"error": str(e)})
+            self.alerter.error("Morning briefing failed", str(e))
 
     # ------------------------------------------------------------------
     # Weekly optimization (stub — requires historical data)
@@ -511,7 +581,7 @@ class Supervisor:
         self.logger.info("supervisor_starting", {})
         self.alerter._post(COLOR_GRAY,
             ":robot_face: *Supervisor Started*\n"
-            "Daily review at 6:00 AM ET | Weekly optimization Sundays 6:00 AM ET"
+            "Morning briefing at 8:00 AM ET | Daily review at 6:00 AM ET | Weekly optimization Sundays 6:00 AM ET"
         )
 
         scheduler = BlockingScheduler(timezone="US/Eastern")
@@ -522,6 +592,15 @@ class Supervisor:
             CronTrigger(hour=6, minute=0),
             id="daily_review",
             name="Daily Performance Review",
+            misfire_grace_time=3600,
+        )
+
+        # Morning briefing at 8:00 AM ET
+        scheduler.add_job(
+            self.morning_briefing,
+            CronTrigger(hour=8, minute=0),
+            id="morning_briefing",
+            name="Morning Edge Briefing",
             misfire_grace_time=3600,
         )
 

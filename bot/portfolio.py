@@ -159,6 +159,29 @@ class Portfolio:
         except Exception:
             pass  # DB errors must not break trading
 
+        # Update edge log with outcome
+        try:
+            from bot.edge_log import update_edge_log_outcome
+            slug = getattr(position, 'slug', position.market_id)
+            time_held = 0.0
+            if position.entry_time:
+                entry = position.entry_time
+                if entry.tzinfo is None:
+                    from datetime import timezone as _tz
+                    entry = entry.replace(tzinfo=_tz.utc)
+                time_held = (close_time - entry).total_seconds()
+            update_edge_log_outcome(
+                slug=slug,
+                entry_time_iso=position.entry_time.isoformat() if position.entry_time else "",
+                actual_pnl=realized_pnl,
+                time_held_seconds=time_held,
+                price_at_close=current_price,
+                close_reason=reason,
+                final_outcome="win" if realized_pnl > 0 else "loss",
+            )
+        except Exception:
+            pass  # Edge log errors must not break trading
+
         return realized_pnl
 
     def get_open_positions(self) -> List[Position]:

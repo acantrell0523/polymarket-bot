@@ -113,6 +113,14 @@ class SlackAlerter:
             f"Bankroll: `${bankroll:.2f}`"
         )
 
+    def morning_briefing(self, text: str):
+        """Post the morning edge briefing."""
+        self._post(COLOR_BLUE, text)
+
+    def edge_report(self, text: str):
+        """Post the edge validation report."""
+        self._post(COLOR_GRAY, text)
+
     def error(self, message: str, details: str = ""):
         text = f":warning: *Bot Error*\n{message}"
         if details:

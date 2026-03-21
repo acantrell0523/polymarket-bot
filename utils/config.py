@@ -47,15 +47,17 @@ class TradingConfig:
     trailing_stop_pct: float = 0.10
     daily_loss_limit_usd: float = 200.0
     max_open_positions: int = 5
+    max_daily_trades: int = 15
     paper_trading: bool = True
 
 
 @dataclass
 class SignalConfig:
-    order_book_imbalance_weight: float = 0.20
+    order_book_imbalance_weight: float = 0.15
     line_movement_weight: float = 0.20
-    odds_value_weight: float = 0.45
-    liquidity_imbalance_weight: float = 0.15
+    odds_value_weight: float = 0.40
+    liquidity_imbalance_weight: float = 0.10
+    sports_context_weight: float = 0.15
 
 
 @dataclass
