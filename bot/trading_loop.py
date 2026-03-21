@@ -146,8 +146,8 @@ class TradingBot:
                 pregame.append(m)
         return live, pregame
 
-    def process_market(self, snapshot: MarketSnapshot):
-        """Process a single market snapshot through the full pipeline."""
+    def _detect_edge(self, snapshot: MarketSnapshot):
+        """Detect edge for a single market. Returns (signal, snapshot) or None."""
         if snapshot.is_live:
             estimator = self.live_estimator
             min_edge = self.live_min_edge
@@ -160,36 +160,62 @@ class TradingBot:
             min_edge=min_edge,
             max_edge=self.config.trading.max_edge_threshold,
         )
-
         if trade_signal is None:
-            return
+            return None
+        return (trade_signal, snapshot)
 
-        # Skip if we already have a position on this market
-        slug = snapshot.slug
-        if any(p.slug == slug for p in self.portfolio.get_open_positions()):
-            return
-
-        # Skip if this slug is in cooldown after a recent close
+    def process_markets(self, snapshots: list):
+        """Rank all opportunities by edge size and execute the best ones."""
         import time as _time
-        cooldown_until = self._slug_cooldowns.get(slug, 0)
-        if _time.time() < cooldown_until:
+
+        # Collect all edges
+        opportunities = []
+        open_slugs = {p.slug for p in self.portfolio.get_open_positions()}
+
+        for snapshot in snapshots:
+            if not snapshot:
+                continue
+            slug = snapshot.slug
+
+            # Skip if already holding
+            if slug in open_slugs:
+                continue
+
+            # Skip if in cooldown
+            cooldown_until = self._slug_cooldowns.get(slug, 0)
+            if _time.time() < cooldown_until:
+                continue
+
+            result = self._detect_edge(snapshot)
+            if result:
+                opportunities.append(result)
+
+        if not opportunities:
             return
 
-        if not self.risk.can_open_position(self.portfolio.positions):
+        # Rank by absolute edge, descending — take only the best
+        opportunities.sort(key=lambda x: abs(x[0].edge), reverse=True)
+
+        slots = self.config.trading.max_open_positions - len(open_slugs)
+        if slots <= 0:
             return
 
-        exposure = self.portfolio.get_total_exposure()
-        size = self.sizer.size_position(trade_signal, self.portfolio.bankroll, exposure)
-        if size <= 0:
-            return
+        for trade_signal, snapshot in opportunities[:slots]:
+            if not self.risk.can_open_position(self.portfolio.positions):
+                break
 
-        trade_signal.position_size_usd = size
-        trade_signal._question = snapshot.question
-        trade_signal._is_live = snapshot.is_live
+            exposure = self.portfolio.get_total_exposure()
+            size = self.sizer.size_position(trade_signal, self.portfolio.bankroll, exposure)
+            if size <= 0:
+                continue
 
-        trade = self.executor.execute_trade(trade_signal)
-        if trade:
-            self.portfolio.open_position(trade_signal, trade)
+            trade_signal.position_size_usd = size
+            trade_signal._question = snapshot.question
+            trade_signal._is_live = snapshot.is_live
+
+            trade = self.executor.execute_trade(trade_signal)
+            if trade:
+                self.portfolio.open_position(trade_signal, trade)
 
     def check_positions(self, has_live_games: bool = False, cycle: int = 0):
         """Check all open positions: fetch live prices, check risk, close via API."""
@@ -253,9 +279,10 @@ class TradingBot:
                         "exit": position.current_price,
                         "pnl": round(position.realized_pnl, 2),
                     })
-                    # 10-minute cooldown before reopening this slug
+                    # Smart re-entry: loss = 10min cooldown, win (>$2) = immediate
                     import time as _time
-                    self._slug_cooldowns[slug] = _time.time() + self._cooldown_seconds
+                    if position.realized_pnl < 2.0:
+                        self._slug_cooldowns[slug] = _time.time() + self._cooldown_seconds
                 else:
                     self.logger.error("position_exit_failed", {
                         "slug": slug,
@@ -325,12 +352,14 @@ class TradingBot:
 
     def _do_live_scan(self, live_markets: List[Dict]):
         """Fast scan — only builds snapshots for live game markets."""
+        snapshots = []
         for market in live_markets:
             if not self.running:
                 break
             snapshot = self.market_data.build_snapshot(market)
             if snapshot:
-                self.process_market(snapshot)
+                snapshots.append(snapshot)
+        self.process_markets(snapshots)
 
     def _log_open_positions(self):
         """Log all currently open positions at startup."""
@@ -425,13 +454,15 @@ class TradingBot:
 
                     live_markets, pregame_markets = self._split_markets(markets)
 
-                    # Process all markets (live + pregame)
+                    # Build all snapshots, then rank and process best opportunities
+                    snapshots = []
                     for market in markets:
                         if not self.running:
                             break
                         snapshot = self.market_data.build_snapshot(market)
                         if snapshot:
-                            self.process_market(snapshot)
+                            snapshots.append(snapshot)
+                    self.process_markets(snapshots)
 
                     has_live = len(live_markets) > 0
                     self.check_positions(has_live, cycle=cycle)

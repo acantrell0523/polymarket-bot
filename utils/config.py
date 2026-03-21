@@ -39,10 +39,14 @@ class TradingConfig:
     max_position_size_usd: float = 50.0
     min_position_size_usd: float = 1.0
     max_portfolio_exposure_usd: float = 500.0
-    stop_loss_threshold: float = 0.15
-    take_profit_threshold: float = 0.02
-    daily_loss_limit_usd: float = 100.0
-    max_open_positions: int = 20
+    stop_loss_threshold: float = 0.25
+    take_profit_threshold: float = 0.05
+    minimum_take_profit_usd: float = 5.0
+    aggressive_exit_pct: float = 0.30
+    trailing_stop_activation_pct: float = 0.15
+    trailing_stop_pct: float = 0.10
+    daily_loss_limit_usd: float = 200.0
+    max_open_positions: int = 5
     paper_trading: bool = True
 
 

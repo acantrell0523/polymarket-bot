@@ -1,11 +1,11 @@
-"""Risk management: stop-loss, take-profit, daily loss limit."""
+"""Risk management: stop-loss, take-profit, trailing stop, aggressive exit."""
 
 from typing import List, Optional
 from datetime import datetime, timezone
 from utils.models import Position
 from utils.config import TradingConfig
 
-MIN_HOLD_SECONDS = 60  # Minimum time before take-profit can trigger
+MIN_HOLD_SECONDS = 60
 
 
 class RiskManager:
@@ -17,31 +17,31 @@ class RiskManager:
         self.last_reset_date: Optional[str] = None
 
     def reset_daily_pnl(self, date_str: Optional[str] = None):
-        """Reset daily P&L tracker (called at start of each trading day)."""
         self.daily_pnl = 0.0
-        self.last_reset_date = date_str or datetime.utcnow().strftime("%Y-%m-%d")
+        self.last_reset_date = date_str or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     def record_pnl(self, pnl: float):
-        """Record realized P&L."""
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self.last_reset_date != today:
             self.reset_daily_pnl(today)
         self.daily_pnl += pnl
 
     def is_daily_limit_breached(self) -> bool:
-        """Check if daily loss limit has been breached."""
         return self.daily_pnl <= -self.config.daily_loss_limit_usd
 
     def check_position(self, position: Position, current_price: float, estimated_prob: float) -> Optional[str]:
-        """
-        Check if a position should be closed.
+        """Check if a position should be closed.
 
-        Returns close reason string, or None to keep position open.
+        Exit hierarchy:
+        1. Position resolved (price at 0 or 1)
+        2. Stop-loss (down 25%)
+        3. Aggressive exit (up 30%+)
+        4. Trailing stop (was up 15%, dropped back)
+        5. Take-profit (edge converged, min $5 profit, held 60s+)
         """
         if position.status != "open":
             return None
 
-        # Update current price and unrealized P&L
         position.current_price = current_price
 
         if position.side == "buy":
@@ -50,46 +50,67 @@ class RiskManager:
             pnl_per_unit = position.entry_price - current_price
 
         position.unrealized_pnl = pnl_per_unit * position.quantity
+        gain_pct = pnl_per_unit / position.entry_price if position.entry_price > 0 else 0
 
-        # Stop-loss check
+        # Track peak favorable price for trailing stop
+        if position.side == "buy":
+            if current_price > position.peak_price:
+                position.peak_price = current_price
+        else:
+            # For shorts, "peak" means lowest price (most favorable)
+            if position.peak_price == 0 or current_price < position.peak_price:
+                position.peak_price = current_price
+
+        # 1. Resolved: price hit 0 or 1
+        if current_price <= 0.01 or current_price >= 0.99:
+            return "resolved"
+
+        # 2. Stop-loss
         loss_pct = -pnl_per_unit / position.entry_price if position.entry_price > 0 else 0
         if loss_pct >= self.config.stop_loss_threshold:
             return "stop_loss"
 
-        # Take-profit: close when price converges to estimated fair value
-        # Guards: must be held 60s+ AND position must be in actual profit
+        # 3. Aggressive exit: up 30%+ from entry
+        if gain_pct >= self.config.aggressive_exit_pct:
+            return "aggressive_exit"
+
+        # 4. Trailing stop: was up 15%+, dropped 10% from peak
+        if position.peak_price > 0 and position.entry_price > 0:
+            if position.side == "buy":
+                peak_gain = (position.peak_price - position.entry_price) / position.entry_price
+                drop_from_peak = (position.peak_price - current_price) / position.entry_price
+            else:
+                peak_gain = (position.entry_price - position.peak_price) / position.entry_price
+                drop_from_peak = (current_price - position.peak_price) / position.entry_price
+
+            if peak_gain >= self.config.trailing_stop_activation_pct:
+                if drop_from_peak >= self.config.trailing_stop_pct:
+                    return "trailing_stop"
+
+        # 5. Take-profit: edge converged, but only if min $5 profit and held 60s+
         edge_remaining = abs(estimated_prob - current_price)
         if edge_remaining <= self.config.take_profit_threshold:
-            # Only take profit if the position is actually profitable
-            if pnl_per_unit <= 0:
-                pass  # Not in profit — don't close
+            if position.unrealized_pnl < self.config.minimum_take_profit_usd:
+                pass  # Under $5 profit — hold
+            elif pnl_per_unit <= 0:
+                pass  # Not in profit
             elif position.entry_time:
                 now = datetime.now(timezone.utc)
                 entry = position.entry_time
                 if entry.tzinfo is None:
                     entry = entry.replace(tzinfo=timezone.utc)
-                held_seconds = (now - entry).total_seconds()
-                if held_seconds >= MIN_HOLD_SECONDS:
+                if (now - entry).total_seconds() >= MIN_HOLD_SECONDS:
                     return "take_profit"
-
-        # Position resolved: price hit 0 or 1
-        if current_price <= 0.01 or current_price >= 0.99:
-            return "resolved"
 
         return None
 
     def can_open_position(self, current_positions: List[Position]) -> bool:
-        """Check if we're allowed to open a new position."""
         open_positions = [p for p in current_positions if p.status == "open"]
-
         if len(open_positions) >= self.config.max_open_positions:
             return False
-
         if self.is_daily_limit_breached():
             return False
-
         return True
 
     def get_portfolio_exposure(self, positions: List[Position]) -> float:
-        """Calculate total portfolio exposure in USD."""
         return sum(p.size_usd for p in positions if p.status == "open")

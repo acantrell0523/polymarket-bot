@@ -98,6 +98,7 @@ class Position:
     close_time: Optional[datetime] = None
     realized_pnl: float = 0.0
     slug: str = ""
+    peak_price: float = 0.0  # highest favorable price seen (for trailing stop)
 
 
 @dataclass

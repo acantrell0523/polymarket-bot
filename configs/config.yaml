@@ -51,29 +51,36 @@ wallet:
 # --- Trading Parameters ---
 trading:
   # Minimum edge (estimated_prob - market_price) to trigger a trade
-  min_edge_threshold: 0.03  # 3% minimum edge required
+  min_edge_threshold: 0.05  # 5% — only trade significant disagreements
   # Maximum edge — reject outliers that may indicate bad data
   max_edge_threshold: 0.40  # 40%
   # Position sizing method: "kelly" or "fixed_fractional"
-  position_sizing_method: "fixed_fractional"  # optimized via sweep
-  # Fixed fractional: fraction of bankroll per trade (used if method=fixed_fractional)
-  fixed_fraction: 0.15  # 15% of bankroll (aggressive)
+  position_sizing_method: "fixed_fractional"
+  # Fixed fractional: fraction of bankroll per trade
+  fixed_fraction: 0.15
   # Kelly fraction multiplier (use half-Kelly for safety)
   kelly_fraction: 0.5
   # Maximum position size in USDC per single trade
-  max_position_size_usd: 10.0
+  max_position_size_usd: 25.0
   # Minimum position size in USDC (below this, skip the trade)
-  min_position_size_usd: 1.0
+  min_position_size_usd: 5.0
   # Maximum total portfolio exposure in USDC across all open positions
   max_portfolio_exposure_usd: 500.0
   # Stop-loss threshold: close position if unrealized loss exceeds this fraction
-  stop_loss_threshold: 0.25  # 25% loss triggers stop-loss (more room during volatile games)
+  stop_loss_threshold: 0.25  # 25% loss triggers stop-loss
   # Take-profit threshold: close position when price converges within this of fair value
-  take_profit_threshold: 0.05  # Within 5% of estimated fair value (lets winners run)
+  take_profit_threshold: 0.05
+  # Minimum profit in USD before take-profit can trigger
+  minimum_take_profit_usd: 5.0
+  # Aggressive exit: close if position is up this % from entry
+  aggressive_exit_pct: 0.30  # 30% gain = close
+  # Trailing stop: if position was up this much and drops back, close it
+  trailing_stop_activation_pct: 0.15  # activate trailing stop after 15% gain
+  trailing_stop_pct: 0.10  # close if drops 10% from peak (e.g., was +15%, now +5%)
   # Daily loss limit in USDC — halt all trading when breached
   daily_loss_limit_usd: 200.0
   # Maximum number of concurrent open positions
-  max_open_positions: 20
+  max_open_positions: 5
   # Paper trading mode (no real orders submitted)
   paper_trading: true
 
