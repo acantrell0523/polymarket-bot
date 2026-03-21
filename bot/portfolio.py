@@ -66,7 +66,11 @@ class Portfolio:
             bal = self._client.account.balances()
             balances = bal.get("balances", [])
             if balances:
-                self._balance_cache = float(balances[0].get("currentBalance", 0))
+                b = balances[0]
+                # buyingPower = actual available cash (what the app shows)
+                # currentBalance includes margin held for SHORT positions
+                self._balance_cache = float(b.get("buyingPower", b.get("currentBalance", 0)))
+                self._margin_held = float(b.get("marginRequirement", 0))
         except Exception:
             pass
 
