@@ -73,24 +73,20 @@ class TradingBot:
             self.espn_cache, self.game_context,
         )
 
-        # Fetch real balance from exchange for live mode
-        initial_bankroll = config.backtest.initial_bankroll_usd
-        if not config.trading.paper_trading and self.executor._client:
-            try:
-                bal = self.executor._client.account.balances()
-                balances = bal.get("balances", [])
-                if balances:
-                    initial_bankroll = float(balances[0].get("currentBalance", initial_bankroll))
-                    self.logger.info("bankroll_from_exchange", {"balance": initial_bankroll})
-            except Exception as e:
-                self.logger.warning("bankroll_fetch_failed", {"error": str(e)})
-
         self.portfolio = Portfolio(
-            initial_bankroll=initial_bankroll,
+            exchange_client=self.executor._client,
             logger=self.logger,
             alerter=self.alerter,
             alert_config=config.alerts,
+            paper_mode=config.trading.paper_trading,
+            initial_bankroll=config.backtest.initial_bankroll_usd,
         )
+        self.logger.info("portfolio_initialized", {
+            "paper_mode": config.trading.paper_trading,
+            "exchange_connected": self.executor._client is not None,
+            "bankroll": round(self.portfolio.bankroll, 2),
+            "equity": round(self.portfolio.get_equity(), 2),
+        })
         self.running = True
 
         # Cooldown tracker: slug → earliest time we can reopen
@@ -230,7 +226,7 @@ class TradingBot:
         games_opening = set()
 
         for trade_signal, snapshot in opportunities[:slots]:
-            if not self.risk.can_open_position(self.portfolio.positions):
+            if not self.risk.can_open_position(self.portfolio.get_open_positions()):
                 break
 
             # One position per game within the same batch
@@ -256,76 +252,21 @@ class TradingBot:
                 self._log_edge_entry(trade_signal, snapshot)
 
     def _get_exchange_pnl(self, slug: str, position) -> Optional[float]:
-        """Get actual P&L from the exchange for a closed position.
-
-        Checks the exchange balance change or position settlement data.
-        Returns None if unavailable (falls back to bot calculation).
-        """
+        """Get actual P&L from the exchange for a closed position."""
         if not self.executor._client:
             return None
         try:
-            # Check if the position still exists on exchange
-            positions = self.executor.get_exchange_positions()
+            positions = self.portfolio.get_exchange_positions()
             if slug in positions:
                 ex_pos = positions[slug]
                 cost = float(ex_pos.get("cost", {}).get("value", "0"))
                 cash_value = float(ex_pos.get("cashValue", {}).get("value", "0"))
                 net = int(ex_pos.get("netPosition", "0"))
                 if net == 0:
-                    # Position closed — P&L = cashValue - cost
                     return cash_value - cost
-            # Position not on exchange anymore — it settled
-            # For resolved markets, calculate from known settlement
             return None
         except Exception:
             return None
-
-    def _reconcile_pnl(self):
-        """Compare bot's internal P&L tracking to exchange balance.
-
-        Logs a warning if they differ by more than $1.
-        """
-        if not self.executor._client:
-            return
-        try:
-            bal = self.executor._client.account.balances()
-            balances = bal.get("balances", [])
-            if not balances:
-                return
-            exchange_balance = float(balances[0].get("currentBalance", 0))
-            bot_bankroll = self.portfolio.bankroll
-
-            # Get value of open positions
-            positions = self.executor.get_exchange_positions()
-            pos_value = 0.0
-            for slug, p in positions.items():
-                pos_value += float(p.get("cashValue", {}).get("value", "0"))
-
-            exchange_total = exchange_balance + pos_value
-            diff = abs(exchange_total - bot_bankroll)
-
-            if diff > 1.0:
-                self.logger.warning("pnl_reconciliation_mismatch", {
-                    "exchange_balance": round(exchange_balance, 2),
-                    "exchange_positions_value": round(pos_value, 2),
-                    "exchange_total": round(exchange_total, 2),
-                    "bot_bankroll": round(bot_bankroll, 2),
-                    "difference": round(diff, 2),
-                })
-                # Sync bankroll to exchange reality
-                self.portfolio.bankroll = exchange_total
-                self.logger.info("bankroll_synced_to_exchange", {
-                    "old": round(bot_bankroll, 2),
-                    "new": round(exchange_total, 2),
-                })
-            else:
-                self.logger.info("pnl_reconciliation_ok", {
-                    "exchange_total": round(exchange_total, 2),
-                    "bot_bankroll": round(bot_bankroll, 2),
-                    "diff": round(diff, 2),
-                })
-        except Exception as e:
-            self.logger.error("pnl_reconciliation_failed", {"error": str(e)})
 
     def _check_live_ncaa_edges(self):
         """Check live NCAA game odds for fast-moving edges.
@@ -510,56 +451,6 @@ class TradingBot:
         if has_live_games:
             self.risk.config.take_profit_threshold = original_tp
 
-    def sync_from_exchange(self):
-        """Rebuild internal position state from the exchange's actual positions."""
-        exchange_positions = self.executor.get_exchange_positions()
-        if not exchange_positions:
-            self.logger.warning("sync_no_exchange_positions", {
-                "message": "No positions returned from exchange"
-            })
-            return
-
-        # Clear existing internal positions
-        old_count = len(self.portfolio.get_open_positions())
-        self.portfolio.positions = []
-
-        from utils.models import Position
-        for slug, p_data in exchange_positions.items():
-            net = int(p_data.get("netPosition", "0"))
-            if net == 0:
-                continue
-
-            cost_val = float(p_data.get("cost", {}).get("value", "0"))
-            cash_val = float(p_data.get("cashValue", {}).get("value", "0"))
-            qty = abs(net)
-            entry_price = cost_val / qty if qty > 0 else 0
-            current_price_est = cash_val / qty if qty > 0 else entry_price
-            side = "buy" if net > 0 else "sell"
-
-            meta = p_data.get("marketMetadata", {})
-            title = meta.get("title", slug)
-
-            position = Position(
-                market_id=slug,
-                token_id=slug,
-                side=side,
-                entry_price=entry_price,
-                size_usd=cost_val,
-                quantity=qty,
-                estimated_prob=0.5,
-                entry_time=datetime.now(timezone.utc),
-                current_price=current_price_est,
-                slug=slug,
-            )
-            self.portfolio.positions.append(position)
-
-        new_count = len(self.portfolio.get_open_positions())
-        self.logger.info("sync_complete", {
-            "old_internal_positions": old_count,
-            "exchange_positions": len(exchange_positions),
-            "synced_positions": new_count,
-        })
-
     def _do_full_scan(self) -> List[Dict]:
         """Full market scan — fetches all markets, processes everything."""
         markets = self.market_data.get_active_markets()
@@ -617,20 +508,18 @@ class TradingBot:
             "full_scan_interval": self.full_scan_interval,
         })
 
+        equity = self.portfolio.get_equity()
+
         print(f"\n{'='*60}")
         print(f"  Polymarket Trading Bot - {mode} MODE")
-        print(f"  Bankroll: ${self.portfolio.bankroll:.2f}")
+        print(f"  Cash balance: ${self.portfolio.bankroll:.2f}")
+        print(f"  Account value: ${equity:.2f}")
         print(f"  Fast scan: {self.live_scan_interval}s (live games only)")
         print(f"  Full scan: {self.full_scan_interval}s (all markets)")
         print(f"  Edge threshold: {self.config.trading.min_edge_threshold*100:.1f}% "
               f"(live: {self.live_min_edge*100:.1f}%)")
 
-        # Sync internal state from exchange
-        if not self.config.trading.paper_trading:
-            print("  Syncing positions from exchange...")
-            self.sync_from_exchange()
-
-        # Log open positions
+        # Log open positions (from exchange)
         self._log_open_positions()
         print(f"{'='*60}\n")
 
@@ -663,6 +552,9 @@ class TradingBot:
                     # === FULL SCAN: all markets ===
                     self.logger.info("full_scan_start", {"cycle": cycle})
 
+                    # Force fresh exchange data for this cycle
+                    self.portfolio.invalidate_cache()
+
                     markets = self._do_full_scan()
                     if not markets:
                         self.logger.warning("no_markets_found", {"cycle": cycle})
@@ -685,10 +577,6 @@ class TradingBot:
                     self.check_positions(has_live, cycle=cycle)
                     self.portfolio.record_equity()
 
-                    # P&L reconciliation every ~10 minutes (every 10th full scan)
-                    if cycle % 200 == 0 and cycle > 0:
-                        self._reconcile_pnl()
-
                     stats = self.portfolio.get_stats()
                     self.logger.info("full_scan_complete", {
                         "cycle": cycle,
@@ -698,7 +586,8 @@ class TradingBot:
                         "open_positions": len(self.portfolio.get_open_positions()),
                         "total_trades": stats["total_trades"],
                         "total_pnl": round(stats["total_pnl"], 2),
-                        "bankroll": round(self.portfolio.bankroll, 2),
+                        "cash_balance": round(self.portfolio.bankroll, 2),
+                        "account_value": round(self.portfolio.get_equity(), 2),
                     })
 
                 else:

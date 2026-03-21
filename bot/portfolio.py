@@ -1,4 +1,16 @@
-"""Position tracking and P&L accounting."""
+"""Portfolio manager — thin wrapper around the Polymarket exchange API.
+
+The exchange is the SINGLE source of truth for:
+  - Cash balance (bankroll)
+  - Open positions and their current value
+  - Unrealized P&L
+  - Total account value
+
+Internal state is only used for:
+  - Tracking which positions the BOT opened (vs manual)
+  - Logging trades to SQLite for edge analysis
+  - Alerting on trade events
+"""
 
 from datetime import datetime, timezone
 from typing import List, Optional, Dict
@@ -8,22 +20,161 @@ from bot import trade_db
 
 
 class Portfolio:
-    """Tracks positions, trades, and P&L."""
+    """Exchange-backed portfolio tracker. All financial data comes from the API."""
 
-    def __init__(self, initial_bankroll: float, logger: Optional[TradingLogger] = None,
-                 alerter=None, alert_config=None):
-        self.initial_bankroll = initial_bankroll
-        self.bankroll = initial_bankroll
-        self.positions: List[Position] = []
-        self.trades: List[Trade] = []
-        self.equity_curve: List[float] = [initial_bankroll]
-        self.timestamps: List[datetime] = [datetime.now(timezone.utc)]
+    def __init__(self, exchange_client=None, logger: Optional[TradingLogger] = None,
+                 alerter=None, alert_config=None, paper_mode: bool = True,
+                 initial_bankroll: float = 0.0):
+        self._client = exchange_client
         self.logger = logger
         self.alerter = alerter
         self.alert_config = alert_config
+        self.paper_mode = paper_mode
+
+        # Paper mode fallback — only used when no exchange client
+        self._paper_bankroll = initial_bankroll
+
+        # Internal tracking for bot-opened positions (slug set)
+        self._bot_positions: set = set()
+
+        # Equity curve for charting
+        self.equity_curve: List[float] = []
+        self.timestamps: List[datetime] = []
+
+        # Cache exchange data to avoid hammering API within the same cycle
+        self._balance_cache: Optional[float] = None
+        self._positions_cache: Optional[Dict] = None
+        self._cache_time: float = 0
+        self._cache_ttl: float = 2.0  # seconds
+
+    # ------------------------------------------------------------------
+    # Exchange API calls (source of truth)
+    # ------------------------------------------------------------------
+
+    def _refresh_cache(self):
+        """Refresh cached exchange data if stale."""
+        import time
+        now = time.time()
+        if now - self._cache_time < self._cache_ttl:
+            return
+        self._cache_time = now
+
+        if not self._client:
+            return
+
+        try:
+            bal = self._client.account.balances()
+            balances = bal.get("balances", [])
+            if balances:
+                self._balance_cache = float(balances[0].get("currentBalance", 0))
+        except Exception:
+            pass
+
+        try:
+            result = self._client.portfolio.positions()
+            self._positions_cache = result.get("positions", {})
+        except Exception:
+            pass
+
+    def invalidate_cache(self):
+        """Force next access to re-fetch from exchange."""
+        self._cache_time = 0
+
+    @property
+    def bankroll(self) -> float:
+        """Cash balance from the exchange."""
+        if self.paper_mode or not self._client:
+            return self._paper_bankroll
+        self._refresh_cache()
+        return self._balance_cache if self._balance_cache is not None else 0.0
+
+    @bankroll.setter
+    def bankroll(self, value: float):
+        """Paper mode bankroll setter."""
+        self._paper_bankroll = value
+
+    def get_exchange_positions(self) -> Dict:
+        """Get raw position data from exchange."""
+        if self.paper_mode or not self._client:
+            return {}
+        self._refresh_cache()
+        return self._positions_cache or {}
+
+    def get_open_positions(self) -> List[Position]:
+        """Get open positions from the exchange."""
+        if self.paper_mode or not self._client:
+            return self._get_paper_positions()
+
+        self._refresh_cache()
+        positions = []
+        for slug, p_data in (self._positions_cache or {}).items():
+            net = int(p_data.get("netPosition", "0"))
+            if net == 0:
+                continue
+
+            cost_val = float(p_data.get("cost", {}).get("value", "0"))
+            cash_val = float(p_data.get("cashValue", {}).get("value", "0"))
+            qty = abs(net)
+            entry_price = cost_val / qty if qty > 0 else 0
+            side = "buy" if net > 0 else "sell"
+
+            pos = Position(
+                market_id=slug,
+                token_id=slug,
+                side=side,
+                entry_price=entry_price,
+                size_usd=cost_val,
+                quantity=qty,
+                estimated_prob=0.5,
+                entry_time=datetime.now(timezone.utc),
+                current_price=cash_val / qty if qty > 0 else entry_price,
+                slug=slug,
+            )
+            pos.unrealized_pnl = cash_val - cost_val
+            positions.append(pos)
+
+        return positions
+
+    def get_total_exposure(self) -> float:
+        """Total USD cost of open positions, from the exchange."""
+        if self.paper_mode or not self._client:
+            return sum(p.size_usd for p in self._get_paper_positions())
+
+        self._refresh_cache()
+        total = 0.0
+        for slug, p_data in (self._positions_cache or {}).items():
+            net = int(p_data.get("netPosition", "0"))
+            if net != 0:
+                total += float(p_data.get("cost", {}).get("value", "0"))
+        return total
+
+    def get_equity(self) -> float:
+        """Total account value: cash + position value, from the exchange."""
+        if self.paper_mode or not self._client:
+            return self._paper_bankroll
+
+        self._refresh_cache()
+        cash = self._balance_cache or 0
+        pos_value = 0.0
+        for slug, p_data in (self._positions_cache or {}).items():
+            pos_value += float(p_data.get("cashValue", {}).get("value", "0"))
+        return cash + pos_value
+
+    # ------------------------------------------------------------------
+    # Paper mode helpers
+    # ------------------------------------------------------------------
+
+    _paper_positions: List[Position] = []
+
+    def _get_paper_positions(self) -> List[Position]:
+        return [p for p in self._paper_positions if p.status == "open"]
+
+    # ------------------------------------------------------------------
+    # Trade lifecycle
+    # ------------------------------------------------------------------
 
     def open_position(self, signal: TradeSignal, trade: Trade) -> Position:
-        """Open a new position from a trade."""
+        """Record a new position opened by the bot."""
         position = Position(
             market_id=signal.market_id,
             token_id=signal.token_id,
@@ -37,11 +188,12 @@ class Portfolio:
             slug=signal.slug,
         )
 
-        self.positions.append(position)
-        self.trades.append(trade)
+        self._bot_positions.add(signal.slug)
+        self.invalidate_cache()
 
-        # Deduct fees from bankroll
-        self.bankroll -= trade.fees
+        if self.paper_mode:
+            self._paper_positions.append(position)
+            self._paper_bankroll -= trade.fees
 
         if self.logger:
             self.logger.info("position_opened", {
@@ -50,6 +202,7 @@ class Portfolio:
                 "entry_price": trade.price,
                 "size_usd": trade.size_usd,
                 "edge": signal.edge,
+                "bankroll": round(self.bankroll, 2),
             })
 
         if self.alerter and self.alert_config and self.alert_config.on_trade_open:
@@ -68,72 +221,19 @@ class Portfolio:
     def close_position(self, position: Position, current_price: float,
                        reason: str, timestamp: Optional[datetime] = None,
                        exchange_pnl: Optional[float] = None) -> float:
-        """
-        Close a position and realize P&L.
-
-        For SHORT (sell) positions that resolve:
-          - We sold shares at entry_price, outcome went to 0 → we keep everything
-          - P&L = entry_price * quantity (minus fees)
-
-        For LONG (buy) positions that resolve:
-          - We bought shares at entry_price, outcome went to 1 → payout is quantity
-          - P&L = (1.0 - entry_price) * quantity (minus fees)
-
-        For non-resolved exits, P&L = price movement * quantity.
-
-        If exchange_pnl is provided (from the exchange API), use that as source of truth.
-
-        Returns realized P&L.
-        """
+        """Record a position close. P&L comes from the exchange when available."""
         if position.status != "open":
             return 0.0
 
         close_time = timestamp or datetime.now(timezone.utc)
+        self.invalidate_cache()
 
+        # Get P&L from exchange (source of truth)
         if exchange_pnl is not None:
-            # Exchange-reported P&L is the source of truth
             realized_pnl = exchange_pnl
-            close_fees = 0.0  # already accounted for by exchange
-        elif reason == "resolved":
-            # Market resolved — settlement P&L
-            if current_price <= 0.01:
-                # Outcome resolved NO (price → 0)
-                if position.side == "sell":
-                    # SHORT wins: we sold at entry_price, outcome worth 0
-                    realized_pnl = position.entry_price * position.quantity
-                    close_fees = 0.0  # no trade on settlement
-                else:
-                    # LONG loses: we bought at entry_price, outcome worth 0
-                    realized_pnl = -position.entry_price * position.quantity
-                    close_fees = 0.0
-            elif current_price >= 0.99:
-                # Outcome resolved YES (price → 1)
-                if position.side == "buy":
-                    # LONG wins: payout = 1.0 per share, cost = entry_price
-                    realized_pnl = (1.0 - position.entry_price) * position.quantity
-                    close_fees = 0.0
-                else:
-                    # SHORT loses: we owe 1.0 per share, received entry_price
-                    realized_pnl = -(1.0 - position.entry_price) * position.quantity
-                    close_fees = 0.0
-            else:
-                # Resolved at an intermediate price (e.g., auto-settle)
-                if position.side == "buy":
-                    pnl_per_unit = current_price - position.entry_price
-                else:
-                    pnl_per_unit = position.entry_price - current_price
-                realized_pnl = pnl_per_unit * position.quantity
-                close_fees = 0.0  # settlement, no taker fee
         else:
-            # Active close (not resolved) — standard P&L
-            if position.side == "buy":
-                pnl_per_unit = current_price - position.entry_price
-            else:
-                pnl_per_unit = position.entry_price - current_price
-            realized_pnl = pnl_per_unit * position.quantity
-            close_value = current_price * position.quantity
-            close_fees = close_value * 0.02  # 2% taker fee
-            realized_pnl -= close_fees
+            # Fallback calculation for resolved markets
+            realized_pnl = self._calculate_pnl(position, current_price, reason)
 
         position.status = "closed"
         position.close_reason = reason
@@ -141,23 +241,8 @@ class Portfolio:
         position.close_time = close_time
         position.realized_pnl = realized_pnl
 
-        self.bankroll += realized_pnl
-
-        # Record exit trade
-        close_value = current_price * position.quantity
-        exit_trade = Trade(
-            market_id=position.market_id,
-            token_id=position.token_id,
-            side="sell" if position.side == "buy" else "buy",
-            price=current_price,
-            quantity=position.quantity,
-            size_usd=close_value,
-            timestamp=close_time,
-            trade_type="exit",
-            fees=close_fees,
-            is_paper=False,
-        )
-        self.trades.append(exit_trade)
+        if self.paper_mode:
+            self._paper_bankroll += realized_pnl
 
         if self.logger:
             self.logger.info("position_closed", {
@@ -167,7 +252,7 @@ class Portfolio:
                 "entry_price": position.entry_price,
                 "close_price": current_price,
                 "pnl": round(realized_pnl, 2),
-                "exchange_pnl": round(exchange_pnl, 2) if exchange_pnl is not None else None,
+                "bankroll": round(self.bankroll, 2),
             })
 
         if self.alerter and self.alert_config and self.alert_config.on_trade_close:
@@ -181,7 +266,7 @@ class Portfolio:
                 close_reason=reason,
             )
 
-        # Persist to SQLite for supervisor analysis
+        # Persist to SQLite for edge analysis (not P&L source of truth)
         try:
             slug = getattr(position, 'slug', position.market_id)
             market_type = ""
@@ -206,9 +291,9 @@ class Portfolio:
                 close_time=close_time,
             )
         except Exception:
-            pass  # DB errors must not break trading
+            pass
 
-        # Update edge log with outcome
+        # Update edge log
         try:
             from bot.edge_log import update_edge_log_outcome
             slug = getattr(position, 'slug', position.market_id)
@@ -216,8 +301,7 @@ class Portfolio:
             if position.entry_time:
                 entry = position.entry_time
                 if entry.tzinfo is None:
-                    from datetime import timezone as _tz
-                    entry = entry.replace(tzinfo=_tz.utc)
+                    entry = entry.replace(tzinfo=timezone.utc)
                 time_held = (close_time - entry).total_seconds()
             update_edge_log_outcome(
                 slug=slug,
@@ -229,26 +313,33 @@ class Portfolio:
                 final_outcome="win" if realized_pnl > 0 else "loss",
             )
         except Exception:
-            pass  # Edge log errors must not break trading
+            pass
 
         return realized_pnl
 
-    def get_open_positions(self) -> List[Position]:
-        """Get all open positions."""
-        return [p for p in self.positions if p.status == "open"]
+    def _calculate_pnl(self, position: Position, current_price: float, reason: str) -> float:
+        """Fallback P&L calculation when exchange data unavailable."""
+        if reason == "resolved":
+            if current_price <= 0.01:
+                if position.side == "sell":
+                    return position.entry_price * position.quantity
+                else:
+                    return -position.entry_price * position.quantity
+            elif current_price >= 0.99:
+                if position.side == "buy":
+                    return (1.0 - position.entry_price) * position.quantity
+                else:
+                    return -(1.0 - position.entry_price) * position.quantity
 
-    def get_total_exposure(self) -> float:
-        """Get total USD exposure across open positions."""
-        return sum(p.size_usd for p in self.get_open_positions())
+        if position.side == "buy":
+            pnl = (current_price - position.entry_price) * position.quantity
+        else:
+            pnl = (position.entry_price - current_price) * position.quantity
+        return pnl
 
-    def get_total_pnl(self) -> float:
-        """Get total realized P&L."""
-        return sum(p.realized_pnl for p in self.positions if p.status == "closed")
-
-    def get_equity(self) -> float:
-        """Get current equity (bankroll + unrealized P&L)."""
-        unrealized = sum(p.unrealized_pnl for p in self.get_open_positions())
-        return self.bankroll + unrealized
+    # ------------------------------------------------------------------
+    # Stats (for logging — NOT source of truth for P&L)
+    # ------------------------------------------------------------------
 
     def record_equity(self, timestamp: Optional[datetime] = None):
         """Record current equity for the equity curve."""
@@ -256,27 +347,31 @@ class Portfolio:
         self.timestamps.append(timestamp or datetime.now(timezone.utc))
 
     def get_stats(self) -> Dict:
-        """Compute portfolio statistics."""
-        closed = [p for p in self.positions if p.status == "closed"]
+        """Get stats from trade_db (exchange-persisted trades)."""
+        from datetime import timedelta
+        try:
+            since = datetime.now(timezone.utc) - timedelta(days=1)
+            trades = trade_db.get_trades_since(since)
+            if not trades:
+                return {"total_trades": 0, "win_rate": 0.0, "total_pnl": 0.0,
+                        "avg_pnl": 0.0, "winning_trades": 0, "losing_trades": 0,
+                        "avg_win": 0, "avg_loss": 0}
 
-        if not closed:
+            wins = [t for t in trades if t["realized_pnl"] > 0]
+            losses = [t for t in trades if t["realized_pnl"] <= 0]
+            total_pnl = sum(t["realized_pnl"] for t in trades)
+
             return {
-                "total_trades": 0,
-                "win_rate": 0.0,
-                "total_pnl": 0.0,
-                "avg_pnl": 0.0,
+                "total_trades": len(trades),
+                "winning_trades": len(wins),
+                "losing_trades": len(losses),
+                "win_rate": len(wins) / len(trades) if trades else 0,
+                "total_pnl": total_pnl,
+                "avg_pnl": total_pnl / len(trades),
+                "avg_win": sum(t["realized_pnl"] for t in wins) / len(wins) if wins else 0,
+                "avg_loss": sum(t["realized_pnl"] for t in losses) / len(losses) if losses else 0,
             }
-
-        wins = [p for p in closed if p.realized_pnl > 0]
-        losses = [p for p in closed if p.realized_pnl <= 0]
-
-        return {
-            "total_trades": len(closed),
-            "winning_trades": len(wins),
-            "losing_trades": len(losses),
-            "win_rate": len(wins) / len(closed) if closed else 0,
-            "total_pnl": sum(p.realized_pnl for p in closed),
-            "avg_pnl": sum(p.realized_pnl for p in closed) / len(closed),
-            "avg_win": sum(p.realized_pnl for p in wins) / len(wins) if wins else 0,
-            "avg_loss": sum(p.realized_pnl for p in losses) / len(losses) if losses else 0,
-        }
+        except Exception:
+            return {"total_trades": 0, "win_rate": 0.0, "total_pnl": 0.0,
+                    "avg_pnl": 0.0, "winning_trades": 0, "losing_trades": 0,
+                    "avg_win": 0, "avg_loss": 0}
