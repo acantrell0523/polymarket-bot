@@ -73,8 +73,12 @@ class RiskManager:
             if position.peak_price == 0 or current_price < position.peak_price:
                 position.peak_price = current_price
 
-        # 1. Resolved: price hit 0 or 1 — always exit immediately
-        if current_price <= 0.01 or current_price >= 0.99:
+        # 1. Resolved: only when the market is ACTUALLY closed on the exchange.
+        # A price of 0.99 during a live game just means high confidence, NOT resolution.
+        # The exchange marks markets as resolved — we check that in the trading loop,
+        # not here. We only trigger "resolved" at the absolute extremes (0.00 or 1.00)
+        # which indicate actual settlement.
+        if current_price <= 0.001 or current_price >= 0.999:
             return "resolved"
 
         # 2. Stop-loss (25%) — always exit immediately
