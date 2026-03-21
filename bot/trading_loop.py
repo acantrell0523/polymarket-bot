@@ -93,6 +93,10 @@ class TradingBot:
         self._slug_cooldowns: Dict[str, float] = {}
         self._cooldown_seconds = 600  # 10 minutes
 
+        # Slugs we've already auto-settled — persisted to file so it survives restarts
+        self._settled_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "settled_slugs.txt")
+        self._settled_slugs: set = self._load_settled_slugs()
+
         # Live-game estimator with aggressive weights
         live_signal_config = copy.deepcopy(config.signals)
         live_signal_config.odds_value_weight = 0.40
@@ -251,6 +255,21 @@ class TradingBot:
                 # Log edge snapshot for this trade
                 self._log_edge_entry(trade_signal, snapshot)
 
+    def _load_settled_slugs(self) -> set:
+        try:
+            with open(self._settled_file, "r") as f:
+                return set(line.strip() for line in f if line.strip())
+        except FileNotFoundError:
+            return set()
+
+    def _save_settled_slug(self, slug: str):
+        self._settled_slugs.add(slug)
+        try:
+            with open(self._settled_file, "a") as f:
+                f.write(slug + "\n")
+        except Exception:
+            pass
+
     def _get_exchange_pnl(self, slug: str, position) -> Optional[float]:
         """Get actual P&L from the exchange for a closed position."""
         if not self.executor._client:
@@ -381,6 +400,11 @@ class TradingBot:
         for position in open_positions:
             # Fetch live price from the exchange
             slug = position.slug or position.market_id
+
+            # Skip positions we've already auto-settled (waiting for exchange cleanup)
+            if slug in self._settled_slugs:
+                continue
+
             live_price = self.market_data.get_live_price(slug)
 
             if live_price is not None:
@@ -445,7 +469,22 @@ class TradingBot:
                 # Submit close order to the exchange
                 closed_on_exchange = self.executor.close_position(position)
                 if closed_on_exchange:
+                    # Check if this was an auto-settle (no real close happened)
+                    was_auto_settled = getattr(self.executor, '_last_close_was_auto_settle', False)
+                    self.executor._last_close_was_auto_settle = False
+
+                    if was_auto_settled:
+                        # Position is settling on exchange — don't write to DB again
+                        self._save_settled_slug(slug)
+                        self.logger.info("position_auto_settled", {
+                            "slug": slug,
+                            "reason": close_reason,
+                            "message": "Awaiting exchange settlement, skipping DB write",
+                        })
+                        continue
+
                     # Try to get exchange-reported P&L as source of truth
+                    self.portfolio.invalidate_cache()
                     exchange_pnl = self._get_exchange_pnl(slug, position)
 
                     self.portfolio.close_position(

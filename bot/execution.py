@@ -323,6 +323,7 @@ class ExecutionEngine:
                                     "message": "3 failed closes, marking as auto-settling",
                                 })
                             del self._close_failures[slug]
+                            self._last_close_was_auto_settle = True
                             return True
                     if self.logger:
                         self.logger.warning("close_position_partial", {
