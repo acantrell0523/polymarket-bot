@@ -19,7 +19,7 @@ wallet:
 trading:
   min_edge_threshold: 0.05
   max_edge_threshold: 0.4
-  position_sizing_method: fixed_fractional
+  position_sizing_method: tiered_kelly
   fixed_fraction: 0.15
   kelly_fraction: 0.5
   max_position_size_usd: 25.0
@@ -34,7 +34,7 @@ trading:
   trailing_stop_pct: 0.1
   daily_loss_limit_usd: 200.0
   max_open_positions: 5
-  paper_trading: true
+  paper_trading: false
 signals:
   odds_value_weight: 0.40
   sports_context_weight: 0.15
