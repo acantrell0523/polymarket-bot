@@ -17,12 +17,12 @@ wallet:
   chain_id: 137
   approval_amount: '1000000000'
 trading:
-  min_edge_threshold: 0.05
+  min_edge_threshold: 0.065
   max_edge_threshold: 0.4
   position_sizing_method: tiered_kelly
   fixed_fraction: 0.15
   kelly_fraction: 0.5
-  max_position_size_usd: 25.0
+  max_position_size_usd: 3.12
   max_daily_trades: 15
   min_position_size_usd: 5.0
   max_portfolio_exposure_usd: 500.0
@@ -36,11 +36,11 @@ trading:
   max_open_positions: 5
   paper_trading: false
 signals:
-  odds_value_weight: 0.40
+  odds_value_weight: 0.4
   sports_context_weight: 0.15
-  line_movement_weight: 0.20
+  line_movement_weight: 0.2
   order_book_imbalance_weight: 0.15
-  liquidity_imbalance_weight: 0.10
+  liquidity_imbalance_weight: 0.1
 filters:
   min_daily_volume_usd: 500.0
   min_liquidity_usd: 200.0
