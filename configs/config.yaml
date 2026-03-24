@@ -17,24 +17,24 @@ wallet:
   chain_id: 137
   approval_amount: '1000000000'
 trading:
-  min_edge_threshold: 0.065
-  max_edge_threshold: 0.4
+  min_edge_threshold: 0.05
+  max_edge_threshold: 0.40
   position_sizing_method: tiered_kelly
   fixed_fraction: 0.15
   kelly_fraction: 0.5
-  max_position_size_usd: 3.12
+  max_position_size_usd: 25.0
   max_daily_trades: 15
   min_position_size_usd: 5.0
   max_portfolio_exposure_usd: 500.0
   stop_loss_threshold: 0.25
   take_profit_threshold: 0.05
   minimum_take_profit_usd: 5.0
-  aggressive_exit_pct: 0.3
+  aggressive_exit_pct: 0.30
   trailing_stop_activation_pct: 0.15
   trailing_stop_pct: 0.1
-  daily_loss_limit_usd: 200.0
+  daily_loss_limit_usd: 75.0
   max_open_positions: 5
-  paper_trading: false
+  paper_trading: true
 signals:
   odds_value_weight: 0.4
   sports_context_weight: 0.15
@@ -101,7 +101,7 @@ reporting:
   export_json: true
   export_csv: true
 alerts:
-  enabled: true
+  enabled: false
   slack_webhook_url: ''
   on_trade_open: true
   on_trade_close: true

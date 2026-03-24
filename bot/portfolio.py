@@ -232,12 +232,23 @@ class Portfolio:
         close_time = timestamp or datetime.now(timezone.utc)
         self.invalidate_cache()
 
-        # Get P&L from exchange (source of truth)
+        # Calculate P&L locally as fallback
+        calculated_pnl = self._calculate_pnl(position, current_price, reason)
+
         if exchange_pnl is not None:
+            # Exchange P&L is source of truth
             realized_pnl = exchange_pnl
+            # Cross-check: warn if bot calc differs by more than $0.50
+            if abs(exchange_pnl - calculated_pnl) > 0.50 and self.logger:
+                self.logger.warning("pnl_mismatch", {
+                    "slug": getattr(position, 'slug', position.market_id),
+                    "exchange_pnl": round(exchange_pnl, 2),
+                    "calculated_pnl": round(calculated_pnl, 2),
+                    "diff": round(abs(exchange_pnl - calculated_pnl), 2),
+                    "using": "exchange",
+                })
         else:
-            # Fallback calculation for resolved markets
-            realized_pnl = self._calculate_pnl(position, current_price, reason)
+            realized_pnl = calculated_pnl
 
         position.status = "closed"
         position.close_reason = reason
