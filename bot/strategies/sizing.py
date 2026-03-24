@@ -79,19 +79,22 @@ class PositionSizer:
         return kelly_f * bankroll
 
     def _tiered_kelly_size(self, signal: TradeSignal) -> float:
-        """Tiered Kelly: bet more on bigger edges.
+        """Tiered Kelly: go bigger on high conviction.
 
-        5-7% edge  → $15
-        7-10% edge → $25
-        10%+ edge  → $35
+        5-7% edge   → $20
+        7-10% edge  → $30
+        10-15% edge → $40
+        15%+ edge   → $50 (max)
         """
         abs_edge = abs(signal.edge) * 100  # convert to percentage
-        if abs_edge >= 10:
-            return 35.0
+        if abs_edge >= 15:
+            return 50.0
+        elif abs_edge >= 10:
+            return 40.0
         elif abs_edge >= 7:
-            return 25.0
+            return 30.0
         else:
-            return 15.0
+            return 20.0
 
     def _fixed_fractional_size(self, bankroll: float) -> float:
         """Fixed fractional: flat percentage of bankroll."""

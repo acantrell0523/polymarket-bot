@@ -56,6 +56,10 @@ class TradingBot:
         from bot.signals.live_odds import LiveOddsTracker
         self.live_odds_tracker = LiveOddsTracker(cache_ttl=30)
 
+        # Game schedule awareness
+        from bot.game_schedule import GameSchedule
+        self.game_schedule = GameSchedule(cache_ttl=120)
+
         if not self.odds_cache.enabled:
             self.logger.warning("odds_api_disabled", {
                 "message": "THE_ODDS_API_KEY not set — sports markets will not trade"
@@ -162,13 +166,16 @@ class TradingBot:
         return live, pregame
 
     def _detect_edge(self, snapshot: MarketSnapshot):
-        """Detect edge for a single market. Returns (signal, snapshot) or None."""
+        """Detect edge for a single market. Uses per-league minimum edge."""
+        from bot.strategies.trade_filter import get_league_min_edge
+
         if snapshot.is_live:
             estimator = self.live_estimator
-            min_edge = self.live_min_edge
         else:
             estimator = self.estimator
-            min_edge = self.config.trading.min_edge_threshold
+
+        # Per-league minimum edge (NHL=4%, NCAA=5%, NBA=7%)
+        min_edge = get_league_min_edge(snapshot.slug)
 
         trade_signal = estimator.detect_edge(
             snapshot,
@@ -180,16 +187,19 @@ class TradingBot:
         return (trade_signal, snapshot)
 
     def process_markets(self, snapshots: list):
-        """Rank all opportunities by edge size and execute the best ones."""
+        """Sniper strategy: rank ALL opportunities, take only the best 1-2.
+
+        Before any trade, every opportunity must pass the full validation
+        checklist in trade_filter.validate_trade().
+        """
         import time as _time
         from bot.edge_log import extract_game_id, get_open_game_ids
+        from bot.strategies.trade_filter import validate_trade, rank_opportunities, get_league_from_slug
 
         # Collect all edges
         opportunities = []
         open_positions = self.portfolio.get_open_positions()
         open_slugs = {p.slug for p in open_positions}
-
-        # Build game correlation map — one position per game max
         open_games = get_open_game_ids(open_positions)
 
         for snapshot in snapshots:
@@ -197,17 +207,11 @@ class TradingBot:
                 continue
             slug = snapshot.slug
 
-            # Skip if already holding this exact market
             if slug in open_slugs:
                 continue
-
-            # Skip if we already have a position on the same game
-            # (correlated market detection: moneyline + spread on same game = bad)
-            game_id = extract_game_id(slug)
-            if game_id in open_games:
+            if slug in self._settled_slugs:
                 continue
 
-            # Skip if in cooldown
             cooldown_until = self._slug_cooldowns.get(slug, 0)
             if _time.time() < cooldown_until:
                 continue
@@ -219,23 +223,53 @@ class TradingBot:
         if not opportunities:
             return
 
-        # Rank by absolute edge, descending — take only the best
-        opportunities.sort(key=lambda x: abs(x[0].edge), reverse=True)
+        # Rank with short bias (shorts score slightly higher)
+        opportunities = rank_opportunities(opportunities)
 
         slots = self.config.trading.max_open_positions - len(open_slugs)
         if slots <= 0:
             return
 
-        # Track games we're about to open in this batch to avoid duplicates
         games_opening = set()
 
-        for trade_signal, snapshot in opportunities[:slots]:
+        for trade_signal, snapshot in opportunities:
             if not self.risk.can_open_position(self.portfolio.get_open_positions()):
                 break
 
-            # One position per game within the same batch
             game_id = extract_game_id(trade_signal.slug)
-            if game_id in games_opening or game_id in open_games:
+
+            # Get number of books for this market
+            consensus = self.odds_cache.get_consensus_odds(trade_signal.slug)
+            num_books = consensus.get("num_books", 0) if consensus else 0
+
+            # Get game time remaining for last-5-minutes block
+            league = get_league_from_slug(trade_signal.slug)
+            parts = trade_signal.slug.split("-")
+            game_time_remaining = None
+            if len(parts) >= 4 and hasattr(self, 'game_schedule'):
+                game_time_remaining = self.game_schedule.get_game_time_remaining(
+                    league, parts[2], parts[3]
+                )
+
+            # Full validation checklist
+            rejection = validate_trade(
+                signal=trade_signal,
+                snapshot=snapshot,
+                num_books=num_books,
+                open_game_ids=open_games | games_opening,
+                game_id=game_id,
+                daily_trades=self.risk.daily_trade_count,
+                max_daily_trades=self.config.trading.max_daily_trades,
+                game_time_remaining=game_time_remaining,
+            )
+
+            if rejection:
+                self.logger.info("trade_rejected", {
+                    "slug": trade_signal.slug,
+                    "edge": round(trade_signal.edge * 100, 1),
+                    "side": trade_signal.side,
+                    "reason": rejection,
+                })
                 continue
 
             exposure = self.portfolio.get_total_exposure()
@@ -252,8 +286,17 @@ class TradingBot:
                 self.portfolio.open_position(trade_signal, trade)
                 self.risk.record_trade_opened()
                 games_opening.add(game_id)
-                # Log edge snapshot for this trade
                 self._log_edge_entry(trade_signal, snapshot)
+
+                self.logger.info("sniper_trade_executed", {
+                    "slug": trade_signal.slug,
+                    "side": trade_signal.side,
+                    "edge": round(trade_signal.edge * 100, 1),
+                    "size": size,
+                    "league": league,
+                    "books": num_books,
+                    "daily_trade": self.risk.daily_trade_count,
+                })
 
     def _load_settled_slugs(self) -> set:
         try:
@@ -585,6 +628,17 @@ class TradingBot:
 
         # Log open positions (from exchange)
         self._log_open_positions()
+
+        # Show today's game schedule
+        schedule = self.game_schedule.format_schedule()
+        if schedule:
+            print(f"\n  Today's Games:")
+            for line in schedule.split("\n"):
+                if line.strip():
+                    print(f"  {line}")
+
+        should_scan, reason = self.game_schedule.should_be_scanning()
+        print(f"\n  Scanning: {'YES' if should_scan else 'SLEEPING'} ({reason})")
         print(f"{'='*60}\n")
 
         # Initial full scan + startup alert
@@ -607,6 +661,14 @@ class TradingBot:
                 if not self._check_supervisor_flags():
                     time.sleep(10)
                     continue
+
+                # Game schedule awareness: sleep when no games within 2 hours
+                if not self.config.trading.paper_trading and cycle % 60 == 1:
+                    should_scan, reason = self.game_schedule.should_be_scanning()
+                    if not should_scan:
+                        self.logger.info("bot_sleeping", {"reason": reason})
+                        time.sleep(120)  # Check again in 2 minutes
+                        continue
 
                 now = time.time()
                 time_since_full = now - self._last_full_scan

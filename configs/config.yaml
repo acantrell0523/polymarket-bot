@@ -22,8 +22,8 @@ trading:
   position_sizing_method: tiered_kelly
   fixed_fraction: 0.15
   kelly_fraction: 0.5
-  max_position_size_usd: 25.0
-  max_daily_trades: 15
+  max_position_size_usd: 50.0
+  max_daily_trades: 5
   min_position_size_usd: 5.0
   max_portfolio_exposure_usd: 500.0
   stop_loss_threshold: 0.25
