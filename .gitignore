@@ -21,3 +21,12 @@ data/historical/
 
 # Claude Code
 .claude/
+
+# Runtime state, should not be tracked
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/kill_switch
+data/pause_until
+data/settled_slugs.txt
