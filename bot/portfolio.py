@@ -47,6 +47,11 @@ class Portfolio:
         self._cache_time: float = 0
         self._cache_ttl: float = 2.0  # seconds
 
+        # Paper mode position/trade tracking (instance-level, not class-level)
+        self._paper_positions: List[Position] = []
+        self.trades: List[Trade] = []
+        self.initial_bankroll: float = initial_bankroll
+
     # ------------------------------------------------------------------
     # Exchange API calls (source of truth)
     # ------------------------------------------------------------------
@@ -168,7 +173,10 @@ class Portfolio:
     # Paper mode helpers
     # ------------------------------------------------------------------
 
-    _paper_positions: List[Position] = []
+    @property
+    def positions(self) -> List[Position]:
+        """All positions (open and closed) — paper mode only."""
+        return self._paper_positions
 
     def _get_paper_positions(self) -> List[Position]:
         return [p for p in self._paper_positions if p.status == "open"]
@@ -198,6 +206,7 @@ class Portfolio:
         if self.paper_mode:
             self._paper_positions.append(position)
             self._paper_bankroll -= trade.fees
+            self.trades.append(trade)
 
         if self.logger:
             self.logger.info("position_opened", {

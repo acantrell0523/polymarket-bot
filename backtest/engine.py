@@ -58,7 +58,7 @@ class BacktestEngine:
         Returns:
             BacktestResult with all metrics.
         """
-        portfolio = Portfolio(self.config.backtest.initial_bankroll_usd)
+        portfolio = Portfolio(paper_mode=True, initial_bankroll=self.config.backtest.initial_bankroll_usd)
 
         # Flatten and sort all snapshots by time
         all_snapshots = []
