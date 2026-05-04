@@ -627,6 +627,43 @@ class TestPortfolio:
         assert len(portfolio.get_open_positions()) == 0
         assert pnl > 0  # buy at 0.50, close at 0.60 → profit
 
+    def test_independent_paper_positions_and_bankrolls(self):
+        """Two Portfolio instances must not share paper positions or bankroll state.
+
+        Guards against the class-level mutable default anti-pattern, e.g.:
+            _paper_positions: List[Position] = []   # ← all instances would share this list
+        Both attributes must be initialised inside __init__ so each instance
+        gets its own independent list/float.
+        """
+        p1 = Portfolio(paper_mode=True, initial_bankroll=500)
+        p2 = Portfolio(paper_mode=True, initial_bankroll=1000)
+
+        # Bankrolls are independent at construction time
+        assert p1.bankroll == 500
+        assert p2.bankroll == 1000
+
+        # Open a position only on p1
+        signal = TradeSignal(
+            market_id="m1", token_id="t1", side="buy",
+            estimated_prob=0.65, market_price=0.50,
+            edge=0.15, position_size_usd=50,
+        )
+        trade = Trade(
+            market_id="m1", token_id="t1", side="buy",
+            price=0.50, quantity=100, size_usd=50,
+            timestamp=datetime.now(timezone.utc),
+            fees=1.0,
+        )
+        p1.open_position(signal, trade)
+
+        # p1 has 1 open position; p2 must still have 0 (independent lists)
+        assert len(p1.get_open_positions()) == 1
+        assert len(p2.get_open_positions()) == 0
+
+        # p1 bankroll was decremented by the fee; p2 bankroll is unchanged
+        assert p1.bankroll == pytest.approx(499.0)  # 500 - 1.0 fee
+        assert p2.bankroll == pytest.approx(1000.0)
+
     def test_portfolio_stats(self):
         portfolio = Portfolio(paper_mode=True, initial_bankroll=1000)
         mock_trades = [{"realized_pnl": 10.0}]

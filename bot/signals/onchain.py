@@ -1,3 +1,21 @@
+# TODO: Wire OnChainEnrichmentClient into the trading loop.
+#
+# To integrate this module:
+# 1. In bot/trading_loop.py (or bot/supervisor.py), instantiate OnChainEnrichmentClient
+#    once at startup (it manages its own rate-limiting and cache).
+# 2. Pass the client into ProbabilityEstimator (or call it directly before detect_edge).
+# 3. In ProbabilityEstimator.detect_edge(), call:
+#        enrichment = onchain_client.get_enrichment_for_market(snapshot)
+#    then feed enrichment into signal functions that consume whale/smart-money data.
+# 4. The enrichment dict keys (market_detail, smart_money_data, whale_data,
+#    unusual_data, positions, market_tide) already match the format that any
+#    Unusual-Whales-style signal functions expect — no signal-layer changes needed.
+# 5. Add onchain config keys (enabled, max_requests_per_second, cache_ttl_seconds,
+#    enrich_on_edge_only) to utils/config.py's BotConfig so behaviour is tuneable
+#    from configs/config.yaml (keys are already present in that file).
+#
+# Moved here from the project root (onchain.py) — was dead code because nothing
+# imported it from that location.
 """
 On-chain enrichment client for Polymarket prediction markets.
 
