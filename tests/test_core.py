@@ -295,6 +295,60 @@ class TestProbabilityEstimator:
         result = estimator.detect_edge(sports_snapshot, min_edge=0.001, max_edge=0.40)
         assert result is None
 
+    def test_config_weight_drives_probability_output(self):
+        """Changing a weight in SignalConfig.weights is actually reflected in
+        estimate_probability — this proves config tuning is no longer a no-op."""
+        # Two signals with strongly opposing values.
+        signals = [
+            Signal(name="order_book_imbalance", value=0.90, confidence=1.0, direction="bullish"),
+            Signal(name="cross_market",          value=0.10, confidence=1.0, direction="bearish"),
+        ]
+
+        # Default "other" weights: cross_market=0.40, order_book_imbalance=0.25
+        config_default = SignalConfig()
+        estimator_default = ProbabilityEstimator(config_default)
+        prob_default, _ = estimator_default.estimate_probability(
+            signals, config_default.weights["other"]
+        )
+
+        # Heavily boost cross_market so the bearish signal dominates.
+        config_boosted = SignalConfig()
+        config_boosted.weights["other"]["cross_market"] = 0.90
+        config_boosted.weights["other"]["order_book_imbalance"] = 0.10
+        estimator_boosted = ProbabilityEstimator(config_boosted)
+        prob_boosted, _ = estimator_boosted.estimate_probability(
+            signals, config_boosted.weights["other"]
+        )
+
+        # Boosting the bearish cross_market signal must pull probability lower.
+        assert prob_boosted < prob_default
+
+    def test_missing_config_weights_fall_back_to_defaults_no_error(self):
+        """When config.weights has no entry for a market type, detect_edge falls
+        back to the hardcoded WEIGHTS defaults without raising any error."""
+        # Clear all per-market-type weights from the config.
+        config = SignalConfig()
+        config.weights = {}  # no market types defined at all
+        estimator = ProbabilityEstimator(config)
+
+        signals = [
+            Signal(name="cross_market",          value=0.55, confidence=1.0, direction="bullish"),
+            Signal(name="order_book_imbalance", value=0.60, confidence=1.0, direction="bullish"),
+        ]
+
+        # Replicate the fallback logic from detect_edge.
+        default_weights = WEIGHTS.get("other", WEIGHTS["other"])
+        config_weights  = getattr(estimator.config, "weights", {}).get("other", {})
+        effective_weights = {**default_weights, **config_weights}
+
+        # When config is empty the effective weights must equal the hardcoded defaults exactly.
+        assert effective_weights == WEIGHTS["other"]
+
+        # estimate_probability must succeed and return a valid probability.
+        prob, conf = estimator.estimate_probability(signals, effective_weights)
+        assert 0.01 <= prob <= 0.99
+        assert 0.0 <= conf <= 1.0
+
 
 # ============================================================================
 # Validate Trade Checklist

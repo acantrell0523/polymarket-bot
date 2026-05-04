@@ -191,7 +191,13 @@ class ProbabilityEstimator:
         3. Combined edge capped at external edge + 1%.
         """
         market_type = detect_market_type(snapshot)
-        weights = WEIGHTS.get(market_type, WEIGHTS["other"])
+        # Build effective weights: start from the hardcoded defaults, then overlay
+        # any values present in config.signals.weights so config changes take effect.
+        # Per-signal fallback: if a key is absent from the config dict the hardcoded
+        # default remains, so existing deployments keep working unchanged.
+        default_weights = WEIGHTS.get(market_type, WEIGHTS["other"])
+        config_weights = getattr(self.config, "weights", {}).get(market_type, {})
+        weights = {**default_weights, **config_weights}
         signals = self.compute_signals(snapshot, market_type)
 
         # Gate: require external validation

@@ -51,6 +51,36 @@ class TradingConfig:
     paper_trading: bool = True
 
 
+# Default per-market-type weights — must stay in sync with WEIGHTS in estimator.py
+_DEFAULT_SIGNAL_WEIGHTS: Dict[str, Dict[str, float]] = {
+    "sports": {
+        "odds_value": 0.40,
+        "sports_context": 0.15,
+        "line_movement": 0.20,
+        "order_book_imbalance": 0.15,
+        "liquidity_imbalance": 0.10,
+    },
+    "crypto": {
+        "crypto_model": 0.45,
+        "cross_market": 0.25,
+        "order_book_imbalance": 0.20,
+        "liquidity_imbalance": 0.10,
+    },
+    "politics": {
+        "cross_market": 0.45,
+        "order_book_imbalance": 0.25,
+        "line_movement": 0.15,
+        "liquidity_imbalance": 0.15,
+    },
+    "other": {
+        "cross_market": 0.40,
+        "order_book_imbalance": 0.25,
+        "line_movement": 0.20,
+        "liquidity_imbalance": 0.15,
+    },
+}
+
+
 @dataclass
 class SignalConfig:
     order_book_imbalance_weight: float = 0.15
@@ -58,6 +88,12 @@ class SignalConfig:
     odds_value_weight: float = 0.40
     liquidity_imbalance_weight: float = 0.10
     sports_context_weight: float = 0.15
+    weights: Dict[str, Dict[str, float]] = field(
+        default_factory=lambda: {
+            market: dict(signal_weights)
+            for market, signal_weights in _DEFAULT_SIGNAL_WEIGHTS.items()
+        }
+    )
 
 
 @dataclass
@@ -191,7 +227,18 @@ def load_config(config_path: str = "configs/config.yaml", env_path: str = ".env"
         if "trading" in raw:
             _apply_dict(config.trading, raw["trading"])
         if "signals" in raw:
-            _apply_dict(config.signals, raw["signals"])
+            signals_raw = dict(raw["signals"])
+            # Handle weights separately: deep-merge per-market-type and per-signal
+            # so that missing keys keep their hardcoded defaults.
+            weights_from_yaml = signals_raw.pop("weights", None)
+            _apply_dict(config.signals, signals_raw)
+            if weights_from_yaml and isinstance(weights_from_yaml, dict):
+                for market_type, market_weights in weights_from_yaml.items():
+                    if isinstance(market_weights, dict):
+                        # Start from defaults for this market type, then overlay config values
+                        base = dict(config.signals.weights.get(market_type, {}))
+                        base.update(market_weights)
+                        config.signals.weights[market_type] = base
         if "filters" in raw:
             _apply_dict(config.filters, raw["filters"])
         if "backtest" in raw:

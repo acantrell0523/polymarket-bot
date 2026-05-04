@@ -41,6 +41,30 @@ signals:
   line_movement_weight: 0.2
   order_book_imbalance_weight: 0.15
   liquidity_imbalance_weight: 0.1
+  # Per-market-type weights used by ProbabilityEstimator.
+  # These values exactly match the hardcoded defaults — edit here to tune behavior.
+  weights:
+    sports:
+      odds_value: 0.40
+      sports_context: 0.15
+      line_movement: 0.20
+      order_book_imbalance: 0.15
+      liquidity_imbalance: 0.10
+    crypto:
+      crypto_model: 0.45
+      cross_market: 0.25
+      order_book_imbalance: 0.20
+      liquidity_imbalance: 0.10
+    politics:
+      cross_market: 0.45
+      order_book_imbalance: 0.25
+      line_movement: 0.15
+      liquidity_imbalance: 0.15
+    other:
+      cross_market: 0.40
+      order_book_imbalance: 0.25
+      line_movement: 0.20
+      liquidity_imbalance: 0.15
 filters:
   min_daily_volume_usd: 500.0
   min_liquidity_usd: 200.0
