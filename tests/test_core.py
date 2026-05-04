@@ -752,3 +752,215 @@ class TestConfig:
             + s.sports_context_weight        # 0.15
         )
         assert abs(total - 1.0) < 0.01
+
+
+# ============================================================================
+# Exit Telemetry Tests
+# ============================================================================
+
+class TestExitTelemetry:
+    """Tests for the exit telemetry layer: max favorable/adverse P&L tracking,
+    let_it_ride counter, and exit_log write on close.
+
+    The tracking update logic lives in TradingBot.check_positions() and is
+    replicated below via _apply_telemetry_update() so these tests stay
+    independent of the full bot infrastructure.
+    """
+
+    def _make_position(
+        self,
+        entry_price: float = 0.50,
+        quantity: float = 100,
+        side: str = "buy",
+        slug: str = "test-market",
+    ) -> Position:
+        return Position(
+            market_id=slug,
+            token_id=slug,
+            side=side,
+            entry_price=entry_price,
+            size_usd=entry_price * quantity,
+            quantity=quantity,
+            estimated_prob=0.65,
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=20),
+            current_price=entry_price,
+            slug=slug,
+        )
+
+    @staticmethod
+    def _apply_telemetry_update(position: Position, current_price: float):
+        """Mirror the four-line block from TradingBot.check_positions()."""
+        if position.side == "buy":
+            pnl_per_unit = current_price - position.entry_price
+        else:
+            pnl_per_unit = position.entry_price - current_price
+        unrealized_usd = pnl_per_unit * position.quantity
+        if unrealized_usd > position.max_favorable_pnl_usd:
+            position.max_favorable_pnl_usd = unrealized_usd
+        if unrealized_usd < position.max_adverse_pnl_usd:
+            position.max_adverse_pnl_usd = unrealized_usd
+
+    # ------------------------------------------------------------------
+    # max_favorable_pnl_usd
+    # ------------------------------------------------------------------
+
+    def test_max_favorable_tracks_peak_profit(self):
+        """max_favorable_pnl_usd must capture the highest positive unrealized P&L."""
+        pos = self._make_position(entry_price=0.50, quantity=100)
+
+        self._apply_telemetry_update(pos, 0.53)   # +$3
+        assert pos.max_favorable_pnl_usd == pytest.approx(3.0)
+
+        self._apply_telemetry_update(pos, 0.57)   # +$7 — new high
+        assert pos.max_favorable_pnl_usd == pytest.approx(7.0)
+
+        self._apply_telemetry_update(pos, 0.52)   # +$2 — pullback, peak must NOT drop
+        assert pos.max_favorable_pnl_usd == pytest.approx(7.0)
+
+    def test_max_favorable_stays_zero_when_always_losing(self):
+        """If the position never enters profit, max_favorable must stay at its default 0.0."""
+        pos = self._make_position(entry_price=0.50, quantity=100)
+        self._apply_telemetry_update(pos, 0.48)   # -$2
+        self._apply_telemetry_update(pos, 0.45)   # -$5
+        assert pos.max_favorable_pnl_usd == 0.0
+
+    # ------------------------------------------------------------------
+    # max_adverse_pnl_usd
+    # ------------------------------------------------------------------
+
+    def test_max_adverse_tracks_peak_loss(self):
+        """max_adverse_pnl_usd must capture the most negative unrealized P&L."""
+        pos = self._make_position(entry_price=0.50, quantity=100)
+
+        self._apply_telemetry_update(pos, 0.47)   # -$3
+        assert pos.max_adverse_pnl_usd == pytest.approx(-3.0)
+
+        self._apply_telemetry_update(pos, 0.42)   # -$8 — new low
+        assert pos.max_adverse_pnl_usd == pytest.approx(-8.0)
+
+        self._apply_telemetry_update(pos, 0.49)   # -$1 — recovery, worst must NOT improve
+        assert pos.max_adverse_pnl_usd == pytest.approx(-8.0)
+
+    def test_max_adverse_stays_zero_when_always_winning(self):
+        """If the position is always in profit, max_adverse stays at its default 0.0."""
+        pos = self._make_position(entry_price=0.50, quantity=100)
+        self._apply_telemetry_update(pos, 0.55)   # +$5
+        self._apply_telemetry_update(pos, 0.60)   # +$10
+        assert pos.max_adverse_pnl_usd == 0.0
+
+    def test_sell_side_favorable_direction_is_price_drop(self):
+        """For a SELL position, a falling price is favorable (profit)."""
+        pos = self._make_position(entry_price=0.60, quantity=100, side="sell")
+        self._apply_telemetry_update(pos, 0.50)   # price fell — sell wins
+        assert pos.max_favorable_pnl_usd == pytest.approx(10.0)
+        assert pos.max_adverse_pnl_usd == 0.0
+
+    # ------------------------------------------------------------------
+    # let_it_ride_count
+    # ------------------------------------------------------------------
+
+    def test_let_it_ride_count_starts_at_zero(self):
+        pos = self._make_position()
+        assert pos.let_it_ride_count == 0
+
+    def test_let_it_ride_count_increments_each_cycle(self):
+        """let_it_ride_count must accumulate across cycles without resetting."""
+        pos = self._make_position()
+        for expected in range(1, 6):
+            pos.let_it_ride_count += 1   # as trading_loop.py does
+            assert pos.let_it_ride_count == expected
+
+    def test_let_it_ride_count_does_not_increment_on_normal_close(self):
+        """Closing without let_it_ride must leave let_it_ride_count at 0."""
+        pos = self._make_position()
+        # Never touch let_it_ride_count — simulate a plain take_profit exit
+        portfolio = Portfolio(paper_mode=True, initial_bankroll=500)
+        with patch("bot.trade_db.insert_exit_log"), \
+             patch("bot.trade_db.insert_trade"), \
+             patch("bot.edge_log.update_edge_log_outcome"):
+            portfolio._paper_positions.append(pos)
+            portfolio.close_position(pos, current_price=0.58, reason="take_profit")
+        assert pos.let_it_ride_count == 0
+
+    # ------------------------------------------------------------------
+    # exit_log DB write
+    # ------------------------------------------------------------------
+
+    def test_exit_log_written_on_close_paper_mode(self):
+        """insert_exit_log must be called exactly once when a paper position closes."""
+        portfolio = Portfolio(paper_mode=True, initial_bankroll=1000)
+        signal = TradeSignal(
+            market_id="exit-log-test",
+            token_id="exit-log-token",
+            side="buy",
+            estimated_prob=0.65,
+            market_price=0.50,
+            edge=0.15,
+            position_size_usd=50,
+            slug="exit-log-test",
+        )
+        trade = Trade(
+            market_id="exit-log-test",
+            token_id="exit-log-token",
+            side="buy",
+            price=0.50,
+            quantity=100,
+            size_usd=50,
+            timestamp=datetime.now(timezone.utc) - timedelta(minutes=20),
+        )
+        pos = portfolio.open_position(signal, trade)
+
+        # Pre-populate tracking fields as the live loop would
+        pos.max_favorable_pnl_usd = 5.0
+        pos.max_adverse_pnl_usd = -2.0
+        pos.let_it_ride_count = 0
+
+        with patch("bot.trade_db.insert_exit_log") as mock_insert, \
+             patch("bot.trade_db.insert_trade"), \
+             patch("bot.edge_log.update_edge_log_outcome"):
+            portfolio.close_position(pos, current_price=0.55, reason="take_profit")
+
+        mock_insert.assert_called_once()
+        kw = mock_insert.call_args[1]   # all args in portfolio.py are keyword args
+        assert kw["slug"] == "exit-log-test"
+        assert kw["close_reason"] == "take_profit"
+        assert kw["max_favorable_pnl_usd"] == pytest.approx(5.0)
+        assert kw["max_adverse_pnl_usd"] == pytest.approx(-2.0)
+        assert kw["let_it_ride_triggered"] is False
+        assert kw["entry_estimated_prob"] == pytest.approx(0.65)
+        assert kw["realized_pnl"] == pytest.approx(5.0)  # (0.55-0.50)*100
+
+    def test_exit_log_records_let_it_ride_triggered_true(self):
+        """let_it_ride_triggered must be True when let_it_ride_count > 0 at close."""
+        portfolio = Portfolio(paper_mode=True, initial_bankroll=1000)
+        signal = TradeSignal(
+            market_id="lir-test",
+            token_id="lir-token",
+            side="buy",
+            estimated_prob=0.65,
+            market_price=0.50,
+            edge=0.15,
+            position_size_usd=50,
+            slug="lir-test",
+        )
+        trade = Trade(
+            market_id="lir-test",
+            token_id="lir-token",
+            side="buy",
+            price=0.50,
+            quantity=100,
+            size_usd=50,
+            timestamp=datetime.now(timezone.utc) - timedelta(minutes=30),
+        )
+        pos = portfolio.open_position(signal, trade)
+        pos.let_it_ride_count = 5   # Was riding for 5 cycles before stop-loss
+
+        with patch("bot.trade_db.insert_exit_log") as mock_insert, \
+             patch("bot.trade_db.insert_trade"), \
+             patch("bot.edge_log.update_edge_log_outcome"):
+            portfolio.close_position(pos, current_price=0.37, reason="stop_loss")
+
+        kw = mock_insert.call_args[1]
+        assert kw["let_it_ride_triggered"] is True
+        assert kw["num_let_it_ride_triggers"] == 5
+        assert kw["close_reason"] == "stop_loss"

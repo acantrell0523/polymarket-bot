@@ -233,7 +233,8 @@ class Portfolio:
 
     def close_position(self, position: Position, current_price: float,
                        reason: str, timestamp: Optional[datetime] = None,
-                       exchange_pnl: Optional[float] = None) -> float:
+                       exchange_pnl: Optional[float] = None,
+                       exit_threshold_distance: float = 0.0) -> float:
         """Record a position close. P&L comes from the exchange when available."""
         if position.status != "open":
             return 0.0
@@ -335,6 +336,57 @@ class Portfolio:
                 price_at_close=current_price,
                 close_reason=reason,
                 final_outcome="win" if realized_pnl > 0 else "loss",
+            )
+        except Exception:
+            pass
+
+        # Write rich exit telemetry to exit_log for post-hoc analysis.
+        # Guarded by try/except so it can never break the close flow.
+        # Not called from BacktestPortfolio (SQLite-free by design).
+        try:
+            import json as _json
+            slug = getattr(position, 'slug', position.market_id)
+
+            # Recompute hold time (may differ from edge_log's time_held if
+            # entry_time was timezone-naive; use the same guarded logic).
+            hold_secs = 0.0
+            if position.entry_time:
+                _entry = position.entry_time
+                if _entry.tzinfo is None:
+                    _entry = _entry.replace(tzinfo=timezone.utc)
+                hold_secs = (close_time - _entry).total_seconds()
+
+            peak_unrealized_pct = (
+                position.max_favorable_pnl_usd / position.size_usd
+                if position.size_usd > 0 else 0.0
+            )
+
+            metadata = {
+                "paper_mode": self.paper_mode,
+                "is_live_game": getattr(position, '_is_live', False),
+            }
+
+            trade_db.insert_exit_log(
+                slug=slug,
+                market_id=position.market_id,
+                side=position.side,
+                entry_time=position.entry_time or close_time,
+                close_time=close_time,
+                hold_seconds=hold_secs,
+                entry_price=position.entry_price,
+                close_price=current_price,
+                size_usd=position.size_usd,
+                quantity=position.quantity,
+                realized_pnl=realized_pnl,
+                close_reason=reason,
+                entry_estimated_prob=position.estimated_prob,
+                max_favorable_pnl_usd=position.max_favorable_pnl_usd,
+                max_adverse_pnl_usd=position.max_adverse_pnl_usd,
+                peak_unrealized_pct=peak_unrealized_pct,
+                let_it_ride_triggered=(position.let_it_ride_count > 0),
+                num_let_it_ride_triggers=position.let_it_ride_count,
+                exit_threshold_distance=exit_threshold_distance,
+                metadata_json=_json.dumps(metadata),
             )
         except Exception:
             pass

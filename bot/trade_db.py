@@ -248,5 +248,129 @@ def get_all_signal_slugs() -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def init_exit_log_table():
+    """Create exit_log table and indexes if they don't exist.
+
+    Safe to call multiple times (CREATE TABLE IF NOT EXISTS).
+    Called automatically from init_db() so no manual wiring needed.
+    Must NOT be called from BacktestPortfolio — that layer is SQLite-free.
+    """
+    conn = _get_conn()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS exit_log (
+            id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            -- Identity
+            slug                     TEXT    NOT NULL,
+            market_id                TEXT    NOT NULL,
+            side                     TEXT    NOT NULL,
+
+            -- Time window
+            entry_time               TEXT    NOT NULL,
+            close_time               TEXT    NOT NULL,
+            hold_seconds             REAL    DEFAULT 0,
+
+            -- Price / size
+            entry_price              REAL    NOT NULL,
+            close_price              REAL    NOT NULL,
+            size_usd                 REAL    NOT NULL,
+            quantity                 REAL    NOT NULL,
+            realized_pnl             REAL    NOT NULL,
+
+            -- Why it closed
+            close_reason             TEXT    NOT NULL,
+
+            -- Primary signal at entry (queryable without JSON parsing)
+            entry_estimated_prob     REAL    NOT NULL DEFAULT 0,
+
+            -- P&L extremes during position life
+            max_favorable_pnl_usd    REAL    DEFAULT 0,
+            max_adverse_pnl_usd      REAL    DEFAULT 0,
+            peak_unrealized_pct      REAL    DEFAULT 0,
+
+            -- Let-it-ride telemetry
+            let_it_ride_triggered    INTEGER DEFAULT 0,
+            num_let_it_ride_triggers INTEGER DEFAULT 0,
+
+            -- Distance from stop-loss boundary at close (fraction of entry_price)
+            exit_threshold_distance  REAL    DEFAULT 0,
+
+            -- Free-form metadata (paper_mode, is_live_game, close_estimated_prob, …)
+            metadata_json            TEXT    DEFAULT '{}',
+
+            created_at               TEXT    DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_exit_log_slug
+            ON exit_log(slug);
+        CREATE INDEX IF NOT EXISTS idx_exit_log_close_reason
+            ON exit_log(close_reason);
+        CREATE INDEX IF NOT EXISTS idx_exit_log_close_time
+            ON exit_log(close_time);
+    """)
+    conn.commit()
+    conn.close()
+
+
+def insert_exit_log(
+    slug: str,
+    market_id: str,
+    side: str,
+    entry_time: datetime,
+    close_time: datetime,
+    hold_seconds: float,
+    entry_price: float,
+    close_price: float,
+    size_usd: float,
+    quantity: float,
+    realized_pnl: float,
+    close_reason: str,
+    entry_estimated_prob: float,
+    max_favorable_pnl_usd: float,
+    max_adverse_pnl_usd: float,
+    peak_unrealized_pct: float,
+    let_it_ride_triggered: bool,
+    num_let_it_ride_triggers: int,
+    exit_threshold_distance: float,
+    metadata_json: str = "{}",
+):
+    """Write a full exit telemetry row when a position closes.
+
+    Called by Portfolio.close_position() for both paper and live modes.
+    Not called from BacktestPortfolio.
+    """
+    conn = _get_conn()
+    conn.execute(
+        """INSERT INTO exit_log
+           (slug, market_id, side, entry_time, close_time, hold_seconds,
+            entry_price, close_price, size_usd, quantity, realized_pnl,
+            close_reason, entry_estimated_prob,
+            max_favorable_pnl_usd, max_adverse_pnl_usd, peak_unrealized_pct,
+            let_it_ride_triggered, num_let_it_ride_triggers,
+            exit_threshold_distance, metadata_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (slug, market_id, side,
+         entry_time.isoformat(), close_time.isoformat(), hold_seconds,
+         entry_price, close_price, size_usd, quantity, realized_pnl,
+         close_reason, entry_estimated_prob,
+         max_favorable_pnl_usd, max_adverse_pnl_usd, peak_unrealized_pct,
+         int(let_it_ride_triggered), num_let_it_ride_triggers,
+         exit_threshold_distance, metadata_json),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_exit_log(limit: int = 100) -> List[Dict[str, Any]]:
+    """Fetch the most recent exit_log rows (newest first)."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM exit_log ORDER BY close_time DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 # Initialize on import
 init_db()
+init_exit_log_table()

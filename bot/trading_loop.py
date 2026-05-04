@@ -462,6 +462,14 @@ class TradingBot:
             pnl_pct = pnl_per_unit / position.entry_price if position.entry_price > 0 else 0
             edge_remaining = abs(position.estimated_prob - position.current_price)
 
+            # --- Exit telemetry: update running P&L extremes each cycle ---
+            # unrealized_usd is positive when we're winning, negative when losing
+            unrealized_usd = pnl_per_unit * position.quantity
+            if unrealized_usd > position.max_favorable_pnl_usd:
+                position.max_favorable_pnl_usd = unrealized_usd
+            if unrealized_usd < position.max_adverse_pnl_usd:
+                position.max_adverse_pnl_usd = unrealized_usd
+
             # Log diagnostics every 10th cycle
             if log_diagnostics:
                 would_sl = pnl_pct <= -self.risk.config.stop_loss_threshold
@@ -486,6 +494,8 @@ class TradingBot:
 
             # Let winners ride — don't close, alert instead
             if close_reason == "let_it_ride":
+                # Track every cycle the position is held in let_it_ride state
+                position.let_it_ride_count += 1
                 if not getattr(position, '_ride_alerted', False):
                     potential_payout = position.quantity * 1.0  # $1/share at resolution
                     self.logger.info("let_it_ride", {
@@ -530,9 +540,26 @@ class TradingBot:
                     self.portfolio.invalidate_cache()
                     exchange_pnl = self._get_exchange_pnl(slug, position)
 
+                    # Distance from the stop-loss boundary at exit time.
+                    # Expressed as a fraction of entry_price so it's scale-free.
+                    # e.g. 0.02 means the close price was 2% of entry_price above the SL floor.
+                    # Useful for "were stop-losses too tight?" analysis in exit_log.
+                    try:
+                        sl_frac = self.risk.config.stop_loss_threshold
+                        if position.side == "buy":
+                            sl_boundary = position.entry_price * (1.0 - sl_frac)
+                            _etd = (position.current_price - sl_boundary) / position.entry_price
+                        else:
+                            sl_boundary = position.entry_price * (1.0 + sl_frac)
+                            _etd = (sl_boundary - position.current_price) / position.entry_price
+                        exit_threshold_distance = max(_etd, 0.0)
+                    except Exception:
+                        exit_threshold_distance = 0.0
+
                     self.portfolio.close_position(
                         position, position.current_price, close_reason,
                         exchange_pnl=exchange_pnl,
+                        exit_threshold_distance=exit_threshold_distance,
                     )
                     self.risk.record_pnl(position.realized_pnl)
                     self.logger.info("position_exit_complete", {

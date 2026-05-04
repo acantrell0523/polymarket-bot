@@ -100,6 +100,12 @@ class Position:
     slug: str = ""
     peak_price: float = 0.0  # highest favorable price seen (for trailing stop)
 
+    # Exit telemetry — updated each cycle by TradingBot.check_positions()
+    # Not used by the backtest engine; safe defaults mean no serialisation breakage.
+    max_favorable_pnl_usd: float = 0.0   # highest positive unrealized P&L seen ($)
+    max_adverse_pnl_usd: float = 0.0     # most negative unrealized P&L seen ($, e.g. -6.20)
+    let_it_ride_count: int = 0           # number of cycles let_it_ride was triggered
+
 
 @dataclass
 class Trade:
