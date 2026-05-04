@@ -11,7 +11,7 @@ from utils.config import BotConfig, BacktestConfig, TradingConfig, SignalConfig
 from bot.signals.estimator import ProbabilityEstimator
 from bot.strategies.sizing import PositionSizer
 from bot.strategies.risk import RiskManager
-from bot.portfolio import Portfolio
+from backtest.portfolio import BacktestPortfolio
 
 
 class BacktestEngine:
@@ -58,7 +58,9 @@ class BacktestEngine:
         Returns:
             BacktestResult with all metrics.
         """
-        portfolio = Portfolio(paper_mode=True, initial_bankroll=self.config.backtest.initial_bankroll_usd)
+        portfolio = BacktestPortfolio(
+            initial_bankroll=self.config.backtest.initial_bankroll_usd
+        )
 
         # Flatten and sort all snapshots by time
         all_snapshots = []
@@ -84,7 +86,8 @@ class BacktestEngine:
                     close_reason = self.risk.check_position(
                         pos, snapshot.price, pos.estimated_prob
                     )
-                    if close_reason:
+                    # "let_it_ride" means hold — it is NOT a close signal
+                    if close_reason and close_reason != "let_it_ride":
                         exit_price = self.apply_slippage(
                             snapshot.price,
                             "sell" if pos.side == "buy" else "buy",
@@ -109,8 +112,8 @@ class BacktestEngine:
             if existing:
                 continue
 
-            # Risk checks
-            if not self.risk.can_open_position(portfolio.positions):
+            # Risk checks — use open positions only so closed ones don't inflate the count
+            if not self.risk.can_open_position(portfolio.get_open_positions()):
                 continue
 
             # Position sizing
@@ -154,7 +157,7 @@ class BacktestEngine:
 
         return self._compute_results(portfolio)
 
-    def _compute_results(self, portfolio: Portfolio) -> BacktestResult:
+    def _compute_results(self, portfolio: BacktestPortfolio) -> BacktestResult:
         """Compute backtest metrics from portfolio state."""
         closed = [p for p in portfolio.positions if p.status == "closed"]
 
