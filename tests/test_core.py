@@ -1,5 +1,7 @@
 """Unit tests for all core components — rewritten for the current codebase.
 
+# NOTE: historical DB tests are at the bottom of this file (TestHistoricalDB).
+
 Replaces the old file which referenced removed modules (bot.signals.unusual_whales,
 price_momentum_signal, volume_signal, etc.) and a stale Portfolio/Estimator API.
 """
@@ -964,3 +966,208 @@ class TestExitTelemetry:
         assert kw["let_it_ride_triggered"] is True
         assert kw["num_let_it_ride_triggers"] == 5
         assert kw["close_reason"] == "stop_loss"
+
+
+# ============================================================================
+# Historical DB Tests
+# ============================================================================
+
+class TestHistoricalDB:
+    """Tests for data/historical_db.py — schema, idempotency, and inspect queries.
+
+    All tests use a tmp_path-isolated SQLite file so they never touch
+    the production data/trades.db.
+    """
+
+    @pytest.fixture
+    def db(self, tmp_path):
+        """Return path to a fresh temp database."""
+        return str(tmp_path / "test_historical.db")
+
+    # ── 1. Schema creation idempotency ───────────────────────────────────────
+
+    def test_init_tables_creates_both_tables(self, db):
+        """init_tables() creates historical_markets and historical_snapshots."""
+        from data.historical_db import init_tables, get_conn
+        init_tables(db)
+        conn = get_conn(db)
+        tables = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        conn.close()
+        assert "historical_markets" in tables
+        assert "historical_snapshots" in tables
+
+    def test_init_tables_is_idempotent(self, db):
+        """Calling init_tables() twice must not raise and must not duplicate rows."""
+        from data.historical_db import init_tables, get_conn
+        init_tables(db)
+        init_tables(db)   # second call must be a no-op
+        conn = get_conn(db)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+            "AND name IN ('historical_markets','historical_snapshots')"
+        ).fetchone()[0]
+        conn.close()
+        assert count == 2  # exactly one copy of each table
+
+    # ── 2. INSERT OR IGNORE duplicate handling ───────────────────────────────
+
+    def test_duplicate_market_insert_ignored(self, db):
+        """Inserting the same slug twice keeps exactly one row."""
+        from data.historical_db import init_tables, get_conn, upsert_historical_market
+        init_tables(db)
+        conn = get_conn(db)
+        for _ in range(3):
+            upsert_historical_market(
+                conn,
+                {"slug": "test-market", "question": "Will it happen?",
+                 "market_type": "nba_outright"},
+            )
+        conn.commit()
+        count = conn.execute(
+            "SELECT COUNT(*) FROM historical_markets WHERE slug='test-market'"
+        ).fetchone()[0]
+        conn.close()
+        assert count == 1
+
+    def test_duplicate_snapshot_insert_ignored(self, db):
+        """Inserting (slug, timestamp, source) twice keeps exactly one snapshot row."""
+        from data.historical_db import init_tables, get_conn, upsert_snapshots
+        init_tables(db)
+        conn = get_conn(db)
+        history = [{"t": 1_700_000_000, "p": 0.45}]
+        upsert_snapshots(conn, "test-market", history, source="clob_prices_history")
+        upsert_snapshots(conn, "test-market", history, source="clob_prices_history")
+        conn.commit()
+        count = conn.execute(
+            "SELECT COUNT(*) FROM historical_snapshots WHERE slug='test-market'"
+        ).fetchone()[0]
+        conn.close()
+        assert count == 1
+
+    # ── 3. Inspect queries on fixture data ───────────────────────────────────
+
+    def test_inspect_snapshot_counts_fixture(self, db):
+        """get_snapshot_counts() returns correct counts for known fixture data."""
+        from data.historical_db import (
+            init_tables, get_conn,
+            upsert_historical_market, upsert_snapshots, get_snapshot_counts,
+        )
+        init_tables(db)
+        conn = get_conn(db)
+
+        # Insert two markets with known densities
+        for slug, n_pts in [("market-a", 10), ("market-b", 3)]:
+            upsert_historical_market(conn, {"slug": slug, "market_type": "nba_outright"})
+            upsert_snapshots(
+                conn, slug,
+                [{"t": 1_700_000_000 + i * 86400, "p": 0.5 + i * 0.01} for i in range(n_pts)],
+            )
+        conn.commit()
+        conn.close()
+
+        counts = get_snapshot_counts(db)
+        assert len(counts) == 2
+        # Sorted by count DESC → market-a first
+        assert counts[0]["slug"] == "market-a"
+        assert counts[0]["cnt"] == 10
+        assert counts[1]["slug"] == "market-b"
+        assert counts[1]["cnt"] == 3
+
+    def test_inspect_settled_outcome_distribution_fixture(self, db):
+        """get_settled_outcome_distribution() counts outcomes correctly."""
+        from data.historical_db import (
+            init_tables, get_conn,
+            upsert_historical_market, get_settled_outcome_distribution,
+        )
+        init_tables(db)
+        conn = get_conn(db)
+
+        outcomes = [("YES", "s1"), ("YES", "s2"), ("NO", "s3"), ("open", "s4")]
+        for outcome, slug in outcomes:
+            upsert_historical_market(
+                conn,
+                {"slug": slug, "settled_outcome": outcome, "market_type": "nba_outright"},
+            )
+        conn.commit()
+        conn.close()
+
+        dist = get_settled_outcome_distribution(db)
+        dist_map = {r["settled_outcome"]: r["cnt"] for r in dist}
+        assert dist_map.get("YES") == 2
+        assert dist_map.get("NO") == 1
+        assert dist_map.get("open") == 1
+
+    # ── 4. Idempotency regression: CLOB API timestamp jitter ─────────────────
+
+    def test_ingest_idempotency(self, db):
+        """Re-running upsert_snapshots with slightly different timestamps for the
+        same daily candles must NOT grow the snapshot count.
+
+        Root cause: the CLOB prices-history API returns intra-day timestamps that
+        vary by up to a few hundred seconds between calls.  The fix buckets every
+        raw timestamp to its UTC day boundary before insert so the
+        UNIQUE(slug, timestamp, source) constraint catches the duplicate.
+
+        Regression guard: this test would have failed before the bucketing fix
+        (snapshot count would jump from 5 → 10 on the second call).
+        """
+        import sqlite3 as _sqlite3
+        from data.historical_db import init_tables, get_conn, upsert_snapshots
+
+        init_tables(db)
+
+        SLUG = "test-idempotency-market"
+        SOURCE = "clob_prices_history"
+
+        # Run 1: timestamps as returned on the first API call
+        history_run1 = [
+            {"t": 1_776_988_823, "p": 0.50},   # 2026-04-30  (some second within the day)
+            {"t": 1_777_075_213, "p": 0.55},   # 2026-05-01
+            {"t": 1_777_161_607, "p": 0.60},   # 2026-05-02
+            {"t": 1_777_248_009, "p": 0.58},   # 2026-05-03
+            {"t": 1_777_334_409, "p": 0.62},   # 2026-05-04
+        ]
+
+        conn = get_conn(db)
+        n1 = upsert_snapshots(conn, SLUG, history_run1, source=SOURCE)
+        conn.commit()
+        conn.close()
+
+        count_after_run1 = _sqlite3.connect(db).execute(
+            "SELECT COUNT(*) FROM historical_snapshots WHERE slug=?", (SLUG,)
+        ).fetchone()[0]
+        assert n1 == 5, f"Expected 5 inserts on run 1, got {n1}"
+        assert count_after_run1 == 5
+
+        # Run 2: same candles but timestamps shifted by a few hundred seconds
+        # (simulating CLOB API jitter observed in production)
+        history_run2 = [
+            {"t": 1_776_988_901, "p": 0.50},   # +78 s from run-1 → same day bucket
+            {"t": 1_777_075_299, "p": 0.55},   # +86 s
+            {"t": 1_777_161_703, "p": 0.60},   # +96 s
+            {"t": 1_777_248_121, "p": 0.58},   # +112 s
+            {"t": 1_777_334_497, "p": 0.62},   # +88 s
+        ]
+
+        conn = get_conn(db)
+        n2 = upsert_snapshots(conn, SLUG, history_run2, source=SOURCE)
+        conn.commit()
+        conn.close()
+
+        count_after_run2 = _sqlite3.connect(db).execute(
+            "SELECT COUNT(*) FROM historical_snapshots WHERE slug=?", (SLUG,)
+        ).fetchone()[0]
+
+        assert n2 == 0, (
+            f"Run 2 inserted {n2} rows — timestamp bucketing is not working; "
+            "duplicate candles were written"
+        )
+        assert count_after_run2 == count_after_run1, (
+            f"IDEMPOTENCY FAILURE: run1={count_after_run1} snapshots, "
+            f"run2={count_after_run2} snapshots"
+        )
