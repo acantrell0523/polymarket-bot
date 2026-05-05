@@ -75,7 +75,14 @@ def detect_market_type(snapshot: MarketSnapshot) -> str:
     """Classify a market into sports/crypto/politics/other."""
     slug = snapshot.slug.lower()
 
+    # Game-level slugs use structured prefixes (aec-, asc-, tsc-, atc-)
     if any(slug.startswith(p) for p in SPORTS_PREFIXES):
+        return "sports"
+
+    # NBA outright slugs (Finals winner, MVP, Conference finals, etc.) contain
+    # "-nba-" anywhere in the slug, e.g. "will-the-celtics-win-the-2026-nba-finals"
+    # or "will-nikola-jokic-win-the-20252026-nba-mvp".
+    if "-nba-" in slug:
         return "sports"
 
     q = snapshot.question

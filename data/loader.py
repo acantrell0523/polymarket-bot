@@ -7,6 +7,11 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 from utils.models import MarketSnapshot, OrderBook, OrderBookLevel
 
+# Default path used by load_historical_data_from_db when no db_path is given.
+_DEFAULT_DB_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "data", "trades.db"
+)
+
 
 def generate_synthetic_price_series(
     length: int = 500,
@@ -169,3 +174,122 @@ def load_historical_data(data_dir: str) -> Optional[List[List[MarketSnapshot]]]:
             markets.append(snapshots)
 
     return markets if markets else None
+
+
+def load_historical_data_from_db(
+    db_path: Optional[str] = None,
+) -> Optional[List[List[MarketSnapshot]]]:
+    """Load historical data from SQLite (data/trades.db).
+
+    Reads historical_markets and historical_snapshots tables and converts
+    each market's price time-series into the List[List[MarketSnapshot]] shape
+    that BacktestEngine.run() expects.
+
+    Field mapping from DB → MarketSnapshot
+    ──────────────────────────────────────
+    market_id        ← historical_markets.market_id  (falls back to slug)
+    token_id         ← historical_markets.token_id_0
+    question         ← historical_markets.question
+    price            ← historical_snapshots.polymarket_price  (clamped [0.01, 0.99])
+    volume_24h       ← historical_snapshots.trade_size_usd    (0.0 if missing)
+    liquidity        ← 0.0  (not stored in DB)
+    order_book       ← OrderBook()  (empty; signals degrade gracefully to confidence=0)
+    price_history    ← prices of all *preceding* snapshots for the same market
+    timestamp        ← historical_snapshots.timestamp (unix epoch → UTC datetime)
+    category         ← "sports"  (all ingested data is NBA)
+    slug             ← historical_markets.slug
+    hours_to_expiry  ← 72.0  (unknown at load time; harmless default)
+    is_live          ← False
+
+    Returns None when tables are empty or unavailable, triggering synthetic fallback.
+    """
+    try:
+        from data.historical_db import get_conn
+    except ImportError:
+        return None
+
+    path = db_path or _DEFAULT_DB_PATH
+    if not os.path.exists(path):
+        return None
+
+    try:
+        conn = get_conn(path)
+    except Exception:
+        return None
+
+    try:
+        # Guard: return None if either table is empty so caller falls back to synthetic.
+        markets_count = conn.execute(
+            "SELECT COUNT(*) FROM historical_markets"
+        ).fetchone()[0]
+        snapshots_count = conn.execute(
+            "SELECT COUNT(*) FROM historical_snapshots"
+        ).fetchone()[0]
+
+        if markets_count == 0 or snapshots_count == 0:
+            conn.close()
+            return None
+
+        market_rows = conn.execute(
+            "SELECT slug, market_id, question, token_id_0 "
+            "FROM historical_markets ORDER BY slug"
+        ).fetchall()
+
+        result: List[List[MarketSnapshot]] = []
+
+        for mrow in market_rows:
+            slug = mrow["slug"]
+            market_id = str(mrow["market_id"] or slug)
+            question = str(mrow["question"] or slug)
+            token_id = str(mrow["token_id_0"] or "")
+
+            snap_rows = conn.execute(
+                "SELECT timestamp, polymarket_price, trade_size_usd "
+                "FROM historical_snapshots "
+                "WHERE slug = ? ORDER BY timestamp ASC",
+                (slug,),
+            ).fetchall()
+
+            if not snap_rows:
+                continue
+
+            prices_so_far: List[float] = []
+            snapshots: List[MarketSnapshot] = []
+
+            for srow in snap_rows:
+                ts = datetime.fromtimestamp(int(srow["timestamp"]), tz=timezone.utc)
+                raw_price = float(srow["polymarket_price"] or 0.0)
+                # Clamp to valid probability range; use 0.5 as neutral default for zero prices
+                price = max(0.01, min(0.99, raw_price)) if raw_price > 0 else 0.5
+                trade_size = float(srow["trade_size_usd"] or 0.0)
+
+                snapshot = MarketSnapshot(
+                    market_id=market_id,
+                    token_id=token_id,
+                    question=question,
+                    price=price,
+                    volume_24h=trade_size,
+                    liquidity=0.0,
+                    order_book=OrderBook(),          # empty; signals return confidence=0
+                    price_history=list(prices_so_far),  # copy before appending current price
+                    timestamp=ts,
+                    category="sports",
+                    slug=slug,
+                    hours_to_expiry=72.0,
+                    is_live=False,
+                )
+                prices_so_far.append(price)
+                snapshots.append(snapshot)
+
+            if snapshots:
+                result.append(snapshots)
+
+        conn.close()
+        return result if result else None
+
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return None

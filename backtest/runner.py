@@ -4,7 +4,7 @@ import sys
 import os
 
 from utils.config import load_config
-from data.loader import generate_synthetic_markets, load_historical_data
+from data.loader import generate_synthetic_markets, load_historical_data, load_historical_data_from_db
 from backtest.engine import BacktestEngine
 from backtest.reporting import generate_report, generate_sweep_report
 from backtest.sweep import run_sweep
@@ -25,9 +25,23 @@ def main():
 
     config = load_config(config_path)
 
-    # Load or generate data
+    # Load or generate data — priority order:
+    #   1. SQLite (historical_markets / historical_snapshots in data/trades.db)
+    #   2. JSON files in config.backtest.data_dir
+    #   3. Synthetic GBM data (fallback when both real sources are empty)
     print("\nLoading market data...")
-    market_data = load_historical_data(config.backtest.data_dir)
+    market_data = load_historical_data_from_db()
+
+    if market_data is not None:
+        total_snaps = sum(len(m) for m in market_data)
+        print(f"  Loaded {len(market_data)} markets ({total_snaps} snapshots) from SQLite")
+        print(f"  NOTE: NBA outright markets route to 'sports' type; trades require")
+        print(f"        OddsCache to be populated. Zero trades = gate working as designed.")
+    else:
+        market_data = load_historical_data(config.backtest.data_dir)
+        if market_data is not None:
+            total_snaps = sum(len(m) for m in market_data)
+            print(f"  Loaded {len(market_data)} markets ({total_snaps} snapshots) from JSON")
 
     if market_data is None:
         print("  No historical data found, generating synthetic data...")

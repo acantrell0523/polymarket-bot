@@ -259,6 +259,22 @@ class TestMarketTypeDetection:
         snap = self._snap("random-market", question="Will this random event happen?")
         assert detect_market_type(snap) == "other"
 
+    def test_nba_outright_finals_slug_is_sports(self):
+        """NBA Finals-winner slugs contain '-nba-' and must classify as sports."""
+        snap = self._snap(
+            "will-the-oklahoma-city-thunder-win-the-2026-nba-finals",
+            question="Will the Oklahoma City Thunder win the 2026 NBA Finals?",
+        )
+        assert detect_market_type(snap) == "sports"
+
+    def test_nba_outright_mvp_slug_is_sports(self):
+        """NBA MVP slugs contain '-nba-' and must classify as sports."""
+        snap = self._snap(
+            "will-nikola-jokic-win-the-20252026-nba-mvp",
+            question="Will Nikola Jokic win the 2025-26 NBA MVP?",
+        )
+        assert detect_market_type(snap) == "sports"
+
 
 # ============================================================================
 # Probability Estimator Tests
@@ -1171,3 +1187,128 @@ class TestHistoricalDB:
             f"IDEMPOTENCY FAILURE: run1={count_after_run1} snapshots, "
             f"run2={count_after_run2} snapshots"
         )
+
+
+# ============================================================================
+# Historical DB → Loader Tests
+# ============================================================================
+
+class TestHistoricalDBLoader:
+    """Tests for load_historical_data_from_db() in data/loader.py.
+
+    All tests use a tmp_path-isolated SQLite file so they never touch
+    the production data/trades.db.
+    """
+
+    @pytest.fixture
+    def populated_db(self, tmp_path):
+        """Temp DB seeded with 2 NBA markets and 15 snapshots each."""
+        from data.historical_db import (
+            init_tables, get_conn, upsert_historical_market, upsert_snapshots,
+        )
+        db = str(tmp_path / "loader_test.db")
+        init_tables(db)
+        conn = get_conn(db)
+        markets = [
+            ("will-the-lakers-win-the-2026-nba-finals",  "111", "Will the Lakers win the 2026 NBA Finals?"),
+            ("will-lebron-james-win-the-20252026-nba-mvp", "222", "Will LeBron James win the 2025-26 NBA MVP?"),
+        ]
+        for slug, mkt_id, question in markets:
+            upsert_historical_market(conn, {
+                "slug": slug,
+                "market_id": mkt_id,
+                "question": question,
+                "token_id_0": f"token_{mkt_id}",
+                "market_type": "nba_outright",
+            })
+            upsert_snapshots(
+                conn, slug,
+                [{"t": 1_700_000_000 + i * 86400, "p": 0.10 + i * 0.02} for i in range(15)],
+            )
+        conn.commit()
+        conn.close()
+        return db
+
+    @pytest.fixture
+    def empty_db(self, tmp_path):
+        """Temp DB with tables created but no rows."""
+        from data.historical_db import init_tables
+        db = str(tmp_path / "empty_loader_test.db")
+        init_tables(db)
+        return db
+
+    # ── 1. Correct shape when tables are populated ────────────────────────────
+
+    def test_returns_correct_shape_when_populated(self, populated_db):
+        """load_historical_data_from_db() returns List[List[MarketSnapshot]] with
+        outer length = number of markets and inner length = snapshots per market."""
+        from data.loader import load_historical_data_from_db
+        result = load_historical_data_from_db(populated_db)
+        assert result is not None, "Expected populated DB to return data, got None"
+        assert len(result) == 2, f"Expected 2 markets, got {len(result)}"
+        for market_snaps in result:
+            assert len(market_snaps) == 15, (
+                f"Expected 15 snapshots per market, got {len(market_snaps)}"
+            )
+        assert isinstance(result[0][0], MarketSnapshot)
+
+    # ── 2. Returns None when tables are empty (triggers synthetic fallback) ───
+
+    def test_returns_none_when_tables_empty(self, empty_db):
+        """load_historical_data_from_db() must return None for an empty DB so the
+        caller falls back to synthetic data rather than returning an empty list."""
+        from data.loader import load_historical_data_from_db
+        result = load_historical_data_from_db(empty_db)
+        assert result is None, (
+            "Expected None for empty DB (triggers synthetic fallback), "
+            f"got {result!r}"
+        )
+
+    # ── 3. Converted snapshots have all required fields ───────────────────────
+
+    def test_snapshots_have_all_required_fields(self, populated_db):
+        """Every MarketSnapshot produced by the DB loader must have valid values
+        for every field the backtest engine and signal pipeline touch."""
+        from data.loader import load_historical_data_from_db
+        result = load_historical_data_from_db(populated_db)
+        assert result is not None
+
+        # Use the 6th snapshot (index 5) of the first market so price_history
+        # has exactly 5 preceding prices — avoids the edge-case of the first
+        # snapshot (price_history=[]) for the non-trivial assertion below.
+        snap = result[0][5]
+
+        # Identity fields
+        assert isinstance(snap.market_id, str) and snap.market_id != ""
+        assert isinstance(snap.token_id, str)
+        assert isinstance(snap.question, str) and snap.question != ""
+        assert isinstance(snap.slug, str) and snap.slug != ""
+
+        # Price in valid probability range
+        assert 0.01 <= snap.price <= 0.99, f"price {snap.price} out of [0.01, 0.99]"
+
+        # Volume / liquidity defaults
+        assert snap.volume_24h >= 0.0
+        assert snap.liquidity == 0.0  # not stored in DB
+
+        # Empty order book — signals degrade to confidence=0, no crash
+        assert isinstance(snap.order_book, OrderBook)
+        assert snap.order_book.bid_depth == 0
+        assert snap.order_book.ask_depth == 0
+
+        # Price history has exactly 5 elements (the 5 snapshots before index 5)
+        assert isinstance(snap.price_history, list)
+        assert len(snap.price_history) == 5, (
+            f"Expected 5 elements in price_history at index 5, "
+            f"got {len(snap.price_history)}"
+        )
+
+        # Timestamp is timezone-aware UTC
+        assert isinstance(snap.timestamp, datetime)
+        assert snap.timestamp.tzinfo is not None, "timestamp must be timezone-aware"
+
+        # Metadata defaults
+        assert snap.category == "sports"
+        assert snap.hours_to_expiry == 72.0
+        assert snap.is_live is False
+        assert snap.outcomes == ["Yes", "No"]
