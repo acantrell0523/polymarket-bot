@@ -158,6 +158,180 @@ class Supervisor:
         return by_type
 
     # ------------------------------------------------------------------
+    # Exit telemetry helpers (read-only queries on exit_log)
+    # ------------------------------------------------------------------
+
+    def _get_exit_insights(self, since_iso: str) -> Optional[Dict[str, Any]]:
+        """Query exit_log for the given window.
+
+        Runs four diagnostic queries:
+          1. Close-reason distribution + avg peak unrealized P&L per reason
+          2. Let-it-ride triggered count and P&L summary
+          3. Let-it-ride positions that subsequently stopped out
+          4. Stop-loss tightness: count of stop_loss exits where take_profit
+             edge was within 2% at close time (reads exit_proximity_json)
+
+        Returns a dict on success, or None when the window is empty or any
+        DB error occurs.  Never raises — all errors are logged at WARNING.
+        """
+        try:
+            conn = trade_db._get_conn()
+
+            total = conn.execute(
+                "SELECT COUNT(*) FROM exit_log WHERE close_time >= ?",
+                (since_iso,),
+            ).fetchone()[0]
+
+            if total == 0:
+                conn.close()
+                return None
+
+            # 1. Close-reason distribution + avg peak unrealized P&L
+            reasons = conn.execute(
+                "SELECT close_reason, COUNT(*) AS n, "
+                "ROUND(100.0 * SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) "
+                "/ COUNT(*), 1) AS win_rate_pct, "
+                "ROUND(AVG(realized_pnl), 2) AS avg_pnl, "
+                "ROUND(AVG(max_favorable_pnl_usd), 2) AS avg_peak_favorable_usd "
+                "FROM exit_log WHERE close_time >= ? "
+                "GROUP BY close_reason ORDER BY n DESC",
+                (since_iso,),
+            ).fetchall()
+
+            # 2. Let-it-ride summary
+            lir = conn.execute(
+                "SELECT COUNT(*) AS n, ROUND(AVG(realized_pnl), 2) AS avg_pnl "
+                "FROM exit_log WHERE close_time >= ? AND let_it_ride_triggered = 1",
+                (since_iso,),
+            ).fetchone()
+
+            # 3. Let-it-ride positions that subsequently stopped out
+            lir_sl = conn.execute(
+                "SELECT COUNT(*) AS n, ROUND(AVG(realized_pnl), 2) AS avg_pnl "
+                "FROM exit_log WHERE close_time >= ? "
+                "AND let_it_ride_triggered = 1 AND close_reason = 'stop_loss'",
+                (since_iso,),
+            ).fetchone()
+
+            # 4. Stop-loss tightness: stop_loss exits where take_profit edge
+            #    was within 2% at close (positive value > -0.02 means nearly converged)
+            sl_tightness = conn.execute(
+                "SELECT COUNT(*) AS total_sl, "
+                "SUM(CASE WHEN exit_proximity_json IS NOT NULL "
+                "AND exit_proximity_json != '{}' "
+                "AND CAST(json_extract(exit_proximity_json, "
+                "'$.take_profit_edge_distance') AS REAL) > -0.02 "
+                "THEN 1 ELSE 0 END) AS tight_count "
+                "FROM exit_log WHERE close_time >= ? AND close_reason = 'stop_loss'",
+                (since_iso,),
+            ).fetchone()
+
+            conn.close()
+
+            return {
+                "total": total,
+                "close_reasons": [dict(r) for r in reasons],
+                "let_it_ride_count": lir["n"] if lir else 0,
+                "let_it_ride_avg_pnl": lir["avg_pnl"] if lir else 0.0,
+                "let_it_ride_then_stop_loss": lir_sl["n"] if lir_sl else 0,
+                "let_it_ride_sl_avg_pnl": lir_sl["avg_pnl"] if lir_sl else 0.0,
+                "total_stop_loss": sl_tightness["total_sl"] if sl_tightness else 0,
+                "tight_stop_count": int(sl_tightness["tight_count"] or 0) if sl_tightness else 0,
+            }
+
+        except Exception as e:
+            self.logger.warning("exit_insights_failed", {"error": str(e)})
+            return None
+
+    def _format_exit_section(self, insights: Dict[str, Any]) -> str:
+        """Render exit telemetry insights as a Slack text block.
+
+        Four blocks:
+          1. Close-reason table (count, win rate, avg realized P&L, avg peak P&L)
+          2. Let-it-ride summary (only when triggered ≥1 time)
+          3. Let-it-ride → subsequent stop-loss warning (only when present)
+          4. Stop-loss tightness diagnostic (only when stop_loss exits exist)
+        """
+        lines = ["\n*Exit Telemetry (last 24h)*"]
+
+        # Block 1: Close-reason distribution + avg peak unrealized P&L
+        if insights.get("close_reasons"):
+            lines.append("")
+            for r in insights["close_reasons"]:
+                peak = r.get("avg_peak_favorable_usd") or 0.0
+                lines.append(
+                    f"  `{r['close_reason']:<20}` "
+                    f"`{r['n']:>2}` exit(s) | "
+                    f"Win `{r['win_rate_pct']:.0f}%` | "
+                    f"Avg P&L `{r['avg_pnl']:+.2f}` | "
+                    f"Avg Peak `+${peak:.2f}`"
+                )
+
+        # Block 2 + 3: Let-it-ride summary (only when triggered)
+        lir_count = insights.get("let_it_ride_count", 0)
+        if lir_count:
+            lines.append("")
+            lir_avg = insights.get("let_it_ride_avg_pnl") or 0.0
+            lir_sl = insights.get("let_it_ride_then_stop_loss", 0)
+            lir_sl_avg = insights.get("let_it_ride_sl_avg_pnl") or 0.0
+            lines.append(
+                f"  :rocket: Let-it-ride fired: `{lir_count}` position(s) "
+                f"(avg `{lir_avg:+.2f}`)"
+            )
+            if lir_sl:
+                lines.append(
+                    f"  :warning: `{lir_sl}` let-it-ride position(s) later stopped out "
+                    f"(avg `{lir_sl_avg:+.2f}`)"
+                )
+
+        # Block 4: Stop-loss tightness diagnostic
+        total_sl = insights.get("total_stop_loss", 0)
+        tight = insights.get("tight_stop_count", 0)
+        if total_sl:
+            lines.append("")
+            if tight:
+                lines.append(
+                    f"  :warning: Stop-loss tightness: `{tight}` of `{total_sl}` "
+                    f"stop_loss exit(s) had take_profit edge within 2% — "
+                    f"stop may be firing prematurely"
+                )
+            else:
+                lines.append(
+                    f"  :white_check_mark: Stop-loss tightness: `{total_sl}` "
+                    f"stop_loss exit(s), none within 2% of take_profit"
+                )
+
+        return "\n".join(lines)
+
+    def _format_exit_oneliner(self, insights: Optional[Dict[str, Any]]) -> Optional[str]:
+        """One-line stop-loss tightness observation for the morning briefing.
+
+        Derived from the tightness diagnostic (item 4) since that is the most
+        actionable forward-looking signal — it tells the operator whether
+        yesterday's stop-losses fired too early.
+
+        Returns None when there are no stop_loss exits so the morning briefing
+        is not padded with an empty or irrelevant line.
+        """
+        if not insights:
+            return None
+        total_sl = insights.get("total_stop_loss", 0)
+        if not total_sl:
+            return None
+        tight = insights.get("tight_stop_count", 0)
+        if tight:
+            return (
+                f":warning: *Yesterday's stop-loss tightness:* "
+                f"`{tight}` of `{total_sl}` stop_loss exit(s) had take_profit "
+                f"edge within 2% — consider reviewing stop-loss width"
+            )
+        return (
+            f":white_check_mark: *Yesterday's stop-loss tightness:* "
+            f"`{total_sl}` stop_loss exit(s), none within 2% of take_profit — "
+            f"stops look reasonable"
+        )
+
+    # ------------------------------------------------------------------
     # Kill switch (STOP only — never changes parameters)
     # ------------------------------------------------------------------
 
@@ -195,6 +369,10 @@ class Supervisor:
             metrics = self._compute_metrics(trades_24h)
             by_type = self._compute_by_type(trades_24h)
 
+            # Exit telemetry for the same 24h window
+            yesterday_iso = yesterday.isoformat()
+            exit_insights = self._get_exit_insights(yesterday_iso)
+
             # Save daily summary
             today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             summary = {
@@ -214,7 +392,7 @@ class Supervisor:
             self.check_kill_switch()
 
             # Send report (NO auto-tuning)
-            self._send_daily_report(metrics, by_type)
+            self._send_daily_report(metrics, by_type, exit_insights)
 
             # Edge validation
             self.run_edge_validation()
@@ -228,7 +406,7 @@ class Supervisor:
             self.logger.error("daily_review_failed", {"error": str(e)})
             self.alerter.error("Daily review failed", str(e))
 
-    def _send_daily_report(self, metrics: Dict, by_type: Dict):
+    def _send_daily_report(self, metrics: Dict, by_type: Dict, exit_insights: Optional[Dict] = None):
         pnl = metrics["total_pnl"]
         pnl_sign = "+" if pnl >= 0 else ""
         color = COLOR_GREEN if pnl >= 0 else COLOR_RED
@@ -272,6 +450,15 @@ class Supervisor:
                 side = "LONG" if net > 0 else "SHORT"
                 emoji = ":small_green_triangle:" if upnl >= 0 else ":small_red_triangle_down:"
                 lines.append(f"  {emoji} `{slug}` {side} `${upnl:+.2f}`")
+
+        # Exit telemetry section — appended to the same Slack message
+        if exit_insights:
+            lines.append(self._format_exit_section(exit_insights))
+        else:
+            lines.append(
+                "\n*Exit Telemetry (last 24h)*\n"
+                "  _No exit_log data yet for this window._"
+            )
 
         self.alerter._post(color, "\n".join(lines))
 
@@ -317,6 +504,15 @@ class Supervisor:
                 market_data, estimator, odds_cache, self.config
             )
             text = format_morning_briefing(opportunities)
+
+            # Append yesterday's stop-loss tightness one-liner (item 4 of exit
+            # telemetry) — the most actionable forward-looking signal.
+            yesterday = datetime.now(timezone.utc) - timedelta(hours=24)
+            exit_insights = self._get_exit_insights(yesterday.isoformat())
+            oneliner = self._format_exit_oneliner(exit_insights)
+            if oneliner:
+                text = text + "\n\n" + oneliner
+
             self.alerter.morning_briefing(text)
 
             self.logger.info("morning_briefing_sent", {

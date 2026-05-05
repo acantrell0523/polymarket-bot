@@ -7,8 +7,9 @@ price_momentum_signal, volume_signal, etc.) and a stale Portfolio/Estimator API.
 """
 
 import pytest
+import sqlite3
 from datetime import datetime, timezone, timedelta
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 from utils.models import (
     OrderBook, OrderBookLevel, MarketSnapshot, Signal,
@@ -1926,4 +1927,265 @@ class TestAnalyzeExitsStopLossTightness:
         )
         assert "⚠" in captured.out, (
             "⚠ warning must appear when take_profit edge was within 2%"
+        )
+
+
+# ============================================================================
+# Supervisor Exit Insights Tests
+# ============================================================================
+
+class TestSupervisorExitInsights:
+    """Tests for Supervisor._get_exit_insights() and exit formatting helpers.
+
+    Uses in-memory SQLite and a lightweight Supervisor stub so tests remain
+    completely independent of the exchange API, APScheduler, and .env config.
+    """
+
+    # ── DDL for in-memory exit_log ───────────────────────────────────────────
+
+    _EXIT_LOG_DDL = (
+        "CREATE TABLE exit_log ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "slug TEXT, market_id TEXT, side TEXT, "
+        "entry_time TEXT, close_time TEXT, hold_seconds REAL, "
+        "entry_price REAL, close_price REAL, size_usd REAL, quantity REAL, "
+        "realized_pnl REAL, close_reason TEXT, entry_estimated_prob REAL, "
+        "max_favorable_pnl_usd REAL DEFAULT 0, max_adverse_pnl_usd REAL DEFAULT 0, "
+        "peak_unrealized_pct REAL DEFAULT 0, let_it_ride_triggered INTEGER DEFAULT 0, "
+        "num_let_it_ride_triggers INTEGER DEFAULT 0, exit_threshold_distance REAL DEFAULT 0, "
+        "metadata_json TEXT DEFAULT '{}', exit_proximity_json TEXT DEFAULT '{}', "
+        "created_at TEXT DEFAULT (datetime('now')))"
+    )
+
+    def _make_conn(self, rows=None):
+        """Return a populated in-memory SQLite connection."""
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(self._EXIT_LOG_DDL)
+        conn.commit()
+        if rows:
+            for row in rows:
+                conn.execute(
+                    "INSERT INTO exit_log (slug, market_id, side, entry_time, close_time, "
+                    "hold_seconds, entry_price, close_price, size_usd, quantity, realized_pnl, "
+                    "close_reason, entry_estimated_prob, max_favorable_pnl_usd, "
+                    "max_adverse_pnl_usd, peak_unrealized_pct, let_it_ride_triggered, "
+                    "num_let_it_ride_triggers, exit_threshold_distance, "
+                    "metadata_json, exit_proximity_json) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    row,
+                )
+            conn.commit()
+        return conn
+
+    def _stub_supervisor(self):
+        """Return a Supervisor instance without calling __init__.
+
+        Bypasses exchange API calls, APScheduler, config loading, and log
+        file creation — suitable for pure unit tests.
+        """
+        from bot.supervisor import Supervisor
+        sup = object.__new__(Supervisor)
+        sup.logger = MagicMock()
+        sup.alerter = MagicMock()
+        sup._starting_value = 1000.0
+        return sup
+
+    # Three fixture rows: 2 take_profit wins + 1 stop_loss with LIR and tight TP proximity
+    _FIXTURE_ROWS = [
+        # (slug, market_id, side, entry_time, close_time, hold_s,
+        #  entry_price, close_price, size_usd, qty, realized_pnl,
+        #  close_reason, entry_est_prob, max_fav, max_adv, peak_pct,
+        #  lir_triggered, num_lir, exit_dist, meta_json, prox_json)
+        (
+            "slug-tp-1", "m1", "buy",
+            "2026-05-03T10:00:00", "2026-05-03T11:00:00", 3600,
+            0.50, 0.59, 50.0, 100, 9.0,
+            "take_profit", 0.65, 12.0, -2.0, 0.24,
+            0, 0, 0.0, "{}", "{}",
+        ),
+        (
+            "slug-tp-2", "m2", "buy",
+            "2026-05-03T12:00:00", "2026-05-03T13:00:00", 3600,
+            0.55, 0.64, 40.0, 80, 7.2,
+            "take_profit", 0.70, 9.0, -1.0, 0.225,
+            0, 0, 0.0, "{}", "{}",
+        ),
+        (
+            # LIR triggered, then stopped out; TP edge was -0.01 > -0.02 → tight
+            "slug-sl-1", "m3", "buy",
+            "2026-05-03T14:00:00", "2026-05-03T15:30:00", 5400,
+            0.50, 0.38, 50.0, 100, -12.0,
+            "stop_loss", 0.60, 5.0, -15.0, 0.10,
+            1, 3, 0.02, "{}",
+            '{"take_profit_edge_distance": -0.01, "stop_loss_distance_pct": 0.05}',
+        ),
+    ]
+
+    # ── Test 1: correct shape and values ────────────────────────────────────
+
+    def test_get_exit_insights_returns_correct_shape(self):
+        """_get_exit_insights() returns a dict with all expected keys and correct
+        values when exit_log has rows in the requested window."""
+        from bot import trade_db
+
+        conn = self._make_conn(self._FIXTURE_ROWS)
+        sup = self._stub_supervisor()
+        since_iso = "2026-05-03T00:00:00+00:00"
+
+        with patch.object(trade_db, "_get_conn", return_value=conn):
+            result = sup._get_exit_insights(since_iso)
+
+        assert result is not None, "Expected dict, got None"
+
+        # All required top-level keys are present
+        for key in ("total", "close_reasons", "let_it_ride_count",
+                    "let_it_ride_then_stop_loss", "total_stop_loss", "tight_stop_count"):
+            assert key in result, f"Missing key: {key}"
+
+        # Correct aggregate counts
+        assert result["total"] == 3
+        assert len(result["close_reasons"]) == 2          # take_profit + stop_loss
+        assert result["let_it_ride_count"] == 1           # slug-sl-1 had LIR=1
+        assert result["let_it_ride_then_stop_loss"] == 1  # it then stopped out
+        assert result["total_stop_loss"] == 1
+        assert result["tight_stop_count"] == 1            # TP edge -0.01 > -0.02
+
+        # Each close_reason entry has the four required fields
+        for r in result["close_reasons"]:
+            for field in ("close_reason", "n", "win_rate_pct", "avg_pnl",
+                          "avg_peak_favorable_usd"):
+                assert field in r, f"close_reasons entry missing field: {field}"
+
+    # ── Test 2: empty window returns None ───────────────────────────────────
+
+    def test_get_exit_insights_empty_window_returns_none(self):
+        """_get_exit_insights() must return None when the window has zero rows.
+
+        This is the normal state for a brand-new deployment before any
+        positions have been closed — the section must silently disappear
+        from the Slack message rather than posting an empty block.
+        """
+        from bot import trade_db
+
+        conn = self._make_conn(rows=None)   # no rows inserted
+        sup = self._stub_supervisor()
+        since_iso = "2099-01-01T00:00:00+00:00"  # far future → no rows match
+
+        with patch.object(trade_db, "_get_conn", return_value=conn):
+            result = sup._get_exit_insights(since_iso)
+
+        assert result is None, f"Expected None for empty window, got {result!r}"
+
+    # ── Test 3: DB error returns None without crashing ──────────────────────
+
+    def test_get_exit_insights_db_error_returns_none(self):
+        """_get_exit_insights() must catch DB errors and return None.
+
+        Verifies the graceful-degradation contract: a missing table or
+        corrupt DB must never crash the 6 AM daily_review() job.
+        """
+        from bot import trade_db
+
+        sup = self._stub_supervisor()
+
+        with patch.object(
+            trade_db, "_get_conn",
+            side_effect=sqlite3.OperationalError("no such table: exit_log"),
+        ):
+            result = sup._get_exit_insights("2026-05-03T00:00:00+00:00")
+
+        assert result is None, "Expected None on DB error"
+
+        # Warning must have been logged (not silently swallowed)
+        sup.logger.warning.assert_called_once()
+        event_name = sup.logger.warning.call_args[0][0]
+        assert event_name == "exit_insights_failed"
+
+    # ── Test 4: _format_exit_section contains all required blocks ───────────
+
+    def test_format_exit_section_contains_all_blocks(self):
+        """_format_exit_section() output must contain every diagnostic block:
+        header, close-reason table, let-it-ride summary, and tightness warning.
+        """
+        sup = self._stub_supervisor()
+        insights = {
+            "total": 3,
+            "close_reasons": [
+                {
+                    "close_reason": "take_profit", "n": 2,
+                    "win_rate_pct": 100.0, "avg_pnl": 8.10,
+                    "avg_peak_favorable_usd": 10.50,
+                },
+                {
+                    "close_reason": "stop_loss", "n": 1,
+                    "win_rate_pct": 0.0, "avg_pnl": -12.0,
+                    "avg_peak_favorable_usd": 5.0,
+                },
+            ],
+            "let_it_ride_count": 1,
+            "let_it_ride_avg_pnl": -12.0,
+            "let_it_ride_then_stop_loss": 1,
+            "let_it_ride_sl_avg_pnl": -12.0,
+            "total_stop_loss": 1,
+            "tight_stop_count": 1,
+        }
+
+        text = sup._format_exit_section(insights)
+
+        assert "Exit Telemetry" in text, "Header must be present"
+        assert "take_profit" in text, "take_profit close reason must appear"
+        assert "stop_loss" in text, "stop_loss close reason must appear"
+        assert "Let-it-ride fired" in text, "Let-it-ride block must appear"
+        assert "let-it-ride position(s) later stopped out" in text, (
+            "LIR→stop-loss warning must appear when lir_then_stop_loss > 0"
+        )
+        assert "Stop-loss tightness" in text, "Tightness diagnostic must appear"
+        assert "within 2%" in text, "Tightness warning text must appear"
+
+    # ── Test 5: oneliner returns None when no data ───────────────────────────
+
+    def test_format_exit_oneliner_returns_none_when_no_data(self):
+        """_format_exit_oneliner(None) must return None so the morning briefing
+        is not padded with a spurious empty line when exit_log is empty."""
+        sup = self._stub_supervisor()
+        result = sup._format_exit_oneliner(None)
+        assert result is None, f"Expected None for None insights, got {result!r}"
+
+    # ── Test 6: oneliner tight-warning path ─────────────────────────────────
+
+    def test_format_exit_oneliner_tight_warning_when_tight_stops_exist(self):
+        """_format_exit_oneliner() must include 'within 2%' when tight_stop_count > 0.
+
+        This is the actionable morning observation the operator needs: if
+        stop_losses fired when take_profit was almost there, the stop may be
+        too tight.
+        """
+        sup = self._stub_supervisor()
+        insights = {"total_stop_loss": 2, "tight_stop_count": 1}
+
+        result = sup._format_exit_oneliner(insights)
+
+        assert result is not None
+        assert "within 2%" in result, (
+            f"Expected 'within 2%' in tight-stop oneliner, got: {result!r}"
+        )
+        assert "Yesterday" in result or "yesterday" in result.lower(), (
+            "Oneliner must reference 'yesterday' to establish temporal context"
+        )
+
+    # ── Test 7: oneliner clean path ──────────────────────────────────────────
+
+    def test_format_exit_oneliner_clean_when_no_tight_stops(self):
+        """_format_exit_oneliner() must return a 'looks reasonable' message
+        when stop_loss exits exist but none were within 2% of take_profit.
+        """
+        sup = self._stub_supervisor()
+        insights = {"total_stop_loss": 3, "tight_stop_count": 0}
+
+        result = sup._format_exit_oneliner(insights)
+
+        assert result is not None
+        assert "reasonable" in result, (
+            f"Expected 'reasonable' in clean-path oneliner, got: {result!r}"
         )
