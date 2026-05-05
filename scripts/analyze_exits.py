@@ -307,6 +307,112 @@ def q_pnl_by_prob_bucket(conn: sqlite3.Connection, since_iso: str):
 
 
 # ---------------------------------------------------------------------------
+# Query 7: Stop-loss tightness diagnostic — take_profit proximity at SL exits
+# ---------------------------------------------------------------------------
+
+def q_stop_loss_tightness_diagnostic(conn: sqlite3.Connection, since_iso: str):
+    """For every stop_loss exit, show how close take_profit was at close time.
+
+    Reads take_profit_edge_distance from exit_proximity_json.
+    Sign convention (matches compute_exit_proximity):
+        negative  →  edge still wide; take_profit NOT close to firing
+                      (e.g. -0.12 = edge was 12 pct-points away from the 5% threshold)
+        positive  →  edge had already converged past the threshold; take_profit
+                      COULD have fired if the $5 profit guard was also met
+
+    A cluster of values near 0 (say, within ±0.02) means that stop_loss and
+    take_profit were racing each other — the stop might be legitimately too tight.
+    """
+    _divider("Stop-Loss Tightness Diagnostic  (take_profit proximity at SL exits)")
+
+    # Check whether the column exists before querying it
+    col_check = conn.execute(
+        "SELECT COUNT(*) FROM pragma_table_info('exit_log') WHERE name='exit_proximity_json'"
+    ).fetchone()
+    if not col_check or col_check[0] == 0:
+        print("  exit_proximity_json column not yet present.")
+        print("  Close a position after the schema migration to populate it.")
+        return
+
+    rows = conn.execute(
+        """
+        SELECT
+            slug,
+            close_time,
+            ROUND(realized_pnl, 2)                                            AS pnl,
+            ROUND(
+                CAST(
+                    json_extract(exit_proximity_json, '$.take_profit_edge_distance')
+                    AS REAL
+                ) * 100, 2
+            )                                                                 AS tp_edge_dist_pct,
+            ROUND(
+                CAST(
+                    json_extract(exit_proximity_json, '$.aggressive_exit_distance_pct')
+                    AS REAL
+                ) * 100, 2
+            )                                                                 AS agg_exit_dist_pct,
+            exit_proximity_json
+        FROM exit_log
+        WHERE close_time >= ?
+          AND close_reason = 'stop_loss'
+          AND exit_proximity_json != '{}'
+          AND exit_proximity_json IS NOT NULL
+        ORDER BY close_time DESC
+        """,
+        (since_iso,),
+    ).fetchall()
+
+    # Count total SL exits (including those without proximity data)
+    total_sl = conn.execute(
+        "SELECT COUNT(*) FROM exit_log WHERE close_time >= ? AND close_reason = 'stop_loss'",
+        (since_iso,),
+    ).fetchone()[0]
+
+    if not rows:
+        if total_sl > 0:
+            print(f"  {total_sl} stop_loss exit(s) found but none have exit_proximity_json data yet.")
+            print("  Proximity data is only recorded for positions closed after the schema migration.")
+        else:
+            print("  No stop_loss exits in window.")
+        return
+
+    print(f"  Showing {len(rows)} of {total_sl} stop_loss exit(s) with proximity data.\n")
+    print(f"  {'Slug':<35} {'Close Time':<22} {'P&L':>7}  "
+          f"{'TP edge dist':>13}  {'Agg exit dist':>14}")
+    print(f"  {'─'*35} {'─'*22} {'─'*7}  {'─'*13}  {'─'*14}")
+
+    tight_count = 0
+    for r in rows:
+        tp_dist = r["tp_edge_dist_pct"]
+        agg_dist = r["agg_exit_dist_pct"]
+        tp_str  = f"{tp_dist:+.2f}%" if tp_dist is not None else "  n/a  "
+        agg_str = f"{agg_dist:+.2f}%" if agg_dist is not None else "  n/a  "
+
+        # Flag rows where take_profit was within 2 pct-points (edge nearly converged)
+        flag = " ⚠" if tp_dist is not None and tp_dist > -2.0 else ""
+        if flag:
+            tight_count += 1
+
+        slug_display = (r["slug"] or "")[:35]
+        print(
+            f"  {slug_display:<35} {(r['close_time'] or '')[:22]:<22} "
+            f"${r['pnl']:>6.2f}  "
+            f"{tp_str:>13}  {agg_str:>14}{flag}"
+        )
+
+    if tight_count:
+        print(
+            f"\n  ⚠  {tight_count} stop_loss exit(s) had take_profit edge within 2%.\n"
+            f"     Consider whether the stop-loss fired prematurely — the edge\n"
+            f"     was almost converged, suggesting the position was near a\n"
+            f"     take_profit close rather than a genuine loss."
+        )
+    else:
+        print("\n  ✓  No stop_loss exits had take_profit edge within 2% — stops look reasonable.")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -351,6 +457,7 @@ def main():
     q_stop_loss_analysis(conn, since_iso)
     q_hold_time_by_reason(conn, since_iso)
     q_pnl_by_prob_bucket(conn, since_iso)
+    q_stop_loss_tightness_diagnostic(conn, since_iso)
 
     print(f"\n{'='*60}\n")
     conn.close()

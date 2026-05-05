@@ -298,6 +298,10 @@ def init_exit_log_table():
             -- Free-form metadata (paper_mode, is_live_game, close_estimated_prob, …)
             metadata_json            TEXT    DEFAULT '{}',
 
+            -- Rich proximity blob: signed distance to every exit threshold at close
+            -- (JSON object; null values mean threshold was not armed/applicable)
+            exit_proximity_json      TEXT    DEFAULT '{}',
+
             created_at               TEXT    DEFAULT (datetime('now'))
         );
 
@@ -309,6 +313,18 @@ def init_exit_log_table():
             ON exit_log(close_time);
     """)
     conn.commit()
+
+    # Migration guard: add column to existing databases that predate this field.
+    # ALTER TABLE … ADD COLUMN raises OperationalError if the column already
+    # exists — catch it so re-running init_db() on a populated database is safe.
+    try:
+        conn.execute(
+            "ALTER TABLE exit_log ADD COLUMN exit_proximity_json TEXT DEFAULT '{}'"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists — nothing to do.
+
     conn.close()
 
 
@@ -333,6 +349,7 @@ def insert_exit_log(
     num_let_it_ride_triggers: int,
     exit_threshold_distance: float,
     metadata_json: str = "{}",
+    exit_proximity_json: str = "{}",
 ):
     """Write a full exit telemetry row when a position closes.
 
@@ -347,15 +364,15 @@ def insert_exit_log(
             close_reason, entry_estimated_prob,
             max_favorable_pnl_usd, max_adverse_pnl_usd, peak_unrealized_pct,
             let_it_ride_triggered, num_let_it_ride_triggers,
-            exit_threshold_distance, metadata_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            exit_threshold_distance, metadata_json, exit_proximity_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (slug, market_id, side,
          entry_time.isoformat(), close_time.isoformat(), hold_seconds,
          entry_price, close_price, size_usd, quantity, realized_pnl,
          close_reason, entry_estimated_prob,
          max_favorable_pnl_usd, max_adverse_pnl_usd, peak_unrealized_pct,
          int(let_it_ride_triggered), num_let_it_ride_triggers,
-         exit_threshold_distance, metadata_json),
+         exit_threshold_distance, metadata_json, exit_proximity_json),
     )
     conn.commit()
     conn.close()

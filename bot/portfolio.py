@@ -234,7 +234,8 @@ class Portfolio:
     def close_position(self, position: Position, current_price: float,
                        reason: str, timestamp: Optional[datetime] = None,
                        exchange_pnl: Optional[float] = None,
-                       exit_threshold_distance: float = 0.0) -> float:
+                       exit_threshold_distance: float = 0.0,
+                       exit_proximity: Optional[dict] = None) -> float:
         """Record a position close. P&L comes from the exchange when available."""
         if position.status != "open":
             return 0.0
@@ -366,6 +367,12 @@ class Portfolio:
                 "is_live_game": getattr(position, '_is_live', False),
             }
 
+            # Serialize exit_proximity dict → JSON string for the new column.
+            # None values in the dict (e.g. trailing_stop unarmed) round-trip
+            # correctly as JSON null, which is queryable in SQLite via
+            # json_extract(exit_proximity_json, '$.trailing_stop_distance_pct') IS NULL.
+            exit_proximity_json = _json.dumps(exit_proximity) if exit_proximity else "{}"
+
             trade_db.insert_exit_log(
                 slug=slug,
                 market_id=position.market_id,
@@ -387,6 +394,7 @@ class Portfolio:
                 num_let_it_ride_triggers=position.let_it_ride_count,
                 exit_threshold_distance=exit_threshold_distance,
                 metadata_json=_json.dumps(metadata),
+                exit_proximity_json=exit_proximity_json,
             )
         except Exception:
             pass

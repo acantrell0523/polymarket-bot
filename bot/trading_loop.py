@@ -14,11 +14,112 @@ from utils.logger import TradingLogger
 from utils.models import MarketSnapshot
 from bot.signals.estimator import ProbabilityEstimator
 from bot.strategies.sizing import PositionSizer
-from bot.strategies.risk import RiskManager
+from bot.strategies.risk import RiskManager, LET_IT_RIDE_THRESHOLD
 from bot.market_data import MarketDataClient
 from bot.execution import ExecutionEngine
 from bot.portfolio import Portfolio
 from bot.alerts import SlackAlerter
+
+
+def compute_exit_proximity(position, current_price: float, estimated_prob: float, config) -> dict:
+    """Compute signed distance to every exit threshold at the moment of close.
+
+    Returns a dict with 5 fields — one per exit condition defined in RiskManager.
+    All distances share the same sign convention:
+        negative = condition has NOT yet been met (threshold still ahead)
+        positive = condition HAS been met (threshold already passed)
+
+    This makes queries like "was take_profit within 2% when stop_loss fired?"
+    expressible as a single SQL inequality on exit_proximity_json fields.
+
+    Args:
+        position    : Position object at close time (peak_price must be set).
+        current_price: The price at which the position is closing.
+        estimated_prob: The probability estimate used for take-profit edge calc.
+        config      : TradingConfig instance (supplies threshold constants).
+
+    Returns dict keys:
+        stop_loss_distance_pct       – loss_pct − stop_loss_threshold
+        take_profit_edge_distance    – take_profit_threshold − edge_remaining
+        aggressive_exit_distance_pct – gain_pct − aggressive_exit_pct
+        trailing_stop_distance_pct   – drop_from_peak − trailing_stop_pct
+                                       (None / JSON null when trailing stop unarmed)
+        let_it_ride_distance_pct     – favorable_price − LET_IT_RIDE_THRESHOLD
+    """
+    entry_price = position.entry_price
+
+    # Degenerate guard: no valid entry price → return zeros
+    if not entry_price or entry_price <= 0:
+        return {
+            "stop_loss_distance_pct": 0.0,
+            "take_profit_edge_distance": 0.0,
+            "aggressive_exit_distance_pct": 0.0,
+            "trailing_stop_distance_pct": None,
+            "let_it_ride_distance_pct": 0.0,
+        }
+
+    if position.side == "buy":
+        pnl_per_unit = current_price - entry_price
+    else:
+        pnl_per_unit = entry_price - current_price
+
+    gain_pct = pnl_per_unit / entry_price
+    loss_pct = -gain_pct  # positive when losing
+
+    # ── 1. stop_loss ──────────────────────────────────────────────────────────
+    # Fires when loss_pct >= stop_loss_threshold (0.25).
+    # Distance = loss_pct − threshold  →  negative = not fired, positive = fired.
+    stop_loss_distance_pct = loss_pct - config.stop_loss_threshold
+
+    # ── 2. take_profit ────────────────────────────────────────────────────────
+    # Fires when edge_remaining <= take_profit_threshold (0.05) AND profit ≥ $5.
+    # Edge distance = threshold − edge_remaining  → negative = not converged yet,
+    # positive = edge has converged past the threshold.
+    edge_remaining = abs(estimated_prob - current_price)
+    take_profit_edge_distance = config.take_profit_threshold - edge_remaining
+
+    # ── 3. aggressive_exit ────────────────────────────────────────────────────
+    # Fires when gain_pct >= aggressive_exit_pct (0.30).
+    # Distance = gain_pct − threshold  →  negative = not there yet.
+    aggressive_exit_distance_pct = gain_pct - config.aggressive_exit_pct
+
+    # ── 4. trailing_stop ─────────────────────────────────────────────────────
+    # Two-stage: first peak_gain must reach activation (0.15), then drop_from_peak
+    # must reach trailing_stop_pct (0.10).
+    # Returns None when the trailing stop was never armed (peak never activated).
+    trailing_stop_distance_pct = None  # default: unarmed / not applicable
+    peak_price = getattr(position, "peak_price", 0)
+    if peak_price and peak_price > 0 and entry_price > 0:
+        if position.side == "buy":
+            peak_gain = (peak_price - entry_price) / entry_price
+            drop_from_peak = (peak_price - current_price) / entry_price
+        else:
+            peak_gain = (entry_price - peak_price) / entry_price
+            drop_from_peak = (current_price - peak_price) / entry_price
+
+        if peak_gain >= config.trailing_stop_activation_pct:
+            # Trailing stop is armed — compute distance to trigger.
+            trailing_stop_distance_pct = drop_from_peak - config.trailing_stop_pct
+
+    # ── 5. let_it_ride ────────────────────────────────────────────────────────
+    # Fires when favorable_price >= LET_IT_RIDE_THRESHOLD (0.70).
+    # For buys favorable_price = current_price; for sells it's 1 − current_price.
+    if position.side == "buy":
+        favorable_price = current_price
+    else:
+        favorable_price = 1.0 - current_price
+    let_it_ride_distance_pct = favorable_price - LET_IT_RIDE_THRESHOLD
+
+    return {
+        "stop_loss_distance_pct": round(stop_loss_distance_pct, 6),
+        "take_profit_edge_distance": round(take_profit_edge_distance, 6),
+        "aggressive_exit_distance_pct": round(aggressive_exit_distance_pct, 6),
+        "trailing_stop_distance_pct": (
+            round(trailing_stop_distance_pct, 6)
+            if trailing_stop_distance_pct is not None else None
+        ),
+        "let_it_ride_distance_pct": round(let_it_ride_distance_pct, 6),
+    }
 
 
 class TradingBot:
@@ -556,10 +657,24 @@ class TradingBot:
                     except Exception:
                         exit_threshold_distance = 0.0
 
+                    # Compute full proximity dict — signed distance to every exit
+                    # threshold at the moment of close. Stored as JSON in exit_log
+                    # for post-hoc queries like "was take_profit close when SL fired?"
+                    try:
+                        exit_proximity = compute_exit_proximity(
+                            position,
+                            position.current_price,
+                            position.estimated_prob,
+                            self.risk.config,
+                        )
+                    except Exception:
+                        exit_proximity = {}
+
                     self.portfolio.close_position(
                         position, position.current_price, close_reason,
                         exchange_pnl=exchange_pnl,
                         exit_threshold_distance=exit_threshold_distance,
+                        exit_proximity=exit_proximity,
                     )
                     self.risk.record_pnl(position.realized_pnl)
                     self.logger.info("position_exit_complete", {

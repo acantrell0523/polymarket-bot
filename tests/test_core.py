@@ -1516,3 +1516,414 @@ class TestHistoricalDBLoader:
         assert snap.hours_to_expiry == 72.0
         assert snap.is_live is False
         assert snap.outcomes == ["Yes", "No"]
+
+
+# ============================================================================
+# Exit Proximity Tests
+# ============================================================================
+
+class TestComputeExitProximity:
+    """Tests for compute_exit_proximity() in bot/trading_loop.py.
+
+    All formulas and sign conventions:
+        negative = condition NOT yet met (threshold still ahead)
+        positive = condition already past trigger (threshold passed)
+    """
+
+    def _make_position(
+        self,
+        entry_price: float = 0.50,
+        current_price: float = 0.50,
+        side: str = "buy",
+        peak_price: float = 0.0,
+        estimated_prob: float = 0.65,
+        quantity: float = 100,
+    ):
+        from utils.models import Position
+        pos = Position(
+            market_id="prox-test",
+            token_id="prox-token",
+            side=side,
+            entry_price=entry_price,
+            size_usd=entry_price * quantity,
+            quantity=quantity,
+            estimated_prob=estimated_prob,
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=20),
+            current_price=current_price,
+            slug="prox-test",
+        )
+        pos.peak_price = peak_price
+        return pos
+
+    def test_compute_exit_proximity_returns_all_five_keys(self):
+        """compute_exit_proximity() must return exactly the 5 approved field names."""
+        from bot.trading_loop import compute_exit_proximity
+        from utils.config import TradingConfig
+
+        pos = self._make_position(entry_price=0.50, current_price=0.45, peak_price=0.0)
+        result = compute_exit_proximity(pos, 0.45, 0.65, TradingConfig())
+
+        expected_keys = {
+            "stop_loss_distance_pct",
+            "take_profit_edge_distance",
+            "aggressive_exit_distance_pct",
+            "trailing_stop_distance_pct",
+            "let_it_ride_distance_pct",
+        }
+        assert set(result.keys()) == expected_keys, (
+            f"Expected keys {expected_keys}, got {set(result.keys())}"
+        )
+
+    def test_stop_loss_distance_negative_when_not_fired(self):
+        """stop_loss_distance_pct must be negative when loss < stop_loss_threshold.
+
+        Position: buy at 0.50, close at 0.43.
+        loss_pct = (0.50 - 0.43) / 0.50 = 0.14
+        stop_loss_threshold = 0.25
+        distance = 0.14 - 0.25 = -0.11  (11% away from triggering)
+        """
+        from bot.trading_loop import compute_exit_proximity
+        from utils.config import TradingConfig
+
+        pos = self._make_position(entry_price=0.50, current_price=0.43)
+        result = compute_exit_proximity(pos, 0.43, 0.65, TradingConfig())
+
+        assert result["stop_loss_distance_pct"] == pytest.approx(-0.11, abs=1e-5), (
+            f"Expected -0.11, got {result['stop_loss_distance_pct']}"
+        )
+
+    def test_stop_loss_distance_positive_when_fired(self):
+        """stop_loss_distance_pct must be positive when loss > stop_loss_threshold.
+
+        Position: buy at 0.50, close at 0.35.
+        loss_pct = 0.30, stop_loss_threshold = 0.25 → distance = +0.05
+        """
+        from bot.trading_loop import compute_exit_proximity
+        from utils.config import TradingConfig
+
+        pos = self._make_position(entry_price=0.50, current_price=0.35)
+        result = compute_exit_proximity(pos, 0.35, 0.65, TradingConfig())
+
+        assert result["stop_loss_distance_pct"] == pytest.approx(0.05, abs=1e-5), (
+            f"Expected +0.05, got {result['stop_loss_distance_pct']}"
+        )
+
+    def test_take_profit_edge_distance_negative_when_edge_wide(self):
+        """take_profit_edge_distance must be negative when edge hasn't converged.
+
+        estimated_prob=0.65, current_price=0.45 → edge_remaining=0.20
+        take_profit_threshold=0.05 → distance = 0.05 - 0.20 = -0.15
+        """
+        from bot.trading_loop import compute_exit_proximity
+        from utils.config import TradingConfig
+
+        pos = self._make_position(entry_price=0.50, current_price=0.45, estimated_prob=0.65)
+        result = compute_exit_proximity(pos, 0.45, 0.65, TradingConfig())
+
+        assert result["take_profit_edge_distance"] == pytest.approx(-0.15, abs=1e-5), (
+            f"Expected -0.15, got {result['take_profit_edge_distance']}"
+        )
+
+    def test_take_profit_edge_distance_positive_when_edge_converged(self):
+        """take_profit_edge_distance must be positive when edge has converged.
+
+        estimated_prob=0.65, current_price=0.62 → edge_remaining=0.03
+        take_profit_threshold=0.05 → distance = 0.05 - 0.03 = +0.02
+        """
+        from bot.trading_loop import compute_exit_proximity
+        from utils.config import TradingConfig
+
+        pos = self._make_position(entry_price=0.50, current_price=0.62, estimated_prob=0.65)
+        result = compute_exit_proximity(pos, 0.62, 0.65, TradingConfig())
+
+        assert result["take_profit_edge_distance"] == pytest.approx(0.02, abs=1e-5), (
+            f"Expected +0.02, got {result['take_profit_edge_distance']}"
+        )
+
+    def test_trailing_stop_none_when_peak_not_activated(self):
+        """trailing_stop_distance_pct must be None when peak_price=0 (never moved)."""
+        from bot.trading_loop import compute_exit_proximity
+        from utils.config import TradingConfig
+
+        pos = self._make_position(entry_price=0.50, current_price=0.45, peak_price=0.0)
+        result = compute_exit_proximity(pos, 0.45, 0.65, TradingConfig())
+
+        assert result["trailing_stop_distance_pct"] is None, (
+            f"Expected None (trailing stop unarmed), got {result['trailing_stop_distance_pct']}"
+        )
+
+    def test_trailing_stop_none_when_peak_gain_below_activation(self):
+        """trailing_stop_distance_pct must be None when peak_gain < 0.15 activation.
+
+        entry=0.50, peak=0.55 → peak_gain=(0.55-0.50)/0.50=0.10 < 0.15 → not armed.
+        """
+        from bot.trading_loop import compute_exit_proximity
+        from utils.config import TradingConfig
+
+        pos = self._make_position(entry_price=0.50, current_price=0.48, peak_price=0.55)
+        result = compute_exit_proximity(pos, 0.48, 0.65, TradingConfig())
+
+        assert result["trailing_stop_distance_pct"] is None, (
+            f"Expected None (peak_gain=0.10 < activation 0.15), "
+            f"got {result['trailing_stop_distance_pct']}"
+        )
+
+    def test_trailing_stop_positive_when_drop_exceeds_trigger(self):
+        """trailing_stop_distance_pct must be positive when the drop exceeded 10%.
+
+        entry=0.50, peak=0.60 → peak_gain=0.20 ≥ 0.15 (armed).
+        current=0.45 → drop=(0.60-0.45)/0.50=0.30
+        distance = 0.30 - 0.10 = +0.20
+        """
+        from bot.trading_loop import compute_exit_proximity
+        from utils.config import TradingConfig
+
+        pos = self._make_position(entry_price=0.50, current_price=0.45, peak_price=0.60)
+        result = compute_exit_proximity(pos, 0.45, 0.65, TradingConfig())
+
+        assert result["trailing_stop_distance_pct"] == pytest.approx(0.20, abs=1e-5), (
+            f"Expected +0.20, got {result['trailing_stop_distance_pct']}"
+        )
+
+    def test_let_it_ride_distance_negative_when_below_threshold(self):
+        """let_it_ride_distance_pct must be negative when price < 0.70.
+
+        buy, current_price=0.55 → favorable_price=0.55
+        distance = 0.55 - 0.70 = -0.15
+        """
+        from bot.trading_loop import compute_exit_proximity
+        from utils.config import TradingConfig
+
+        pos = self._make_position(entry_price=0.50, current_price=0.55)
+        result = compute_exit_proximity(pos, 0.55, 0.65, TradingConfig())
+
+        assert result["let_it_ride_distance_pct"] == pytest.approx(-0.15, abs=1e-5), (
+            f"Expected -0.15, got {result['let_it_ride_distance_pct']}"
+        )
+
+    def test_let_it_ride_distance_sell_side_uses_complement(self):
+        """For a SELL position, favorable_price = 1 - current_price.
+
+        sell, current_price=0.20 → favorable_price=0.80
+        distance = 0.80 - 0.70 = +0.10
+        """
+        from bot.trading_loop import compute_exit_proximity
+        from utils.config import TradingConfig
+
+        pos = self._make_position(entry_price=0.50, current_price=0.20, side="sell")
+        result = compute_exit_proximity(pos, 0.20, 0.30, TradingConfig())
+
+        assert result["let_it_ride_distance_pct"] == pytest.approx(0.10, abs=1e-5), (
+            f"Expected +0.10 for sell at 0.20, got {result['let_it_ride_distance_pct']}"
+        )
+
+    def test_zero_entry_price_returns_safe_defaults(self):
+        """A position with entry_price=0 must not raise — returns zeros/None."""
+        from bot.trading_loop import compute_exit_proximity
+        from utils.config import TradingConfig
+
+        pos = self._make_position(entry_price=0.0, current_price=0.40)
+        result = compute_exit_proximity(pos, 0.40, 0.65, TradingConfig())
+
+        assert result["stop_loss_distance_pct"] == 0.0
+        assert result["trailing_stop_distance_pct"] is None
+
+
+class TestExitProximityRecordedInDB:
+    """Test that exit_proximity is serialized and passed to insert_exit_log."""
+
+    def test_exit_proximity_json_passed_to_insert_exit_log(self):
+        """When close_position() receives exit_proximity, insert_exit_log must be
+        called with that dict serialized to a JSON string in exit_proximity_json."""
+        from bot.portfolio import Portfolio
+
+        portfolio = Portfolio(paper_mode=True, initial_bankroll=1000)
+        signal = TradeSignal(
+            market_id="prox-db-test",
+            token_id="prox-db-token",
+            side="buy",
+            estimated_prob=0.65,
+            market_price=0.50,
+            edge=0.15,
+            position_size_usd=50,
+            slug="prox-db-test",
+        )
+        trade = Trade(
+            market_id="prox-db-test",
+            token_id="prox-db-token",
+            side="buy",
+            price=0.50,
+            quantity=100,
+            size_usd=50,
+            timestamp=datetime.now(timezone.utc) - timedelta(minutes=20),
+        )
+        pos = portfolio.open_position(signal, trade)
+
+        proximity = {
+            "stop_loss_distance_pct": -0.11,
+            "take_profit_edge_distance": -0.15,
+            "aggressive_exit_distance_pct": -0.18,
+            "trailing_stop_distance_pct": None,
+            "let_it_ride_distance_pct": -0.30,
+        }
+
+        import json
+        with patch("bot.trade_db.insert_exit_log") as mock_insert, \
+             patch("bot.trade_db.insert_trade"), \
+             patch("bot.edge_log.update_edge_log_outcome"):
+            portfolio.close_position(
+                pos, current_price=0.43, reason="stop_loss",
+                exit_proximity=proximity,
+            )
+
+        mock_insert.assert_called_once()
+        kw = mock_insert.call_args[1]
+
+        assert "exit_proximity_json" in kw, (
+            "insert_exit_log must receive exit_proximity_json kwarg"
+        )
+        decoded = json.loads(kw["exit_proximity_json"])
+        assert decoded["stop_loss_distance_pct"] == pytest.approx(-0.11)
+        # JSON null → Python None
+        assert decoded["trailing_stop_distance_pct"] is None
+
+    def test_exit_proximity_defaults_to_empty_json_when_not_provided(self):
+        """When exit_proximity is not passed, exit_proximity_json must be '{}'."""
+        from bot.portfolio import Portfolio
+
+        portfolio = Portfolio(paper_mode=True, initial_bankroll=1000)
+        signal = TradeSignal(
+            market_id="prox-default-test",
+            token_id="prox-default-token",
+            side="buy",
+            estimated_prob=0.65,
+            market_price=0.50,
+            edge=0.15,
+            position_size_usd=50,
+            slug="prox-default-test",
+        )
+        trade = Trade(
+            market_id="prox-default-test",
+            token_id="prox-default-token",
+            side="buy",
+            price=0.50,
+            quantity=100,
+            size_usd=50,
+            timestamp=datetime.now(timezone.utc) - timedelta(minutes=20),
+        )
+        pos = portfolio.open_position(signal, trade)
+
+        with patch("bot.trade_db.insert_exit_log") as mock_insert, \
+             patch("bot.trade_db.insert_trade"), \
+             patch("bot.edge_log.update_edge_log_outcome"):
+            # Do NOT pass exit_proximity — default path
+            portfolio.close_position(pos, current_price=0.55, reason="take_profit")
+
+        kw = mock_insert.call_args[1]
+        assert kw["exit_proximity_json"] == "{}", (
+            f"Default exit_proximity_json should be '{{}}', "
+            f"got {kw['exit_proximity_json']!r}"
+        )
+
+
+class TestAnalyzeExitsStopLossTightness:
+    """Verify q_stop_loss_tightness_diagnostic runs without error and produces
+    correct structured output."""
+
+    def test_function_exists_and_is_importable(self):
+        """q_stop_loss_tightness_diagnostic must be importable from analyze_exits."""
+        from scripts.analyze_exits import q_stop_loss_tightness_diagnostic
+        assert callable(q_stop_loss_tightness_diagnostic)
+
+    def _make_exit_log_db(self):
+        """Return an in-memory SQLite connection with the exit_log schema."""
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(":memory:")
+        conn.row_factory = _sqlite3.Row
+        conn.executescript("""
+            CREATE TABLE exit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug TEXT NOT NULL DEFAULT '',
+                market_id TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT 'buy',
+                entry_time TEXT NOT NULL DEFAULT '',
+                close_time TEXT NOT NULL DEFAULT '',
+                hold_seconds REAL DEFAULT 0,
+                entry_price REAL NOT NULL DEFAULT 0,
+                close_price REAL NOT NULL DEFAULT 0,
+                size_usd REAL NOT NULL DEFAULT 0,
+                quantity REAL NOT NULL DEFAULT 0,
+                realized_pnl REAL NOT NULL DEFAULT 0,
+                close_reason TEXT NOT NULL DEFAULT '',
+                entry_estimated_prob REAL NOT NULL DEFAULT 0,
+                max_favorable_pnl_usd REAL DEFAULT 0,
+                max_adverse_pnl_usd REAL DEFAULT 0,
+                peak_unrealized_pct REAL DEFAULT 0,
+                let_it_ride_triggered INTEGER DEFAULT 0,
+                num_let_it_ride_triggers INTEGER DEFAULT 0,
+                exit_threshold_distance REAL DEFAULT 0,
+                metadata_json TEXT DEFAULT '{}',
+                exit_proximity_json TEXT DEFAULT '{}'
+            );
+        """)
+        conn.commit()
+        return conn
+
+    def test_no_data_path_does_not_crash(self, capsys):
+        """Running the diagnostic on an empty exit_log must complete without raising."""
+        from scripts.analyze_exits import q_stop_loss_tightness_diagnostic
+
+        conn = self._make_exit_log_db()
+        since_iso = (
+            datetime.now(timezone.utc) - timedelta(days=30)
+        ).isoformat()
+
+        q_stop_loss_tightness_diagnostic(conn, since_iso)
+        conn.close()
+
+        captured = capsys.readouterr()
+        assert "Traceback" not in captured.out
+        assert "Error" not in captured.out
+
+    def test_with_stop_loss_proximity_data_prints_tightness_info(self, capsys):
+        """A stop_loss row with exit_proximity_json where take_profit_edge_distance
+        > -0.02 must trigger the ⚠ flag in the output."""
+        import json as _json
+        from scripts.analyze_exits import q_stop_loss_tightness_diagnostic
+
+        conn = self._make_exit_log_db()
+
+        # take_profit_edge_distance = +0.01 → edge already converged (within 2%) → ⚠
+        proximity = _json.dumps({
+            "stop_loss_distance_pct": 0.05,
+            "take_profit_edge_distance": 0.01,
+            "aggressive_exit_distance_pct": -0.20,
+            "trailing_stop_distance_pct": None,
+            "let_it_ride_distance_pct": -0.30,
+        })
+        close_ts = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """INSERT INTO exit_log
+               (slug, market_id, side, entry_time, close_time, entry_price,
+                close_price, size_usd, quantity, realized_pnl, close_reason,
+                entry_estimated_prob, exit_proximity_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("test-sl-slug", "test-mid", "buy", close_ts, close_ts,
+             0.50, 0.37, 50, 100, -13.0, "stop_loss", 0.65, proximity),
+        )
+        conn.commit()
+
+        since_iso = (
+            datetime.now(timezone.utc) - timedelta(days=1)
+        ).isoformat()
+
+        q_stop_loss_tightness_diagnostic(conn, since_iso)
+        conn.close()
+
+        captured = capsys.readouterr()
+        assert "test-sl-slug" in captured.out, (
+            "slug must appear in the diagnostic output"
+        )
+        assert "⚠" in captured.out, (
+            "⚠ warning must appear when take_profit edge was within 2%"
+        )
