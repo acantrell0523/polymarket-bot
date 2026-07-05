@@ -79,6 +79,15 @@ class TradeSignal:
     timestamp: Optional[datetime] = None
     slug: str = ""
 
+    # Cost-aware edge accounting (filled in by the trading loop / backtest
+    # engine from bot.strategies.edge.compute_edge_breakdown before sizing).
+    # net_edge = edge at the executable price after taker fees; this is the
+    # number the trade filter gates on and Kelly sizing is driven by.
+    net_edge: float = 0.0
+    exec_price: float = 0.0   # 0.0 = not computed; fall back to market_price
+    spread: float = 0.0       # best_ask - best_bid at signal time
+    fee_rate: float = 0.0
+
 
 @dataclass
 class Position:

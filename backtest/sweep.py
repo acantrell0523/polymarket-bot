@@ -135,6 +135,7 @@ def run_sweep(
     config: BotConfig,
     market_data: List[List[MarketSnapshot]],
     max_workers: int = 4,
+    odds_cache=None,
 ) -> List[Dict[str, Any]]:
     """
     Run parameter sweep across all combinations.
@@ -158,7 +159,7 @@ def run_sweep(
         sweep_config.trading.fixed_fraction = params["fixed_fraction"]
         sweep_config.trading.stop_loss_threshold = params["stop_loss"]
 
-        engine = BacktestEngine(sweep_config)
+        engine = BacktestEngine(sweep_config, odds_cache=odds_cache)
         result = engine.run(market_data)
 
         entry = {

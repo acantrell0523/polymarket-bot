@@ -11,15 +11,22 @@ from utils.config import BotConfig, BacktestConfig, TradingConfig, SignalConfig
 from bot.signals.estimator import ProbabilityEstimator
 from bot.strategies.sizing import PositionSizer
 from bot.strategies.risk import RiskManager
+from bot.strategies.edge import compute_edge_breakdown
 from backtest.portfolio import BacktestPortfolio
 
 
 class BacktestEngine:
-    """Replays historical market data through the trading pipeline."""
+    """Replays historical market data through the trading pipeline.
 
-    def __init__(self, config: BotConfig):
+    Pass a HistoricalOddsCache as odds_cache to give the external validation
+    gate something to validate against — without it, sports markets are
+    blocked exactly as they would be live without odds data (0 trades).
+    """
+
+    def __init__(self, config: BotConfig, odds_cache=None):
         self.config = config
-        self.estimator = ProbabilityEstimator(config.signals)
+        self.odds_cache = odds_cache
+        self.estimator = ProbabilityEstimator(config.signals, odds_cache=odds_cache)
         self.sizer = PositionSizer(config.trading)
         self.risk = RiskManager(config.trading)
 
@@ -76,6 +83,11 @@ class BacktestEngine:
         for snapshot in all_snapshots:
             latest_by_market[snapshot.market_id] = snapshot
 
+            # Advance the odds cache's replay clock so consensus lookups can
+            # never see data from the future (no lookahead bias).
+            if self.odds_cache is not None and hasattr(self.odds_cache, "set_time"):
+                self.odds_cache.set_time(snapshot.timestamp)
+
             # Skip if insufficient history
             if len(snapshot.price_history) < 10:
                 continue
@@ -114,6 +126,21 @@ class BacktestEngine:
 
             # Risk checks — use open positions only so closed ones don't inflate the count
             if not self.risk.can_open_position(portfolio.get_open_positions()):
+                continue
+
+            # Cost-aware edge (same math as the live loop): executable price
+            # plus taker fee, so Kelly sizing sees net numbers here too.
+            breakdown = compute_edge_breakdown(
+                trade_signal.estimated_prob, snapshot, trade_signal.side,
+                fee_rate=self.config.backtest.taker_fee_bps / 10000,
+            )
+            trade_signal.net_edge = breakdown.net_edge
+            trade_signal.exec_price = breakdown.exec_price
+            trade_signal.spread = breakdown.spread
+            trade_signal.fee_rate = breakdown.fee_rate
+
+            # Net-edge gate (mirrors trade_filter check #9)
+            if trade_signal.net_edge < self.config.trading.min_net_edge:
                 continue
 
             # Position sizing

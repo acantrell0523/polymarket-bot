@@ -30,6 +30,7 @@ from bot.edge_log import (
 
 
 KILL_SWITCH_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "kill_switch")
+DATA_DIR = os.path.dirname(KILL_SWITCH_PATH)
 
 
 class Supervisor:
@@ -357,6 +358,45 @@ class Supervisor:
                 )
 
     # ------------------------------------------------------------------
+    # Trading-loop liveness (heartbeat written by TradingBot every cycle)
+    # ------------------------------------------------------------------
+
+    def check_heartbeat(self):
+        """Alert when the trading loop's heartbeat goes stale.
+
+        The loop writes data/heartbeat.json every scan cycle. If it stops
+        (crash, hang, OOM), only the supervisor can notice — the loop itself
+        obviously can't report its own death. Alerts once per stale episode,
+        and only if a heartbeat has ever been written (so a supervisor running
+        without the bot doesn't spam).
+        """
+        from bot.health import HealthMonitor, STALE_HEARTBEAT_SECONDS
+
+        hb = HealthMonitor.read_heartbeat(DATA_DIR)
+        if hb is None:
+            return  # bot never started here — nothing to monitor
+
+        age = HealthMonitor.heartbeat_age_seconds(DATA_DIR)
+        stale = age is not None and age > STALE_HEARTBEAT_SECONDS
+
+        if stale and not getattr(self, "_heartbeat_alerted", False):
+            self._heartbeat_alerted = True
+            self.logger.error("trading_loop_heartbeat_stale", {
+                "age_seconds": round(age, 0),
+                "last_status": hb,
+            })
+            self.alerter._post(COLOR_RED,
+                f":skull: *Trading loop heartbeat stale* — last beat "
+                f"`{age/60:.0f}` minutes ago (cycle `{hb.get('cycle', '?')}`, "
+                f"mode `{hb.get('mode', '?')}`).\n"
+                f"The bot process is likely dead or hung — check the host."
+            )
+        elif not stale and getattr(self, "_heartbeat_alerted", False):
+            self._heartbeat_alerted = False
+            self.alerter._post(COLOR_GREEN,
+                ":heartbeat: Trading loop heartbeat recovered.")
+
+    # ------------------------------------------------------------------
     # Daily review (report only)
     # ------------------------------------------------------------------
 
@@ -557,6 +597,14 @@ class Supervisor:
             minutes=15,
             id="kill_switch_check",
             name="Kill Switch Check",
+        )
+
+        scheduler.add_job(
+            self.check_heartbeat,
+            "interval",
+            minutes=5,
+            id="heartbeat_check",
+            name="Trading Loop Heartbeat Check",
         )
 
         def shutdown(sig, frame):

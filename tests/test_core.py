@@ -2189,3 +2189,491 @@ class TestSupervisorExitInsights:
         assert "reasonable" in result, (
             f"Expected 'reasonable' in clean-path oneliner, got: {result!r}"
         )
+
+
+# ============================================================================
+# Net-edge accounting (bot/strategies/edge.py)
+# ============================================================================
+
+from bot.strategies.edge import (
+    compute_edge_breakdown, executable_price, book_spread,
+)
+
+
+class TestEdgeBreakdown:
+    def _snapshot(self, price=0.50, bids=None, asks=None):
+        ob = OrderBook(
+            bids=[OrderBookLevel(price=p, size=s) for p, s in (bids or [(0.48, 500)])],
+            asks=[OrderBookLevel(price=p, size=s) for p, s in (asks or [(0.52, 500)])],
+        )
+        return MarketSnapshot(
+            market_id="m", token_id="t", question="q", price=price,
+            volume_24h=1000, liquidity=1000, order_book=ob,
+            price_history=[price], timestamp=datetime.now(timezone.utc),
+            slug="aec-nba-aaa-bbb-2026-01-01",
+        )
+
+    def test_buy_uses_ask_price(self):
+        snap = self._snapshot()
+        assert executable_price(snap, "buy") == pytest.approx(0.52)
+
+    def test_sell_uses_bid_price(self):
+        snap = self._snapshot()
+        assert executable_price(snap, "sell") == pytest.approx(0.48)
+
+    def test_empty_book_falls_back_to_snapshot_price(self):
+        snap = self._snapshot()
+        snap.order_book = OrderBook()
+        assert executable_price(snap, "buy") == pytest.approx(0.50)
+        assert book_spread(snap) == 0.0
+
+    def test_spread(self):
+        snap = self._snapshot()
+        assert book_spread(snap) == pytest.approx(0.04)
+
+    def test_buy_net_edge_charges_spread_and_fee(self):
+        # p=0.60, mid=0.50 -> gross edge 0.10
+        # exec at ask 0.52, fee 2%: net = 0.60 - 0.52*1.02 = 0.0696
+        snap = self._snapshot()
+        bd = compute_edge_breakdown(0.60, snap, "buy", fee_rate=0.02)
+        assert bd.gross_edge == pytest.approx(0.10)
+        assert bd.exec_price == pytest.approx(0.52)
+        assert bd.net_edge == pytest.approx(0.60 - 0.52 * 1.02)
+        assert bd.net_edge < bd.gross_edge
+
+    def test_sell_net_edge(self):
+        # p=0.40, sell at bid 0.48, fee 2%: net = 0.48*0.98 - 0.40 = 0.0704
+        snap = self._snapshot()
+        bd = compute_edge_breakdown(0.40, snap, "sell", fee_rate=0.02)
+        assert bd.net_edge == pytest.approx(0.48 * 0.98 - 0.40)
+
+    def test_marginal_gross_edge_goes_negative_net(self):
+        # 3% gross edge on a 4-cent-wide book with 2% fee is NOT tradeable
+        snap = self._snapshot()
+        bd = compute_edge_breakdown(0.53, snap, "buy", fee_rate=0.02)
+        assert bd.gross_edge == pytest.approx(0.03)
+        assert bd.net_edge < 0
+
+
+# ============================================================================
+# Bayesian log-odds pooling
+# ============================================================================
+
+class TestLogOddsPooling:
+    def _estimator(self):
+        cfg = SignalConfig()
+        cfg.combination_method = "logodds"
+        return ProbabilityEstimator(cfg)
+
+    def test_no_evidence_returns_market_price(self):
+        """With zero-confidence signals the posterior must equal the prior
+        (the market price) — no manufactured edge."""
+        est = self._estimator()
+        signals = [Signal(name="odds_value", value=0.9, confidence=0.0)]
+        prob, conf = est.estimate_probability_logodds(
+            signals, {"odds_value": 0.4}, market_price=0.30
+        )
+        assert prob == pytest.approx(0.30)
+        assert conf == 0.0
+
+    def test_full_confidence_moves_toward_signal(self):
+        est = self._estimator()
+        signals = [Signal(name="odds_value", value=0.60, confidence=1.0)]
+        prob, _ = est.estimate_probability_logodds(
+            signals, {"odds_value": 1.0}, market_price=0.40
+        )
+        # Single signal with full normalized weight -> posterior == signal view
+        assert prob == pytest.approx(0.60, abs=0.01)
+
+    def test_low_confidence_barely_moves_estimate(self):
+        est = self._estimator()
+        signals = [Signal(name="odds_value", value=0.90, confidence=0.05)]
+        prob, _ = est.estimate_probability_logodds(
+            signals, {"odds_value": 0.4, "line_movement": 0.6}, market_price=0.40
+        )
+        assert abs(prob - 0.40) < 0.05
+
+    def test_posterior_bounded(self):
+        est = self._estimator()
+        signals = [Signal(name="odds_value", value=0.99, confidence=1.0)]
+        prob, _ = est.estimate_probability_logodds(
+            signals, {"odds_value": 1.0}, market_price=0.99
+        )
+        assert 0.01 <= prob <= 0.99
+
+    def test_detect_edge_uses_configured_method(self):
+        """combination_method='linear' must route through the legacy pool."""
+        cfg = SignalConfig()
+        cfg.combination_method = "linear"
+        est = ProbabilityEstimator(cfg)
+        signals = [Signal(name="odds_value", value=0.60, confidence=1.0)]
+        lin, _ = est._combine(signals, {"odds_value": 1.0}, market_price=0.40)
+        assert lin == pytest.approx(0.60)
+
+
+# ============================================================================
+# Fee-aware Kelly sizing
+# ============================================================================
+
+class TestFeeAwareKelly:
+    def test_fee_reduces_kelly_size(self):
+        cfg_free = TradingConfig(position_sizing_method="kelly", taker_fee_rate=0.0,
+                                 max_position_size_usd=10000, max_portfolio_exposure_usd=10000)
+        cfg_fee = TradingConfig(position_sizing_method="kelly", taker_fee_rate=0.05,
+                                max_position_size_usd=10000, max_portfolio_exposure_usd=10000)
+        signal = TradeSignal(
+            market_id="m", token_id="t", side="buy",
+            estimated_prob=0.60, market_price=0.50,
+            edge=0.10, position_size_usd=0,
+        )
+        size_free = PositionSizer(cfg_free).size_position(signal, 1000, 0)
+        size_fee = PositionSizer(cfg_fee).size_position(signal, 1000, 0)
+        assert size_fee < size_free
+
+    def test_kelly_uses_exec_price_when_set(self):
+        cfg = TradingConfig(position_sizing_method="kelly", taker_fee_rate=0.0,
+                            max_position_size_usd=10000, max_portfolio_exposure_usd=10000)
+        cheap = TradeSignal(market_id="m", token_id="t", side="buy",
+                            estimated_prob=0.60, market_price=0.50,
+                            edge=0.10, position_size_usd=0, exec_price=0.50)
+        expensive = TradeSignal(market_id="m", token_id="t", side="buy",
+                                estimated_prob=0.60, market_price=0.50,
+                                edge=0.10, position_size_usd=0, exec_price=0.58)
+        sizer = PositionSizer(cfg)
+        assert sizer.size_position(expensive, 1000, 0) < sizer.size_position(cheap, 1000, 0)
+
+    def test_negative_net_edge_sizes_zero(self):
+        """A trade whose costs exceed the edge must get zero Kelly size."""
+        cfg = TradingConfig(position_sizing_method="kelly", taker_fee_rate=0.10,
+                            max_position_size_usd=10000, max_portfolio_exposure_usd=10000)
+        signal = TradeSignal(market_id="m", token_id="t", side="buy",
+                             estimated_prob=0.52, market_price=0.50,
+                             edge=0.02, position_size_usd=0)
+        assert PositionSizer(cfg).size_position(signal, 1000, 0) == 0.0
+
+    def test_sell_side_kelly_positive_for_overpriced_market(self):
+        cfg = TradingConfig(position_sizing_method="kelly", taker_fee_rate=0.02,
+                            max_position_size_usd=10000, max_portfolio_exposure_usd=10000)
+        signal = TradeSignal(market_id="m", token_id="t", side="sell",
+                             estimated_prob=0.40, market_price=0.55,
+                             edge=-0.15, position_size_usd=0)
+        assert PositionSizer(cfg).size_position(signal, 1000, 0) > 0
+
+
+# ============================================================================
+# New trade filter checks: spread + net edge
+# ============================================================================
+
+class TestFilterSpreadAndNetEdge:
+    def _snapshot(self):
+        ob = OrderBook(
+            bids=[OrderBookLevel(price=0.48, size=800)],
+            asks=[OrderBookLevel(price=0.52, size=800)],
+        )
+        return MarketSnapshot(
+            market_id="m", token_id="t", question="q", price=0.50,
+            volume_24h=5000, liquidity=2000, order_book=ob,
+            price_history=[0.5], timestamp=datetime.now(timezone.utc),
+            slug="aec-nba-aaa-bbb-2026-01-01",
+        )
+
+    def _signal(self, **kw):
+        base = dict(market_id="m", token_id="t", side="buy",
+                    estimated_prob=0.62, market_price=0.50, edge=0.12,
+                    position_size_usd=0, slug="aec-nba-aaa-bbb-2026-01-01")
+        base.update(kw)
+        return TradeSignal(**base)
+
+    def _validate(self, signal, **kw):
+        return validate_trade(
+            signal=signal, snapshot=self._snapshot(), num_books=4,
+            open_game_ids=set(), game_id="g1", daily_trades=0,
+            max_daily_trades=5, **kw,
+        )
+
+    def test_wide_spread_rejected(self):
+        sig = self._signal(spread=0.15, exec_price=0.52, net_edge=0.08)
+        reason = self._validate(sig, max_spread=0.10)
+        assert reason is not None and "spread" in reason
+
+    def test_tight_spread_passes(self):
+        sig = self._signal(spread=0.04, exec_price=0.52, net_edge=0.08)
+        assert self._validate(sig, max_spread=0.10, min_net_edge=0.02) is None
+
+    def test_net_edge_below_min_rejected(self):
+        sig = self._signal(spread=0.04, exec_price=0.52, net_edge=0.01)
+        reason = self._validate(sig, min_net_edge=0.02)
+        assert reason is not None and "net_edge" in reason
+
+    def test_net_edge_check_skipped_when_not_computed(self):
+        """Direct callers that never computed exec_price keep old behavior."""
+        sig = self._signal()  # exec_price defaults to 0.0
+        assert self._validate(sig, min_net_edge=0.02) is None
+
+
+# ============================================================================
+# On-chain flow signal
+# ============================================================================
+
+from bot.signals.signals import onchain_flow_signal
+
+
+class _FakeOnchainClient:
+    def __init__(self, enrichment):
+        self._enrichment = enrichment
+
+    def get_enrichment_for_market(self, snapshot):
+        return self._enrichment
+
+
+class TestOnchainFlowSignal:
+    def _snapshot(self, price=0.50):
+        return MarketSnapshot(
+            market_id="m", token_id="t", question="q", price=price,
+            volume_24h=1000, liquidity=1000, order_book=OrderBook(),
+            price_history=[price], timestamp=datetime.now(timezone.utc),
+            slug="aec-nba-aaa-bbb-2026-01-01",
+        )
+
+    def test_no_client_is_noop(self, signal_config):
+        sig = onchain_flow_signal(self._snapshot(), signal_config, None)
+        assert sig.confidence == 0.0
+
+    def test_whale_buying_tilts_bullish(self, signal_config):
+        client = _FakeOnchainClient({
+            "market_detail": {"data": {"smart_money_sentiment": 0.8}},
+            "whale_data": {"data": [{"direction": "buy", "amount": 3000, "whale_count": 5}]},
+        })
+        sig = onchain_flow_signal(self._snapshot(0.50), signal_config, client)
+        assert sig.value > 0.50
+        assert 0 < sig.confidence <= 0.5
+        assert sig.direction == "bullish"
+
+    def test_no_activity_is_noop(self, signal_config):
+        client = _FakeOnchainClient({
+            "market_detail": {"data": {"smart_money_sentiment": 0.0}},
+            "whale_data": {"data": []},
+        })
+        sig = onchain_flow_signal(self._snapshot(), signal_config, client)
+        assert sig.confidence == 0.0
+
+    def test_client_exception_is_noop(self, signal_config):
+        class Exploder:
+            def get_enrichment_for_market(self, snapshot):
+                raise RuntimeError("api down")
+        sig = onchain_flow_signal(self._snapshot(), signal_config, Exploder())
+        assert sig.confidence == 0.0
+
+    def test_estimator_includes_onchain_signal_when_client_present(self, signal_config):
+        client = _FakeOnchainClient({
+            "market_detail": {"data": {"smart_money_sentiment": 0.5}},
+            "whale_data": {"data": [{"direction": "buy", "amount": 1000, "whale_count": 2}]},
+        })
+        est = ProbabilityEstimator(signal_config, onchain_client=client)
+        signals = est.compute_signals(self._snapshot(), "sports")
+        assert any(s.name == "onchain_flow" for s in signals)
+
+
+# ============================================================================
+# Env-var config overrides
+# ============================================================================
+
+from utils.config import _apply_env_overrides, _coerce_env_value
+
+
+class TestEnvOverrides:
+    def test_override_float_bool_int(self):
+        cfg = BotConfig()
+        _apply_env_overrides(cfg, {
+            "POLYBOT_TRADING__MIN_EDGE_THRESHOLD": "0.08",
+            "POLYBOT_TRADING__PAPER_TRADING": "false",
+            "POLYBOT_TRADING__MAX_OPEN_POSITIONS": "3",
+            "POLYBOT_ALERTS__ENABLED": "true",
+        })
+        assert cfg.trading.min_edge_threshold == pytest.approx(0.08)
+        assert cfg.trading.paper_trading is False
+        assert cfg.trading.max_open_positions == 3
+        assert cfg.alerts.enabled is True
+
+    def test_unknown_keys_ignored(self):
+        cfg = BotConfig()
+        before = cfg.trading.min_edge_threshold
+        _apply_env_overrides(cfg, {
+            "POLYBOT_NOPE__FIELD": "1",
+            "POLYBOT_TRADING__NOT_A_FIELD": "1",
+            "UNRELATED_VAR": "x",
+        })
+        assert cfg.trading.min_edge_threshold == before
+
+    def test_malformed_value_keeps_default(self):
+        cfg = BotConfig()
+        before = cfg.trading.min_edge_threshold
+        _apply_env_overrides(cfg, {"POLYBOT_TRADING__MIN_EDGE_THRESHOLD": "banana"})
+        assert cfg.trading.min_edge_threshold == before
+
+    def test_coerce_bool_variants(self):
+        assert _coerce_env_value("YES", True) is True
+        assert _coerce_env_value("0", True) is False
+
+
+# ============================================================================
+# Health monitor
+# ============================================================================
+
+from bot.health import HealthMonitor
+
+
+class TestHealthMonitor:
+    def test_beat_and_read(self, tmp_path):
+        hm = HealthMonitor(data_dir=str(tmp_path))
+        hm.beat({"cycle": 7, "mode": "PAPER"})
+        hb = HealthMonitor.read_heartbeat(str(tmp_path))
+        assert hb["cycle"] == 7
+        age = HealthMonitor.heartbeat_age_seconds(str(tmp_path))
+        assert age is not None and age < 5
+
+    def test_missing_heartbeat_is_stale(self, tmp_path):
+        assert HealthMonitor.is_heartbeat_stale(str(tmp_path)) is True
+
+    def test_fresh_heartbeat_not_stale(self, tmp_path):
+        HealthMonitor(data_dir=str(tmp_path)).beat()
+        assert HealthMonitor.is_heartbeat_stale(str(tmp_path)) is False
+
+    def test_backoff_kicks_in_after_threshold(self, tmp_path):
+        hm = HealthMonitor(data_dir=str(tmp_path), failure_threshold=3,
+                           base_backoff_seconds=10, max_backoff_seconds=100)
+        assert hm.record_failure("api") == 0.0
+        assert hm.record_failure("api") == 0.0
+        b3 = hm.record_failure("api")   # threshold reached
+        b4 = hm.record_failure("api")
+        b5 = hm.record_failure("api")
+        assert b3 == 10 and b4 == 20 and b5 == 40
+        assert hm.is_degraded("api")
+
+    def test_backoff_capped(self, tmp_path):
+        hm = HealthMonitor(data_dir=str(tmp_path), failure_threshold=1,
+                           base_backoff_seconds=10, max_backoff_seconds=50)
+        for _ in range(20):
+            backoff = hm.record_failure("api")
+        assert backoff == 50
+
+    def test_success_resets(self, tmp_path):
+        hm = HealthMonitor(data_dir=str(tmp_path), failure_threshold=2)
+        hm.record_failure("api")
+        hm.record_failure("api")
+        assert hm.is_degraded("api")
+        hm.record_success("api")
+        assert not hm.is_degraded("api")
+        assert hm.record_failure("api") == 0.0  # counter restarted
+
+
+# ============================================================================
+# Decision log
+# ============================================================================
+
+class TestDecisionLog:
+    def test_insert_and_read_roundtrip(self, tmp_path, monkeypatch):
+        import bot.trade_db as tdb
+        monkeypatch.setattr(tdb, "DB_PATH", str(tmp_path / "test.db"))
+        tdb.init_db()
+        tdb.insert_decision(
+            slug="aec-nba-aaa-bbb-2026-01-01",
+            decision="rejected",
+            reason="net_edge_1.0pct_below_2.0pct_min_after_costs",
+            market_type="sports",
+            side="buy",
+            polymarket_price=0.50,
+            exec_price=0.52,
+            estimated_prob=0.55,
+            gross_edge=0.05,
+            net_edge=0.01,
+            spread=0.04,
+            fee_rate=0.02,
+        )
+        tdb.insert_decision(slug="x", decision="executed", position_size_usd=25.0)
+
+        rows = tdb.get_recent_decisions()
+        assert len(rows) == 2
+        rejected = tdb.get_recent_decisions(decision="rejected")
+        assert len(rejected) == 1
+        r = rejected[0]
+        assert r["slug"] == "aec-nba-aaa-bbb-2026-01-01"
+        assert r["net_edge"] == pytest.approx(0.01)
+        assert "net_edge" in r["reason"]
+
+
+# ============================================================================
+# Historical odds cache + backtest integration
+# ============================================================================
+
+from backtest.historical_odds import HistoricalOddsCache
+from backtest.engine import BacktestEngine
+
+
+class TestHistoricalOddsCache:
+    def test_time_aware_lookup_no_lookahead(self):
+        cache = HistoricalOddsCache({
+            "slug-a": [(100.0, 0.40, 3), (200.0, 0.60, 4)],
+        })
+        cache.set_time(datetime.fromtimestamp(150, tz=timezone.utc))
+        prob, books = cache.get_probability_for_slug("slug-a")
+        assert prob == pytest.approx(0.40)   # the 0.60 point is in the future
+        assert books == 3
+
+        cache.set_time(datetime.fromtimestamp(250, tz=timezone.utc))
+        prob, _ = cache.get_probability_for_slug("slug-a")
+        assert prob == pytest.approx(0.60)
+
+    def test_before_first_point_returns_none(self):
+        cache = HistoricalOddsCache({"slug-a": [(100.0, 0.40, 3)]})
+        cache.set_time(datetime.fromtimestamp(50, tz=timezone.utc))
+        assert cache.get_probability_for_slug("slug-a") is None
+
+    def test_unknown_slug_returns_none(self):
+        cache = HistoricalOddsCache({})
+        assert cache.get_probability_for_slug("nope") is None
+        assert cache.get_consensus_odds("nope") is None
+
+    def test_is_historical_flag_set(self):
+        assert HistoricalOddsCache({}).is_historical is True
+
+    def test_from_db_missing_file_gives_empty_cache(self, tmp_path):
+        cache = HistoricalOddsCache.from_db(str(tmp_path / "absent.db"))
+        assert len(cache) == 0
+
+    def test_synthetic_consensus_covers_all_markets(self):
+        markets = generate_synthetic_markets(num_markets=3, num_snapshots=20, seed=7)
+        cache = HistoricalOddsCache.synthetic_from_market_data(markets, seed=7)
+        for m in markets:
+            slug = m[0].slug
+            cache.set_time(m[-1].timestamp)
+            result = cache.get_probability_for_slug(slug)
+            assert result is not None
+            prob, books = result
+            assert 0.02 <= prob <= 0.98
+            assert books >= 2
+
+    def test_synthetic_slugs_route_to_sports(self):
+        markets = generate_synthetic_markets(num_markets=1, num_snapshots=5, seed=1)
+        assert detect_market_type(markets[0][0]) == "sports"
+
+
+class TestBacktestWithHistoricalOdds:
+    def test_backtest_fires_trades_with_synthetic_consensus(self, config):
+        """The 0-trades gap: with a consensus source the external validation
+        gate opens and the full pipeline places trades."""
+        # Same scale + seed as backtest.runner's synthetic fallback, which is
+        # known to produce trades with the default config.
+        markets = generate_synthetic_markets(num_markets=20, num_snapshots=500, seed=42)
+        cache = HistoricalOddsCache.synthetic_from_market_data(markets, seed=42)
+        engine = BacktestEngine(config, odds_cache=cache)
+        result = engine.run(markets)
+        assert result.total_trades > 0
+
+    def test_backtest_zero_trades_without_odds_cache(self, config):
+        """Without external validation the gate still blocks everything —
+        the guardrail is intact."""
+        markets = generate_synthetic_markets(num_markets=5, num_snapshots=60, seed=42)
+        engine = BacktestEngine(config, odds_cache=None)
+        result = engine.run(markets)
+        assert result.total_trades == 0

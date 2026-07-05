@@ -82,12 +82,92 @@ def init_db():
             PRIMARY KEY (slug, signal_name)
         );
 
+        -- Every trading decision, including rejections. This is the audit
+        -- trail: for any timestamp you can reconstruct what the bot believed
+        -- (estimated_prob), what the market offered (price/exec_price/spread),
+        -- what the opportunity was worth after costs (net_edge), and why it
+        -- did or did not act (decision + reason).
+        CREATE TABLE IF NOT EXISTS decision_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            market_type TEXT DEFAULT '',
+            side TEXT DEFAULT '',
+            polymarket_price REAL DEFAULT 0,
+            exec_price REAL DEFAULT 0,
+            estimated_prob REAL DEFAULT 0,
+            gross_edge REAL DEFAULT 0,
+            net_edge REAL DEFAULT 0,
+            spread REAL DEFAULT 0,
+            fee_rate REAL DEFAULT 0,
+            position_size_usd REAL DEFAULT 0,
+            decision TEXT NOT NULL,       -- executed | rejected | skipped_sizing | execution_failed
+            reason TEXT DEFAULT '',
+            metadata_json TEXT DEFAULT '{}'
+        );
+
         CREATE INDEX IF NOT EXISTS idx_trades_close_time ON trades(close_time);
         CREATE INDEX IF NOT EXISTS idx_trades_slug ON trades(slug);
         CREATE INDEX IF NOT EXISTS idx_signal_log_slug ON signal_log(slug);
+        CREATE INDEX IF NOT EXISTS idx_decision_log_ts ON decision_log(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_decision_log_slug ON decision_log(slug);
+        CREATE INDEX IF NOT EXISTS idx_decision_log_decision ON decision_log(decision);
     """)
     conn.commit()
     conn.close()
+
+
+def insert_decision(
+    slug: str,
+    decision: str,
+    reason: str = "",
+    market_type: str = "",
+    side: str = "",
+    polymarket_price: float = 0.0,
+    exec_price: float = 0.0,
+    estimated_prob: float = 0.0,
+    gross_edge: float = 0.0,
+    net_edge: float = 0.0,
+    spread: float = 0.0,
+    fee_rate: float = 0.0,
+    position_size_usd: float = 0.0,
+    metadata_json: str = "{}",
+):
+    """Write one row of the decision audit trail.
+
+    Called by the trading loop for EVERY opportunity that reached the
+    validation stage — executed or not — so strategy performance can be
+    analyzed against the road not taken.
+    """
+    conn = _get_conn()
+    conn.execute(
+        """INSERT INTO decision_log
+           (timestamp, slug, market_type, side, polymarket_price, exec_price,
+            estimated_prob, gross_edge, net_edge, spread, fee_rate,
+            position_size_usd, decision, reason, metadata_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (datetime.now(timezone.utc).isoformat(), slug, market_type, side,
+         polymarket_price, exec_price, estimated_prob, gross_edge, net_edge,
+         spread, fee_rate, position_size_usd, decision, reason, metadata_json),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_recent_decisions(limit: int = 100, decision: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Fetch recent decision_log rows, optionally filtered by decision type."""
+    conn = _get_conn()
+    if decision:
+        rows = conn.execute(
+            "SELECT * FROM decision_log WHERE decision = ? ORDER BY timestamp DESC LIMIT ?",
+            (decision, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM decision_log ORDER BY timestamp DESC LIMIT ?", (limit,)
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 def insert_trade(

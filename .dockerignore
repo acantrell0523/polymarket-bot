@@ -1,0 +1,13 @@
+.git
+.gitignore
+venv
+__pycache__
+*.pyc
+.pytest_cache
+reports/
+data/trades.db*
+data/kill_switch
+data/pause_until
+data/heartbeat.json
+data/settled_slugs.txt
+.env

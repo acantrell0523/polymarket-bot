@@ -30,3 +30,4 @@ data/*.db-shm
 data/kill_switch
 data/pause_until
 data/settled_slugs.txt
+data/heartbeat.json

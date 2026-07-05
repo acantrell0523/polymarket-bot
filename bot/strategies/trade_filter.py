@@ -63,6 +63,14 @@ def validate_trade(
     daily_trades: int,
     max_daily_trades: int,
     game_time_remaining: Optional[float] = None,
+    # Config-driven thresholds. Defaults preserve the historical hardcoded
+    # behavior; the trading loop passes values from TradingConfig so all of
+    # these are tunable without code changes.
+    min_price: float = MIN_PRICE,
+    max_price: float = MAX_PRICE,
+    min_liquidity_usd: float = MIN_LIQUIDITY_USD,
+    max_spread: Optional[float] = None,
+    min_net_edge: Optional[float] = None,
 ) -> Optional[str]:
     """Validate a trade against ALL pre-trade checks.
 
@@ -80,16 +88,16 @@ def validate_trade(
     if effective_edge < min_edge:
         return f"edge_{effective_edge*100:.1f}pct_below_{league}_{min_edge*100:.0f}pct_min"
 
-    # 3. Price range check (15% to 85%)
+    # 3. Price range check (avoid extreme favorites/longshots)
     price = snapshot.price
-    if price < MIN_PRICE or price > MAX_PRICE:
-        return f"price_{price:.2f}_outside_15-85_range"
+    if price < min_price or price > max_price:
+        return f"price_{price:.2f}_outside_{min_price:.2f}-{max_price:.2f}_range"
 
     # 4. Liquidity check
     ob = snapshot.order_book
     total_depth = ob.bid_depth + ob.ask_depth if ob else 0
-    if total_depth < MIN_LIQUIDITY_USD:
-        return f"liquidity_{total_depth:.0f}_below_{MIN_LIQUIDITY_USD:.0f}_min"
+    if total_depth < min_liquidity_usd:
+        return f"liquidity_{total_depth:.0f}_below_{min_liquidity_usd:.0f}_min"
 
     # 5. Correlated game check
     if game_id in open_game_ids:
@@ -102,6 +110,20 @@ def validate_trade(
     # 7. Last 5 minutes block (buzzer beater risk)
     if game_time_remaining is not None and game_time_remaining < 300:
         return f"last_5_minutes_block_{game_time_remaining:.0f}s_remaining"
+
+    # 8. Spread check — a wide book can't be exited cleanly. The spread is set
+    # on the signal by compute_edge_breakdown; 0.0 means "book missing", which
+    # we let through (the liquidity check above already caught empty books).
+    if max_spread is not None and signal.spread > max_spread:
+        return f"spread_{signal.spread:.3f}_above_{max_spread:.3f}_max"
+
+    # 9. Net edge check — edge must survive fees + crossing the spread.
+    # signal.net_edge is set by compute_edge_breakdown (executable price with
+    # taker fee); if the caller never computed it, skip the check.
+    if min_net_edge is not None and signal.exec_price > 0:
+        if signal.net_edge < min_net_edge:
+            return (f"net_edge_{signal.net_edge*100:.1f}pct_below_"
+                    f"{min_net_edge*100:.1f}pct_min_after_costs")
 
     return None  # All checks passed
 

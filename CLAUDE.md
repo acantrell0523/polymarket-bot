@@ -4,9 +4,32 @@ This document is a comprehensive reference for AI assistants (and human develope
 
 ---
 
-## Today's Changes — 2026-05-04
+## Latest Changes — 2026-07-05 (production-hardening audit)
 
-Ten commits landed today. Start here before reading anything else.
+A full audit + upgrade pass landed. Key changes to know before reading the rest
+of this document (sections below have been updated in place):
+
+| Area | Change |
+|------|--------|
+| **Net-edge accounting** | New `bot/strategies/edge.py`. Edge is now computed at the EXECUTABLE price (best ask for buys / best bid for sells) net of the taker fee. `TradeSignal` carries `net_edge/exec_price/spread/fee_rate`; the trade filter gates on `trading.min_net_edge` (default 2%) and rejects books wider than `trading.max_spread`. |
+| **Bayesian pooling** | `ProbabilityEstimator` now defaults to log-odds pooling anchored on the market price as the prior (`signals.combination_method: logodds`). No signal evidence ⇒ estimate == market price ⇒ zero edge. Legacy linear pooling remains available (`linear`). |
+| **Fee-aware Kelly** | Default sizing is fractional Kelly (`position_sizing_method: kelly`, `kelly_fraction: 0.25`) computed on the executable price grossed up by the taker fee. Tiered flat-dollar sizing remains available. |
+| **On-chain signal wired** | `OnChainEnrichmentClient` is now instantiated in the trading loop (when `onchain.enabled`) and feeds a new supporting `onchain_flow` signal (weight 0.10, confidence capped at 0.5) in all market types. |
+| **Backtest 0-trades gap CLOSED** | New `backtest/historical_odds.py` — a time-aware, lookahead-free `HistoricalOddsCache` satisfies the external validation gate in replays. Synthetic backtests generate synthetic consensus and now exercise the full pipeline (gate → ranking → sizing → risk). SQLite-backed backtests read `historical_snapshots.espn_consensus_prob` (still 0 for CLOB-ingested data — gate stays closed there until consensus data is ingested). |
+| **Decision audit trail** | New `decision_log` table: EVERY opportunity that reaches validation is recorded (executed / rejected / skipped_sizing / execution_failed) with estimated_prob, prices, gross+net edge, spread, fee, size, and reason. |
+| **Health & degraded mode** | New `bot/health.py`. Trading loop writes `data/heartbeat.json` every cycle; supervisor alerts when it goes stale (5-min check). Repeated market-data failures trigger exponential backoff (max 5 min) with one Slack alert per outage. |
+| **Durable daily-loss halt** | Breaching `daily_loss_limit_usd` now writes `data/pause_until` (next UTC midnight) so the halt survives restarts, plus a Slack alert. |
+| **Position re-estimation** | On every full scan, open positions' `estimated_prob` is refreshed from current signals (`estimate_for_snapshot`), so take-profit tracks current beliefs, not entry-time ones. |
+| **Env-var config overrides** | Any scalar config value: `POLYBOT_<SECTION>__<FIELD>` (e.g. `POLYBOT_TRADING__PAPER_TRADING=false`). Applied after YAML. |
+| **Containerized** | `Dockerfile` + `docker-compose.yml` (bot + supervisor services, shared data volume, heartbeat-based healthcheck). |
+| **Cleanup** | Dead `bot/test_signals.py` deleted; dead subgraph URL removed from config; `apscheduler`/`python-dateutil` added to requirements (supervisor previously crashed on missing dep); expiry windows now config-driven (`filters.sports_window_hours` / `nonsports_window_days`); paper/live fee simulation reads `trading.taker_fee_rate`. |
+| **Tests** | 152 tests passing (was 107): net-edge math, log-odds pooling, fee-aware Kelly, spread/net-edge filters, onchain signal, env overrides, health monitor, decision log, historical odds cache, backtest-fires-trades integration. |
+
+---
+
+## Changes — 2026-05-04
+
+Ten commits landed that day; retained for history.
 
 | Commit | Summary |
 |--------|---------|
@@ -56,11 +79,11 @@ polymarket-bot/
 │   ├── trade_db.py             # SQLite trade history, signal log, exit_log
 │   ├── supervisor.py           # Read-only scheduled agent (reports, kill switch)
 │   ├── game_schedule.py        # ESPN schedule fetcher; drives scan sleep logic
-│   ├── test_signals.py         # Manual scratch/debug file, not a test suite
+│   ├── health.py               # Heartbeat + API failure tracking / degraded mode
 │   ├── signals/
-│   │   ├── signals.py          # 5 signal functions (OB imbalance, line movement,
+│   │   ├── signals.py          # 8 signal functions (OB imbalance, line movement,
 │   │   │                       #   odds value, liquidity imbalance, cross-market,
-│   │   │                       #   sports context, crypto model)
+│   │   │                       #   sports context, crypto model, onchain flow)
 │   │   ├── estimator.py        # ProbabilityEstimator: routes by market type,
 │   │   │                       #   external validation gate, config-driven weights
 │   │   ├── onchain.py          # OnChainEnrichmentClient (moved from repo root;
@@ -72,11 +95,13 @@ polymarket-bot/
 │   │   ├── sports_data.py      # ESPN game context (home advantage, fatigue)
 │   │   └── live_odds.py        # Live in-game NCAA edge tracker
 │   └── strategies/
-│       ├── sizing.py           # Kelly / tiered-Kelly / fixed-fractional sizing
+│       ├── edge.py             # Cost-aware net-edge accounting (fees + spread)
+│       ├── sizing.py           # Fee-aware Kelly / tiered-Kelly / fixed-fractional sizing
 │       ├── risk.py             # Stop-loss, trailing stop, take-profit, let-it-ride
 │       └── trade_filter.py     # Pre-trade validation checklist (validate_trade)
 ├── backtest/
 │   ├── engine.py               # Replay engine with slippage/fee simulation
+│   ├── historical_odds.py      # Time-aware HistoricalOddsCache (no lookahead)
 │   ├── portfolio.py            # BacktestPortfolio — pure in-memory, no SQLite side effects
 │   ├── sweep.py                # Parameter sensitivity sweep
 │   ├── reporting.py            # Matplotlib charts + JSON/CSV exports
@@ -96,7 +121,7 @@ polymarket-bot/
 │   ├── logger.py               # Structured JSON logger
 │   └── models.py               # Shared dataclasses (OrderBook, TradeSignal, Position…)
 ├── tests/
-│   └── test_core.py            # pytest suite — 100 tests, all passing
+│   └── test_core.py            # pytest suite — 152 tests, all passing
 ├── configs/config.yaml         # CANONICAL master configuration file (only config file)
 ├── .env.example                # Environment variable template
 ├── requirements.txt            # Python dependencies
@@ -245,26 +270,55 @@ Additional caps:
 
 ### Probability Combination Formula
 
+Selected by `signals.combination_method` (default `logodds`):
+
+**Log-odds Bayesian pooling (default)** — market price is the prior; each
+signal shifts the posterior in log-odds space proportional to its
+confidence-scaled weight:
+
+```
+posterior = logit(price) + sum_i k_i * (logit(v_i) - logit(price))
+k_i = (w_i * c_i) / sum_j(w_j)                    # sum(k_i) <= 1
+estimated_prob = sigmoid(posterior)               # clamped [0.01, 0.99]
+```
+
+Key property: with no signal evidence the estimate IS the market price (zero
+edge) — the math itself is humble, not just the gates.
+
+**Linear pooling (legacy, `combination_method: linear`)**:
+
 ```
 estimated_prob = sum(w_i * c_i * v_i) / sum(w_i * c_i)
 ```
-where `w_i` = weight, `c_i` = confidence, `v_i` = signal value. Clamped to [0.01, 0.99].
 
 ### Edge Calculation
 
 ```
-edge = estimated_prob - snapshot.price
+edge = estimated_prob - snapshot.price            # gross edge (vs mid/last)
 side = "buy" if edge > 0 else "sell"
 ```
-Trade fires if `min_edge ≤ |edge| ≤ max_edge`.
+Trade fires if `min_edge ≤ |edge| ≤ max_edge`, then must ALSO clear the
+cost-aware net-edge gate (`bot/strategies/edge.py`):
+
+```
+buy : net_edge = estimated_prob - best_ask * (1 + taker_fee)
+sell: net_edge = best_bid * (1 - taker_fee) - estimated_prob
+```
+requiring `net_edge ≥ trading.min_net_edge` (default 2%) and
+`spread ≤ trading.max_spread` (default 0.10).
 
 ---
 
 ## 4. Kelly / Position Sizing
 
-Implemented in `bot/strategies/sizing.py`. Three sizing methods:
+Implemented in `bot/strategies/sizing.py`. Three sizing methods. **The default
+is now fractional Kelly (`kelly`, `kelly_fraction: 0.25`)** — fee- and
+spread-aware, proportional to edge AND bankroll. It uses the executable price
+(`signal.exec_price`, set by `compute_edge_breakdown`) grossed up by the taker
+fee as the cost basis, so costs shrink the Kelly fraction exactly as they
+shrink the real edge. Zero net edge ⇒ zero size.
 
-### Tiered Kelly (`tiered_kelly`) — current default
+### Tiered Kelly (`tiered_kelly`) — legacy option
 
 Hard-coded tiers based on absolute edge (ignoring bankroll):
 
@@ -780,6 +834,14 @@ historical_markets
   ingest_time
   UNIQUE(slug)
 
+-- Decision audit trail — one row per opportunity that reached validation
+-- (decision: executed | rejected | skipped_sizing | execution_failed)
+decision_log
+  id, timestamp, slug, market_type, side,
+  polymarket_price, exec_price, estimated_prob,
+  gross_edge, net_edge, spread, fee_rate,
+  position_size_usd, decision, reason, metadata_json
+
 -- Historical price time-series (NEW today)
 historical_snapshots
   id, slug, timestamp,         -- timestamp is UTC day boundary (unix epoch)
@@ -799,10 +861,10 @@ historical_snapshots
 
 ### ✅ Working
 
-- **Test suite** — 100 tests passing in `tests/test_core.py`. Run `pytest tests/test_core.py`. Covers: order book, signals, market type detection, probability estimator, validate_trade, position sizing, risk manager, portfolio, data generation, backtest engine, config, exit telemetry, live-loop let_it_ride safety, historical DB schema + idempotency, DB loader, exit proximity computation, and the analyze_exits script.
+- **Test suite** — 152 tests passing in `tests/test_core.py`. Run `pytest tests/test_core.py`. Covers: order book, signals, market type detection, probability estimator, validate_trade, position sizing, risk manager, portfolio, data generation, backtest engine, config, exit telemetry, live-loop let_it_ride safety, historical DB schema + idempotency, DB loader, exit proximity computation, and the analyze_exits script.
 
   ```
-  ============================= 100 passed in 0.37s ==============================
+  ============================= 152 passed in 2.10s ==============================
   ```
 
 - **Live trading loop** — `TradingBot.run()` is the production path. Dual-speed scanning (3s live / 60s full), sniper trade selection, full validation checklist, position lifecycle.
@@ -835,19 +897,22 @@ historical_snapshots
 
 ### ❌ Current Gaps / Not Yet Working
 
-1. **Backtest fires 0 trades** — Not a bug; it's an architectural gap. The backtest runs `BacktestEngine` through the full signal pipeline, but `OddsCache` is empty (no live API calls in backtest mode). The external validation gate blocks all trades because `odds_value_signal` returns `confidence=0`. **Next required piece**: populate historical consensus probabilities into a `HistoricalOddsCache` (or similar) before replay, so the external validation gate can pass. This is the largest remaining piece for meaningful backtests.
+1. **Historical consensus data not yet ingested** — The backtest PIPELINE gap is closed (`HistoricalOddsCache` + engine/runner wiring, verified by tests), but the SQLite historical data still has `espn_consensus_prob = 0` for every CLOB-ingested row, so SQLite-backed backtests still block on the external validation gate (by design). **Next required piece**: extend `scripts/ingest_historical.py` to populate historical consensus probabilities (e.g. archived closing lines) into `historical_snapshots.espn_consensus_prob`. Synthetic backtests exercise the full pipeline in the meantime.
 
-2. **`onchain.py` not wired into live pipeline** — `OnChainEnrichmentClient` in `bot/signals/onchain.py` provides free whale/smart-money/sentiment data from Polymarket CLOB and Gamma APIs. It was moved from the repo root today but is still not imported or called anywhere in the live signal pipeline. Integration steps are documented in the file's header comment. Config keys (`onchain.enabled`, `onchain.cache_ttl_seconds`, etc.) are present in `configs/config.yaml` awaiting wiring.
+2. **No game-level NBA Polymarket markets for 2026 playoffs** — Polymarket is only listing season-long outrights (Finals winner, MVP, Conference champion) for the current playoff window, not individual game moneylines. The `aec-nba-*` pattern in `scripts/ingest_historical.py` Phase 1 finds 0 matches for 2026 dates. Backtest data for individual game markets requires going back to 2024–25 regular season dates.
 
-3. **No game-level NBA Polymarket markets for 2026 playoffs** — Polymarket is only listing season-long outrights (Finals winner, MVP, Conference champion) for the current playoff window, not individual game moneylines. The `aec-nba-*` pattern in `scripts/ingest_historical.py` Phase 1 finds 0 matches for 2026 dates. Backtest data for individual game markets requires going back to 2024–25 regular season dates.
+3. **`THE_ODDS_API_KEY` is effectively required for live trading** — Without it, `OddsCache` falls back to ESPN only (1 book). The `validate_trade()` checklist requires ≥2 books, so all sports trades will be rejected. The bot will run but won't place any trades in live mode without this key.
 
-4. **The Graph hosted subgraph is dead** — `configs/config.yaml` still lists `api.subgraph_url: https://api.thegraph.com/subgraphs/name/polymarket/polymarket-matic`. This endpoint no longer works (The Graph deprecated free hosted subgraph endpoints). Any code path that tried to use it for on-chain trade history would fail. The free `CLOB /trades` endpoint is the viable replacement (already implemented in `OnChainEnrichmentClient`), but this rules out deep historical trade-level data without a paid Graph API key.
+4. **`polymarket-us` SDK availability** — Not on all package indexes; the Dockerfile tolerates a failed install (paper mode works without it). Live deployments must confirm the SDK installed.
 
-5. **`THE_ODDS_API_KEY` is effectively required for live trading** — Without it, `OddsCache` falls back to ESPN only (1 book). The `validate_trade()` checklist requires ≥2 books, so all sports trades will be rejected. The bot will run but won't place any trades in live mode without this key.
+### ✅ Gaps Closed on 2026-07-05
 
-6. **`max_hours_to_expiry: 48` filter** — Set in config but the actual filtering in `market_data.py` uses different windows per category (sports: 24h, non-sports: 14 days), effectively ignoring this config value for non-sports markets.
-
-7. **`bot/test_signals.py`** — File exists at root of `bot/`. Appears to be a manual scratch/debug script, not a test suite. Not harmful but not useful.
+- **Backtest fires 0 trades** → pipeline gap closed via `backtest/historical_odds.py` (time-aware `HistoricalOddsCache`, no lookahead; synthetic consensus for GBM data). Remaining data-ingestion work tracked as gap #1 above.
+- **`onchain.py` not wired** → `OnChainEnrichmentClient` instantiated in `TradingBot.__init__` (gated by `onchain.enabled`), feeds the new `onchain_flow` signal in both estimators.
+- **The Graph hosted subgraph dead** → dead `subgraph_url` removed from `configs/config.yaml`; on-chain data comes from free CLOB/Gamma endpoints.
+- **`max_hours_to_expiry` ignored** → scan windows are now config-driven: `filters.sports_window_hours` (default 24) and `filters.nonsports_window_days` (default 14).
+- **`bot/test_signals.py` scratch file** → deleted.
+- **Missing deps** → `apscheduler` and `python-dateutil` added to `requirements.txt` (supervisor previously crashed on a clean install).
 
 ### ✅ Bugs Fixed Today (no longer issues)
 
@@ -893,6 +958,13 @@ python scripts/inspect_historical.py
 
 # Analyze exit telemetry (after running bot and closing some positions)
 python scripts/analyze_exits.py --days 30
+
+# Containerized deployment (bot + supervisor, shared data volume)
+docker compose up -d --build
+docker compose logs -f bot
+
+# Override any config value per-environment without editing YAML
+POLYBOT_TRADING__PAPER_TRADING=false POLYBOT_TRADING__KELLY_FRACTION=0.25 python -m bot.trading_loop
 ```
 
 Logs: `reports/trading.log` (bot), `reports/supervisor.log` (supervisor), `reports/live_output.log` (nohup stdout).

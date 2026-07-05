@@ -80,9 +80,14 @@ class MarketDataClient:
 
         now = datetime.now(timezone.utc)
         min_expiry = now + timedelta(hours=self.filters.min_hours_to_expiry)
-        sports_cutoff = now + timedelta(hours=24)
+        # Windows are config-driven (filters.sports_window_hours /
+        # filters.nonsports_window_days) so deployments can widen or narrow
+        # the scan universe without code changes.
+        sports_window_hours = getattr(self.filters, "sports_window_hours", 24.0)
+        nonsports_window_days = getattr(self.filters, "nonsports_window_days", 14.0)
+        sports_cutoff = now + timedelta(hours=sports_window_hours)
         max_live_age = timedelta(hours=4)
-        nonsports_cutoff = now + timedelta(days=14)
+        nonsports_cutoff = now + timedelta(days=nonsports_window_days)
 
         filtered = []
         live_count = 0
@@ -120,8 +125,8 @@ class MarketDataClient:
                 "total": len(markets),
                 "after_time_filter": len(filtered),
                 "live_games": live_count,
-                "sports_window_hours": 24,
-                "nonsports_window_days": 14,
+                "sports_window_hours": sports_window_hours,
+                "nonsports_window_days": nonsports_window_days,
             })
 
         return filtered

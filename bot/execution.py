@@ -69,8 +69,9 @@ class ExecutionEngine:
 
         quantity = size_usd / price if price > 0 else 0
 
-        # Simulate fees (taker fee)
-        fee_rate = 0.02  # 2% taker fee
+        # Simulate fees at the configured taker rate (single source of truth
+        # shared with the net-edge calculation and Kelly sizing)
+        fee_rate = getattr(self.config, "taker_fee_rate", 0.02)
         fees = size_usd * fee_rate
 
         trade = Trade(
@@ -167,7 +168,7 @@ class ExecutionEngine:
                 filled_qty = quantity  # fallback if execution format differs
 
             filled_size = filled_qty * price
-            fee_rate = 0.02
+            fee_rate = getattr(self.config, "taker_fee_rate", 0.02)
             fees = filled_size * fee_rate
 
             trade = Trade(
