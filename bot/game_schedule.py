@@ -10,12 +10,14 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional, Tuple
 
 from bot.signals.odds_api import TEAM_ABBREVS
+from bot.leagues import LEAGUES, scoreboard_url, game_seconds_remaining
 
 
+# All registered leagues. Off-season leagues return zero games from ESPN and
+# cost one cached call each — this is what keeps the bot focused on whatever
+# sports are ACTUALLY happening today, year-round, with no seasonal edits.
 ESPN_ENDPOINTS = {
-    "nba": "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
-    "cbb": "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard",
-    "nhl": "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard",
+    league: scoreboard_url(league) for league in LEAGUES
 }
 
 
@@ -186,30 +188,24 @@ class GameSchedule:
             period = status.get("period", 0)
 
             try:
-                parts = clock.split(":")
+                # Soccer clocks render as "67'" (minutes elapsed, counting up);
+                # stoppage time as "90'+". Strip the markers before parsing.
+                clean = clock.replace("'", "").replace("+", "").strip()
+                parts = clean.split(":")
                 if len(parts) == 2:
                     clock_seconds = int(parts[0]) * 60 + int(float(parts[1]))
+                elif "'" in clock:
+                    clock_seconds = int(float(parts[0])) * 60  # minutes elapsed
                 else:
                     clock_seconds = int(float(parts[0]))
             except (ValueError, TypeError):
                 clock_seconds = 0
 
-            # Calculate total remaining based on sport
-            if sport == "nba":
-                # 4 quarters, 12 min each = 48 min total
-                quarters_left = max(0, 4 - period)
-                remaining = quarters_left * 12 * 60 + clock_seconds
-            elif sport == "cbb":
-                # 2 halves, 20 min each = 40 min total
-                halves_left = max(0, 2 - period)
-                remaining = halves_left * 20 * 60 + clock_seconds
-            elif sport == "nhl":
-                # 3 periods, 20 min each = 60 min total
-                periods_left = max(0, 3 - period)
-                remaining = periods_left * 20 * 60 + clock_seconds
-            else:
-                remaining = clock_seconds
-
+            # Per-league clock math lives in the registry. None = clockless
+            # sport (baseball) or unknown league — no last-5-minutes block.
+            remaining = game_seconds_remaining(sport, period, clock_seconds)
+            if remaining is None:
+                return None
             return float(remaining)
 
         return None
@@ -221,7 +217,8 @@ class GameSchedule:
             return "No games scheduled today."
 
         lines = []
-        for sport in ("cbb", "nhl", "nba"):
+        # Only leagues that actually have games today show up
+        for sport in sorted({g["sport"] for g in games}):
             sport_games = [g for g in games if g["sport"] == sport]
             if not sport_games:
                 continue

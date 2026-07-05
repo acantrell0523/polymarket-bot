@@ -15,7 +15,7 @@ of this document (sections below have been updated in place):
 | **Bayesian pooling** | `ProbabilityEstimator` now defaults to log-odds pooling anchored on the market price as the prior (`signals.combination_method: logodds`). No signal evidence ⇒ estimate == market price ⇒ zero edge. Legacy linear pooling remains available (`linear`). |
 | **Fee-aware Kelly** | Default sizing is fractional Kelly (`position_sizing_method: kelly`, `kelly_fraction: 0.25`) computed on the executable price grossed up by the taker fee. Tiered flat-dollar sizing remains available. |
 | **On-chain signal wired** | `OnChainEnrichmentClient` is now instantiated in the trading loop (when `onchain.enabled`) and feeds a new supporting `onchain_flow` signal (weight 0.10, confidence capped at 0.5) in all market types. |
-| **Backtest 0-trades gap CLOSED** | New `backtest/historical_odds.py` — a time-aware, lookahead-free `HistoricalOddsCache` satisfies the external validation gate in replays. Synthetic backtests generate synthetic consensus and now exercise the full pipeline (gate → ranking → sizing → risk). SQLite-backed backtests read `historical_snapshots.espn_consensus_prob` (still 0 for CLOB-ingested data — gate stays closed there until consensus data is ingested). |
+| **Backtest 0-trades gap CLOSED** | New `backtest/historical_odds.py` — a time-aware, lookahead-free `HistoricalOddsCache` satisfies the external validation gate in replays. Synthetic backtests generate synthetic consensus and now exercise the full pipeline (gate → ranking → sizing → risk). SQLite-backed backtests read `historical_snapshots.espn_consensus_prob`, populated by the recorder's consensus phase as data accumulates. |
 | **Decision audit trail** | New `decision_log` table: EVERY opportunity that reaches validation is recorded (executed / rejected / skipped_sizing / execution_failed) with estimated_prob, prices, gross+net edge, spread, fee, size, and reason. |
 | **Health & degraded mode** | New `bot/health.py`. Trading loop writes `data/heartbeat.json` every cycle; supervisor alerts when it goes stale (5-min check). Repeated market-data failures trigger exponential backoff (max 5 min) with one Slack alert per outage. |
 | **Durable daily-loss halt** | Breaching `daily_loss_limit_usd` now writes `data/pause_until` (next UTC midnight) so the halt survives restarts, plus a Slack alert. |
@@ -23,8 +23,9 @@ of this document (sections below have been updated in place):
 | **Env-var config overrides** | Any scalar config value: `POLYBOT_<SECTION>__<FIELD>` (e.g. `POLYBOT_TRADING__PAPER_TRADING=false`). Applied after YAML. |
 | **Containerized** | `Dockerfile` + `docker-compose.yml` (bot + supervisor services, shared data volume, heartbeat-based healthcheck). |
 | **Cleanup** | Dead `bot/test_signals.py` deleted; dead subgraph URL removed from config; `apscheduler`/`python-dateutil` added to requirements (supervisor previously crashed on missing dep); expiry windows now config-driven (`filters.sports_window_hours` / `nonsports_window_days`); paper/live fee simulation reads `trading.taker_fee_rate`. |
+| **Current-sports focus** | New `bot/leagues.py` central registry (MLB, WNBA, MLS + NBA/NHL/NFL/CBB/EPL). `GameSchedule` previously watched only NBA/NCAA/NHL — all off-season in July — so the live bot would have slept all summer; it now sweeps every registered league (off-season leagues return zero games, auto-reactivate when seasons start). Ingest is a forward-looking daily recorder: no-arg run sweeps the last 3 days → today across all leagues; NBA outrights are opt-in (`--include-nba-outrights`); `--prune-leagues nba` deletes finished-season data. Supervisor runs the recorder daily at 05:30 ET. Per-league clock math (incl. clockless MLB, count-up soccer clocks) drives the last-5-minutes block. |
 | **Consensus backfill** | `scripts/ingest_historical.py` Phase 3 (+ standalone `--consensus-only` mode): ESPN pickcenter odds → de-vigged consensus → `historical_snapshots.espn_consensus_prob`, with YES-team inference and a closing-line lookahead guard (`--consensus-window-days`, default 3). See §10. |
-| **Tests** | 168 tests passing (was 107): net-edge math, log-odds pooling, fee-aware Kelly, spread/net-edge filters, onchain signal, env overrides, health monitor, decision log, historical odds cache, backtest-fires-trades integration, consensus backfill (de-vig math, YES-team inference, window guard, end-to-end into HistoricalOddsCache). |
+| **Tests** | 181 tests passing (was 107): net-edge math, log-odds pooling, fee-aware Kelly, spread/net-edge filters, onchain signal, env overrides, health monitor, decision log, historical odds cache, backtest-fires-trades integration, consensus backfill (de-vig math, YES-team inference, window guard, end-to-end into HistoricalOddsCache). |
 
 ---
 
@@ -80,6 +81,8 @@ polymarket-bot/
 │   ├── trade_db.py             # SQLite trade history, signal log, exit_log
 │   ├── supervisor.py           # Read-only scheduled agent (reports, kill switch)
 │   ├── game_schedule.py        # ESPN schedule fetcher; drives scan sleep logic
+│   ├── leagues.py              # Central league registry (current sports; ESPN paths,
+│   │                           #   odds-api keys, per-league game clock math)
 │   ├── health.py               # Heartbeat + API failure tracking / degraded mode
 │   ├── signals/
 │   │   ├── signals.py          # 8 signal functions (OB imbalance, line movement,
@@ -122,7 +125,7 @@ polymarket-bot/
 │   ├── logger.py               # Structured JSON logger
 │   └── models.py               # Shared dataclasses (OrderBook, TradeSignal, Position…)
 ├── tests/
-│   └── test_core.py            # pytest suite — 168 tests, all passing
+│   └── test_core.py            # pytest suite — 181 tests, all passing
 ├── configs/config.yaml         # CANONICAL master configuration file (only config file)
 ├── .env.example                # Environment variable template
 ├── requirements.txt            # Python dependencies
@@ -513,9 +516,11 @@ Rate limiting: 5 req/s max. Uses `urllib3.Retry` with exponential backoff on 429
 Read-only agent. **Never modifies config.yaml.** Runs as a separate process via `run.sh`.
 
 Scheduled jobs (APScheduler, US/Eastern):
+- **5:30 AM ET**: `daily_data_recorder()` — records yesterday+today's games (prices + consensus) across all registered leagues into the historical tables
 - **6:00 AM ET**: `daily_review()` — 24h trade stats by market type, edge validation report, kill switch check, Slack post
 - **8:00 AM ET**: `morning_briefing()` — top 10 edge opportunities from morning scan, posted to Slack
 - **Every 15 min**: `check_kill_switch()` — halts bot if account value < 50% of starting value
+- **Every 5 min**: `check_heartbeat()` — Slack alert when the trading loop's heartbeat goes stale
 
 Kill switch: creates `data/kill_switch` file. Remove the file to resume trading.
 
@@ -627,19 +632,21 @@ Total combinations: 5 × 5 × (4 + 4) = 200. Results sorted by Sharpe ratio.
 
 ### Overview
 
-Two new SQLite tables (`historical_markets`, `historical_snapshots`) in `data/trades.db` store historical NBA market data for backtesting. Data is ingested by `scripts/ingest_historical.py` from free public APIs (ESPN + Polymarket CLOB/Gamma).
+Two SQLite tables (`historical_markets`, `historical_snapshots`) in `data/trades.db` store market data for backtesting. Data is recorded by `scripts/ingest_historical.py` from free public APIs (ESPN + Polymarket CLOB/Gamma).
+
+**The recorder is strictly focused on CURRENT sports.** With no date arguments it sweeps the last 3 days up to today across every league in `bot/leagues.py` (July: MLB, WNBA, MLS have games; NBA/NHL/NFL return zero until their seasons start, then auto-reactivate). Run it daily — cron, or the supervisor's built-in 05:30 ET `daily_data_recorder` job — and the dataset builds forward from today. Season backfills are still possible by passing explicit `--start/--end`, and `--prune-leagues nba` clears out finished-season data.
 
 ### Three-Phase Ingestion (`scripts/ingest_historical.py`)
 
-**Phase 1 — Game-by-game (ESPN scoreboard)**:
-1. For each date in `[--start, --end]`, fetch NBA games from ESPN scoreboard API
-2. For each game, construct expected Polymarket slug (`aec-nba-{away}-{home}-{date}`)
+**Phase 1 — Game-by-game (ESPN scoreboard, every registered league)**:
+1. For each date in the window and each league, fetch games from that league's ESPN scoreboard (off-season leagues return none)
+2. For each game, construct candidate Polymarket slugs (`aec-{league}-{away}-{home}-{date}`; soccer uses the 3-outcome `atc-…-{team}` family)
 3. Look up the market on Gamma API
 4. Fetch CLOB `prices-history` for the YES token
 5. Filter history to the requested date window
 6. Insert into `historical_markets` (market metadata) and `historical_snapshots` (price series)
 
-**Phase 2 — NBA outright/futures**:
+**Phase 2 — NBA outright/futures (OPT-IN via `--include-nba-outrights`; off by default, season over)**:
 1. For each slug in `NBA_OUTRIGHT_EVENT_SLUGS` (Finals winner, MVP, Conference champion, etc.)
 2. Fetch all markets under that Gamma event
 3. Fetch CLOB `prices-history` for each market's YES token
@@ -655,12 +662,20 @@ Two new SQLite tables (`historical_markets`, `historical_snapshots`) in `data/tr
 **Re-running is fully idempotent**: `INSERT OR IGNORE` for price phases, plain `UPDATE` for the consensus backfill. Timestamps are bucketed to UTC day boundaries (floor to 86400 s) before insert, so the `UNIQUE(slug, timestamp, source)` constraint catches duplicates even when the CLOB API returns slightly different intra-day timestamps across runs. Verified by regression tests (`TestHistoricalDB.test_ingest_idempotency`, `TestUpdateSnapshotConsensus.test_rerun_is_idempotent`).
 
 ```bash
-python scripts/ingest_historical.py --start 2026-01-01 --end 2026-05-04
+# Daily recorder (default): last 3 days → today, all registered leagues
+python scripts/ingest_historical.py
+
+# Specific leagues / window
+python scripts/ingest_historical.py --leagues mlb,wnba,mls --days-back 7
+
+# Drop finished-season NBA data
+python scripts/ingest_historical.py --prune-leagues nba --leagues mlb,wnba,mls
 
 # Backfill consensus for an already-populated database (no re-ingest):
 python scripts/ingest_historical.py --consensus-only
 
-# Options: --consensus-window-days N (default 3), --skip-consensus
+# Options: --consensus-window-days N (default 3), --skip-consensus,
+#          --include-nba-outrights, --start/--end for explicit windows
 ```
 
 ### Current State of the Historical Database
@@ -876,10 +891,10 @@ historical_snapshots
 
 ### ✅ Working
 
-- **Test suite** — 168 tests passing in `tests/test_core.py`. Run `pytest tests/test_core.py`. Covers: order book, signals, market type detection, probability estimator, validate_trade, position sizing, risk manager, portfolio, data generation, backtest engine, config, exit telemetry, live-loop let_it_ride safety, historical DB schema + idempotency, DB loader, exit proximity computation, and the analyze_exits script.
+- **Test suite** — 181 tests passing in `tests/test_core.py`. Run `pytest tests/test_core.py`. Covers: order book, signals, market type detection, probability estimator, validate_trade, position sizing, risk manager, portfolio, data generation, backtest engine, config, exit telemetry, live-loop let_it_ride safety, historical DB schema + idempotency, DB loader, exit proximity computation, and the analyze_exits script.
 
   ```
-  ============================= 168 passed in 2.23s ==============================
+  ============================= 181 passed in 1.85s ==============================
   ```
 
 - **Live trading loop** — `TradingBot.run()` is the production path. Dual-speed scanning (3s live / 60s full), sniper trade selection, full validation checklist, position lifecycle.
@@ -912,9 +927,9 @@ historical_snapshots
 
 ### ❌ Current Gaps / Not Yet Working
 
-1. **Consensus backfill not yet RUN against the live ESPN API** — The ingest script now populates `espn_consensus_prob` (Phase 3 / `--consensus-only`, see §10), and the logic is fully unit-tested against ESPN's documented `pickcenter` payload shape, but it has not yet been executed on a network with ESPN access (this dev environment's proxy blocks `site.api.espn.com`). Run `python scripts/ingest_historical.py --consensus-only` from a deployment host, then `python scripts/inspect_historical.py` to confirm coverage. Caveats: only game markets get consensus (outrights have no pickcenter source and stay gated — the currently-ingested 2026 data is outrights-only, so a meaningful sports backtest also needs Phase 1 game data from 2024–25 dates, see gap #2); ESPN may carry few providers per historical game (`num_books` is clamped to ≥2 by `HistoricalOddsCache.from_db`, and the "3 books for >7% edges" rule still applies).
+1. **Recorder not yet RUN against the live APIs** — The forward-looking recorder (see §10) and its consensus phase are fully unit-tested, but neither has been executed on a network with ESPN access (this dev environment's proxy blocks `site.api.espn.com`). From a deployment host, run `python scripts/ingest_historical.py` daily (or rely on the supervisor's 05:30 ET job), then `python scripts/inspect_historical.py` to confirm coverage. Expect the first runs to surface Polymarket slug-pattern/abbreviation mismatches for MLB/WNBA/MLS as `no_market` log lines — extend `ABBR_MAP` / `candidate_slugs()` in `scripts/ingest_historical.py` as they're discovered (only the NBA mapping is battle-tested).
 
-2. **No game-level NBA Polymarket markets for 2026 playoffs** — Polymarket is only listing season-long outrights (Finals winner, MVP, Conference champion) for the current playoff window, not individual game moneylines. The `aec-nba-*` pattern in `scripts/ingest_historical.py` Phase 1 finds 0 matches for 2026 dates. Backtest data for individual game markets requires going back to 2024–25 regular season dates.
+2. **Backtest data accumulates forward, so it starts thin** — The strategy is strictly current-sports: the recorder builds the dataset from today onward (MLB/WNBA/MLS right now). That means meaningful sports backtests need a few weeks of recorded data before they carry statistical weight. The old 2026 NBA outright data can be dropped with `--prune-leagues nba`. ESPN may carry few pickcenter providers per game (`num_books` is clamped to ≥2 by `HistoricalOddsCache.from_db`, and the "3 books for >7% edges" rule still applies).
 
 3. **`THE_ODDS_API_KEY` is effectively required for live trading** — Without it, `OddsCache` falls back to ESPN only (1 book). The `validate_trade()` checklist requires ≥2 books, so all sports trades will be rejected. The bot will run but won't place any trades in live mode without this key.
 

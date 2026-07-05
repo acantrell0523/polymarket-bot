@@ -1,19 +1,28 @@
 """
-Historical NBA data ingestion pipeline (Option D — CLOB prices-history).
+Sports data recorder — CURRENT sports, today and forward.
+
+The bot trades whatever is in season NOW (July: MLB, WNBA, MLS; NBA/NHL/NFL
+pick up automatically when their seasons start — see bot/leagues.py). This
+script records the data those backtests need, and its defaults are
+forward-looking: run it with no date arguments and it sweeps the last few
+days up to TODAY across every registered league. Run it daily (cron, or the
+supervisor's built-in 05:30 ET job) and the historical dataset accumulates
+forward from today. Off-season leagues return zero games and cost nothing.
 
 Data flow
 ---------
-Phase 1 (game-by-game):
+Phase 1 (game-by-game, all registered leagues):
   ESPN scoreboard  →  Polymarket slug lookup (Gamma)  →  CLOB prices-history
                    →  ESPN game summary (pickcenter)  →  consensus probability
 
-Phase 2 (season-long outrights):
+Phase 2 (season-long NBA outrights — OPT-IN via --include-nba-outrights;
+  disabled by default because the NBA season is over):
   Gamma /events for known NBA event slugs  →  CLOB prices-history
   (no consensus source exists for outrights — they stay gated in backtests)
 
 Phase 3 (consensus backfill, also available standalone via --consensus-only):
   For every ingested moneyline_game market, fetch the ESPN game summary's
-  `pickcenter` block (free, retained for past games), de-vig each provider's
+  `pickcenter` block for that market's league, de-vig each provider's
   moneyline into a win probability, average across providers, figure out
   which team the market's YES token refers to, and write the result into
   historical_snapshots.espn_consensus_prob / num_books. This is the value
@@ -26,9 +35,12 @@ Phase 3 (consensus backfill, also available standalone via --consensus-only):
   snapshots keep espn_consensus_prob=0 rather than receiving a consensus
   that "knows" late-breaking news (lookahead).
 
-Both price phases filter history to the [--start, --end] date window and
-store results in data/trades.db:
-  historical_markets   — one row per Polymarket market
+Housekeeping: --prune-leagues nba deletes previously ingested markets and
+snapshots for finished seasons you no longer care about.
+
+Both price phases filter history to the resolved date window and store
+results in data/trades.db:
+  historical_markets   — one row per Polymarket market (league column set)
   historical_snapshots — (slug, timestamp, price, consensus) time-series
 
 Re-running is fully idempotent: INSERT OR IGNORE for inserts, plain UPDATE
@@ -60,20 +72,22 @@ from data.historical_db import (
 # Reuse the exact odds→probability conversions the live bot trades with, so
 # historical consensus and live consensus are computed identically.
 from bot.signals.odds_api import _american_to_prob, _spread_to_moneyline_prob
+from bot.leagues import LEAGUES, all_league_codes, scoreboard_url, summary_url
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-ESPN_SCOREBOARD = (
-    "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
-)
-ESPN_SUMMARY = (
-    "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary"
-)
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE  = "https://clob.polymarket.com"
 
 # Minimum seconds between outbound API calls (polite throttle)
 THROTTLE_SECS = 0.2
+
+# Leagues that use 3-outcome (win/draw/win) markets on Polymarket, which use
+# the atc- slug family with a team-outcome suffix instead of aec-.
+SOCCER_LEAGUES = {"mls", "epl"}
+
+# Default sweep window when no dates are given: the recent past up to today.
+DEFAULT_DAYS_BACK = 3
 
 # Gamma event slugs for season-long NBA outrights to sweep regardless of date
 NBA_OUTRIGHT_EVENT_SLUGS = [
@@ -116,14 +130,18 @@ def _get(session: requests.Session, url: str,
 # ── ESPN ──────────────────────────────────────────────────────────────────────
 
 def fetch_espn_games(
-    session: requests.Session, date_str: str, last_call: float
+    session: requests.Session, league: str, date_str: str, last_call: float
 ) -> Tuple[List[Dict], float]:
     """
-    Fetch NBA games for a YYYYMMDD string.
-    Returns (list[game_dict], last_call).
+    Fetch a league's games for a YYYYMMDD string from the ESPN scoreboard.
+    Off-season leagues return an empty list. Returns (list[game_dict], last_call).
     """
+    url = scoreboard_url(league)
+    if not url:
+        return [], last_call
+
     last_call = _throttle(last_call)
-    data = _get(session, ESPN_SCOREBOARD, params={"dates": date_str})
+    data = _get(session, url, params={"dates": date_str})
     last_call = time.time()
 
     if not data:
@@ -138,6 +156,7 @@ def fetch_espn_games(
             away  = next((t for t in teams if t.get("homeAway") == "away"), {})
 
             games.append({
+                "league":     league,
                 "espn_id":    ev.get("id", ""),
                 "date":       date_str,
                 "start_time": ev.get("date", ""),
@@ -150,7 +169,8 @@ def fetch_espn_games(
                 "away_score": str(away.get("score", "") or ""),
             })
         except Exception as exc:
-            logging.warning("espn_parse_error event_id=%s error=%s", ev.get("id"), exc)
+            logging.warning("espn_parse_error league=%s event_id=%s error=%s",
+                            league, ev.get("id"), exc)
 
     return games, last_call
 
@@ -170,35 +190,55 @@ def _parse_token_ids(market: Dict) -> Tuple[str, str]:
         return "", ""
 
 
+# Known ESPN ↔ Polymarket abbreviation differences, per league.
+# Other leagues' mismatches surface as "no_market" log lines on the first
+# recorded day — add mappings here as they're discovered.
+ABBR_MAP = {
+    "nba": {
+        "sa":  "sas",   # San Antonio Spurs
+        "gs":  "gsw",   # Golden State Warriors
+        "ny":  "nyk",   # New York Knicks
+        "no":  "nor",   # New Orleans Pelicans
+    },
+}
+
+
+def candidate_slugs(game: Dict) -> List[str]:
+    """Possible Polymarket slugs for one ESPN game, most likely first.
+
+    Two-outcome sports use the aec- moneyline family
+    (aec-{league}-{away}-{home}-{date}); soccer uses the 3-outcome atc-
+    family with a team suffix (atc-{league}-{away}-{home}-{date}-{team}).
+    Each candidate costs one Gamma lookup, so the list is kept short.
+    """
+    league = game["league"]
+    away = game["away_abbr"]
+    home = game["home_abbr"]
+    date_iso = f"{game['date'][:4]}-{game['date'][4:6]}-{game['date'][6:]}"
+
+    amap = ABBR_MAP.get(league, {})
+    away_pm = amap.get(away, away)
+    home_pm = amap.get(home, home)
+
+    if league in SOCCER_LEAGUES:
+        base = f"atc-{league}-{away_pm}-{home_pm}-{date_iso}"
+        return [f"{base}-{away_pm}", f"{base}-{home_pm}",
+                f"aec-{league}-{away_pm}-{home_pm}-{date_iso}"]
+
+    slugs = [f"aec-{league}-{away_pm}-{home_pm}-{date_iso}"]
+    if (away_pm, home_pm) != (away, home):
+        slugs.append(f"aec-{league}-{away}-{home}-{date_iso}")
+    return slugs
+
+
 def find_game_market(
     session: requests.Session, game: Dict, last_call: float
 ) -> Tuple[Optional[Dict], float]:
     """
     Try to find a Polymarket moneyline market for a given ESPN game.
-    Constructs the expected aec-nba-{away}-{home}-{date} slug and checks Gamma.
     Returns (market_dict | None, last_call).
     """
-    away = game["away_abbr"]
-    home = game["home_abbr"]
-    date_iso = f"{game['date'][:4]}-{game['date'][4:6]}-{game['date'][6:]}"
-
-    # Normalise a few known ESPN ↔ Polymarket abbreviation differences
-    abbr_map = {
-        "sa":  "sas",   # San Antonio Spurs
-        "gs":  "gsw",   # Golden State Warriors
-        "ny":  "nyk",   # New York Knicks
-        "no":  "nor",   # New Orleans Pelicans
-        "uta": "uta",
-    }
-    home_pm = abbr_map.get(home, home)
-    away_pm = abbr_map.get(away, away)
-
-    candidates = [
-        f"aec-nba-{away_pm}-{home_pm}-{date_iso}",
-        f"aec-nba-{away}-{home}-{date_iso}",
-    ]
-
-    for slug in candidates:
+    for slug in candidate_slugs(game):
         last_call = _throttle(last_call)
         data = _get(session, f"{GAMMA_BASE}/markets", params={"slug": slug})
         last_call = time.time()
@@ -264,15 +304,17 @@ def fetch_prices_history(
 # ── Consensus backfill (ESPN pickcenter) ─────────────────────────────────────
 
 def fetch_espn_pickcenter(
-    session: requests.Session, espn_game_id: str, last_call: float
+    session: requests.Session, espn_game_id: str, last_call: float,
+    league: str = "nba",
 ) -> Tuple[List[Dict], float]:
     """Fetch the pickcenter (sportsbook odds) block from an ESPN game summary.
 
     Works for past games — ESPN retains the odds in the summary endpoint.
     Returns (list[provider_odds_dict], last_call).
     """
+    url = summary_url(league) or summary_url("nba")
     last_call = _throttle(last_call)
-    data = _get(session, ESPN_SUMMARY, params={"event": espn_game_id})
+    data = _get(session, url, params={"event": espn_game_id})
     last_call = time.time()
 
     if not data or not isinstance(data, dict):
@@ -416,7 +458,9 @@ def backfill_consensus_for_market(
     if not espn_id:
         return 0, last_call
 
-    pickcenter, last_call = fetch_espn_pickcenter(session, espn_id, last_call)
+    # Legacy rows stored league as 'NBA'; new rows store the lowercase code.
+    league = (market_row.get("league") or "nba").lower()
+    pickcenter, last_call = fetch_espn_pickcenter(session, espn_id, last_call, league)
     consensus = compute_consensus_from_pickcenter(pickcenter)
     if consensus is None:
         logging.info("no_pickcenter_odds slug=%s espn_id=%s", slug, espn_id)
@@ -508,6 +552,7 @@ def ingest_game_market(
         "slug":            slug,
         "market_id":       str(market.get("id", "")),
         "condition_id":    market.get("conditionId", ""),
+        "league":          game.get("league", "nba"),
         "question":        market.get("question", ""),
         "home_team":       game["home_name"],
         "away_team":       game["away_name"],
@@ -591,7 +636,7 @@ def run_consensus_backfill(
     Returns (markets_updated, snapshot_rows_updated, last_call).
     """
     rows = conn.execute(
-        "SELECT slug, espn_game_id, question, home_team, away_team, "
+        "SELECT slug, espn_game_id, league, question, home_team, away_team, "
         "       settled_outcome, game_start_time "
         "FROM historical_markets "
         "WHERE market_type = 'moneyline_game' AND espn_game_id != '' "
@@ -616,20 +661,215 @@ def run_consensus_backfill(
     return markets_updated, rows_updated, last_call
 
 
+def prune_leagues(conn, leagues: List[str]) -> Tuple[int, int]:
+    """Delete markets + snapshots for finished seasons you no longer track.
+
+    Matches historical_markets.league case-insensitively and also removes
+    NBA outright markets when 'nba' is pruned (they have market_type
+    'nba_outright'). Returns (markets_deleted, snapshots_deleted).
+    """
+    codes = [l.lower() for l in leagues]
+    placeholders = ",".join("?" for _ in codes)
+    where = f"LOWER(league) IN ({placeholders})"
+    if "nba" in codes:
+        where += " OR market_type = 'nba_outright'"
+
+    slugs = [r[0] for r in conn.execute(
+        f"SELECT slug FROM historical_markets WHERE {where}", codes
+    ).fetchall()]
+
+    snaps_deleted = 0
+    if slugs:
+        slug_ph = ",".join("?" for _ in slugs)
+        snaps_deleted = conn.execute(
+            f"DELETE FROM historical_snapshots WHERE slug IN ({slug_ph})", slugs
+        ).rowcount
+    markets_deleted = conn.execute(
+        f"DELETE FROM historical_markets WHERE {where}", codes
+    ).rowcount
+    conn.commit()
+    return markets_deleted, snaps_deleted
+
+
+def run_ingest(
+    start_dt: datetime.date,
+    end_dt: datetime.date,
+    leagues: List[str],
+    include_nba_outrights: bool = False,
+    consensus_window_days: int = 3,
+    skip_consensus: bool = False,
+) -> Dict[str, int]:
+    """Run the full recorder (phases 1–3) and return a summary dict.
+
+    Callable programmatically (the supervisor's daily recorder job uses this)
+    as well as from the CLI.
+    """
+    start_ts = int(datetime.datetime(
+        start_dt.year, start_dt.month, start_dt.day,
+        tzinfo=datetime.timezone.utc).timestamp())
+    end_ts = int(datetime.datetime(
+        end_dt.year, end_dt.month, end_dt.day, 23, 59, 59,
+        tzinfo=datetime.timezone.utc).timestamp())
+
+    logging.info(
+        "ingestion_start start=%s end=%s leagues=%s",
+        start_dt.isoformat(), end_dt.isoformat(), ",".join(leagues),
+    )
+
+    init_tables()
+    session = requests.Session()
+    session.headers.update({"User-Agent": "polymarket-bot-historical/1.0"})
+    conn = get_conn()
+    last_call = 0.0
+
+    totals = {
+        "espn_games": 0, "game_markets": 0, "game_snapshots": 0,
+        "outright_markets": 0, "outright_snapshots": 0,
+        "consensus_markets": 0, "consensus_rows": 0, "errors": 0,
+    }
+
+    # ── Phase 1: ESPN game-by-game sweep, every registered league ────────────
+    # Off-season leagues return zero games from ESPN — the sweep automatically
+    # tracks whatever sports are actually being played in the window.
+    logging.info("=== Phase 1: ESPN game sweep (leagues: %s) ===", ",".join(leagues))
+    current = start_dt
+    while current <= end_dt:
+        date_str = current.strftime("%Y%m%d")
+        for league in leagues:
+            try:
+                games, last_call = fetch_espn_games(session, league, date_str, last_call)
+                if games:
+                    logging.info("date=%s league=%s espn_games=%d",
+                                 date_str, league, len(games))
+                totals["espn_games"] += len(games)
+
+                for game in games:
+                    try:
+                        market, last_call = find_game_market(session, game, last_call)
+                        if market is None:
+                            logging.info(
+                                "no_market league=%s %s @ %s on %s",
+                                league, game["away_name"], game["home_name"], date_str,
+                            )
+                            continue
+
+                        n, last_call = ingest_game_market(
+                            session, game, market, start_ts, end_ts, last_call, conn
+                        )
+                        totals["game_markets"] += 1
+                        totals["game_snapshots"] += n
+
+                    except Exception as exc:
+                        totals["errors"] += 1
+                        logging.error(
+                            "game_error league=%s espn_id=%s error=%s",
+                            league, game.get("espn_id"), exc,
+                        )
+
+            except Exception as exc:
+                totals["errors"] += 1
+                logging.error("date_error date=%s league=%s error=%s",
+                              date_str, league, exc)
+
+        current += datetime.timedelta(days=1)
+
+    # ── Phase 2: NBA outright / futures sweep (opt-in; season is over) ───────
+    if include_nba_outrights:
+        logging.info("=== Phase 2: NBA outright sweep ===")
+        for event_slug in dict.fromkeys(NBA_OUTRIGHT_EVENT_SLUGS):
+            try:
+                markets, last_call = fetch_gamma_event_markets(session, event_slug, last_call)
+                logging.info("event=%s markets=%d", event_slug, len(markets))
+                for market in markets:
+                    try:
+                        n, last_call = ingest_outright_market(
+                            session, market, start_ts, end_ts, last_call, conn
+                        )
+                        if n > 0:
+                            totals["outright_markets"] += 1
+                            totals["outright_snapshots"] += n
+                    except Exception as exc:
+                        totals["errors"] += 1
+                        logging.error("outright_error slug=%s error=%s",
+                                      market.get("slug"), exc)
+            except Exception as exc:
+                totals["errors"] += 1
+                logging.error("event_error event=%s error=%s", event_slug, exc)
+    else:
+        logging.info("=== Phase 2: NBA outrights SKIPPED "
+                     "(season over; --include-nba-outrights to opt in) ===")
+
+    # ── Phase 3: consensus backfill for game markets ──────────────────────────
+    if skip_consensus:
+        logging.info("=== Phase 3: consensus backfill SKIPPED (--skip-consensus) ===")
+    else:
+        logging.info("=== Phase 3: consensus backfill (ESPN pickcenter) ===")
+        totals["consensus_markets"], totals["consensus_rows"], last_call = (
+            run_consensus_backfill(session, conn, consensus_window_days, last_call)
+        )
+
+    conn.close()
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    coverage = get_consensus_coverage()
+    logging.info("=== INGESTION COMPLETE ===")
+    logging.info("date_range:              %s → %s",
+                 start_dt.isoformat(), end_dt.isoformat())
+    logging.info("leagues:                 %s", ",".join(leagues))
+    logging.info("espn_games_found:        %d", totals["espn_games"])
+    logging.info("game_markets_matched:    %d", totals["game_markets"])
+    logging.info("game_snapshots:          %d", totals["game_snapshots"])
+    logging.info("outright_markets:        %d", totals["outright_markets"])
+    logging.info("outright_snapshots:      %d", totals["outright_snapshots"])
+    logging.info("consensus_markets:       %d", totals["consensus_markets"])
+    logging.info("consensus_rows_updated:  %d", totals["consensus_rows"])
+    logging.info("consensus_coverage:      %d/%d snapshots (%d slugs)",
+                 coverage["with_consensus"], coverage["total"],
+                 coverage["slugs_with_consensus"])
+    logging.info("errors:                  %d", totals["errors"])
+    return totals
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Ingest historical NBA Polymarket data into data/trades.db"
+        description="Record current-sports Polymarket data into data/trades.db. "
+                    "With no date arguments, sweeps the last %d days up to "
+                    "today across all registered leagues — run it daily and "
+                    "the dataset builds forward." % DEFAULT_DAYS_BACK
     )
     parser.add_argument(
-        "--start", help="Start date (YYYY-MM-DD, inclusive)"
+        "--start", help="Start date (YYYY-MM-DD, inclusive). "
+                        "Default: today minus --days-back"
     )
     parser.add_argument(
-        "--end", help="End date (YYYY-MM-DD, inclusive)"
+        "--end", help="End date (YYYY-MM-DD, inclusive). Default: today"
+    )
+    parser.add_argument(
+        "--days-back", type=int, default=DEFAULT_DAYS_BACK,
+        help="With no --start, sweep this many days back from today "
+             f"(default {DEFAULT_DAYS_BACK})"
+    )
+    parser.add_argument(
+        "--leagues", default=",".join(all_league_codes()),
+        help="Comma-separated league codes to sweep "
+             f"(default: all registered — {','.join(all_league_codes())}). "
+             "Off-season leagues cost one empty call per day."
+    )
+    parser.add_argument(
+        "--include-nba-outrights", action="store_true",
+        help="Also sweep season-long NBA outright markets (off by default — "
+             "the NBA season is over)"
+    )
+    parser.add_argument(
+        "--prune-leagues", default="",
+        help="Comma-separated league codes whose ingested markets/snapshots "
+             "should be DELETED before this run (e.g. --prune-leagues nba "
+             "to drop last season's data)"
     )
     parser.add_argument(
         "--consensus-only", action="store_true",
         help="Skip price ingestion; only backfill espn_consensus_prob for "
-             "game markets already in the database (no --start/--end needed)"
+             "game markets already in the database (no dates needed)"
     )
     parser.add_argument(
         "--consensus-window-days", type=int, default=3,
@@ -655,6 +895,16 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
+    # ── Optional prune of finished-season data ────────────────────────────────
+    if args.prune_leagues.strip():
+        init_tables()
+        conn = get_conn()
+        codes = [c.strip() for c in args.prune_leagues.split(",") if c.strip()]
+        m_del, s_del = prune_leagues(conn, codes)
+        conn.close()
+        logging.info("pruned leagues=%s markets=%d snapshots=%d",
+                     ",".join(codes), m_del, s_del)
+
     # ── Standalone consensus backfill mode ────────────────────────────────────
     if args.consensus_only:
         init_tables()
@@ -674,146 +924,26 @@ def main() -> None:
                      coverage["slugs_with_consensus"])
         return
 
-    if not args.start or not args.end:
-        parser.error("--start and --end are required (unless --consensus-only)")
-
-    start_dt = datetime.date.fromisoformat(args.start)
-    end_dt   = datetime.date.fromisoformat(args.end)
-    start_ts = int(
-        datetime.datetime(
-            start_dt.year, start_dt.month, start_dt.day,
-            tzinfo=datetime.timezone.utc
-        ).timestamp()
-    )
-    end_ts = int(
-        datetime.datetime(
-            end_dt.year, end_dt.month, end_dt.day, 23, 59, 59,
-            tzinfo=datetime.timezone.utc
-        ).timestamp()
-    )
-
-    logging.info(
-        "ingestion_start start=%s end=%s start_ts=%d end_ts=%d",
-        args.start, args.end, start_ts, end_ts,
-    )
-
-    # Initialise tables (idempotent)
-    init_tables()
-    logging.info("tables_ready")
-
-    session = requests.Session()
-    session.headers.update({"User-Agent": "polymarket-bot-historical/1.0"})
-
-    conn = get_conn()
-    last_call = 0.0
-
-    total_espn_games      = 0
-    total_game_matched    = 0
-    total_game_snaps      = 0
-    total_outright_mrkts  = 0
-    total_outright_snaps  = 0
-    errors                = 0
-
-    # ── Phase 1: ESPN game-by-game sweep ─────────────────────────────────────
-    logging.info("=== Phase 1: ESPN game-by-game sweep ===")
-    current = start_dt
-    while current <= end_dt:
-        date_str = current.strftime("%Y%m%d")
-        try:
-            games, last_call = fetch_espn_games(session, date_str, last_call)
-            logging.info("date=%s espn_games=%d", date_str, len(games))
-            total_espn_games += len(games)
-
-            for game in games:
-                try:
-                    market, last_call = find_game_market(session, game, last_call)
-                    if market is None:
-                        logging.info(
-                            "no_market %s @ %s on %s",
-                            game["away_name"], game["home_name"], date_str,
-                        )
-                        continue
-
-                    n, last_call = ingest_game_market(
-                        session, game, market, start_ts, end_ts, last_call, conn
-                    )
-                    total_game_matched += 1
-                    total_game_snaps   += n
-
-                except Exception as exc:
-                    errors += 1
-                    logging.error(
-                        "game_error espn_id=%s error=%s", game.get("espn_id"), exc
-                    )
-
-        except Exception as exc:
-            errors += 1
-            logging.error("date_error date=%s error=%s", date_str, exc)
-
-        current += datetime.timedelta(days=1)
-
-    # ── Phase 2: NBA outright / futures sweep ─────────────────────────────────
-    logging.info("=== Phase 2: NBA outright sweep ===")
-    seen_event_slugs = set()
-    for event_slug in NBA_OUTRIGHT_EVENT_SLUGS:
-        if event_slug in seen_event_slugs:
-            continue
-        seen_event_slugs.add(event_slug)
-        try:
-            markets, last_call = fetch_gamma_event_markets(session, event_slug, last_call)
-            logging.info("event=%s markets=%d", event_slug, len(markets))
-
-            for market in markets:
-                try:
-                    n, last_call = ingest_outright_market(
-                        session, market, start_ts, end_ts, last_call, conn
-                    )
-                    if n > 0:
-                        total_outright_mrkts += 1
-                        total_outright_snaps += n
-                except Exception as exc:
-                    errors += 1
-                    logging.error(
-                        "outright_error slug=%s error=%s", market.get("slug"), exc
-                    )
-
-        except Exception as exc:
-            errors += 1
-            logging.error("event_error event=%s error=%s", event_slug, exc)
-
-    # ── Phase 3: consensus backfill for game markets ──────────────────────────
-    consensus_markets = 0
-    consensus_rows = 0
-    if args.skip_consensus:
-        logging.info("=== Phase 3: consensus backfill SKIPPED (--skip-consensus) ===")
+    # Forward-looking defaults: [today - days_back, today]
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    end_dt = datetime.date.fromisoformat(args.end) if args.end else today
+    if args.start:
+        start_dt = datetime.date.fromisoformat(args.start)
     else:
-        logging.info("=== Phase 3: consensus backfill (ESPN pickcenter) ===")
-        consensus_markets, consensus_rows, last_call = run_consensus_backfill(
-            session, conn, args.consensus_window_days, last_call
-        )
+        start_dt = end_dt - datetime.timedelta(days=args.days_back)
 
-    conn.close()
+    leagues = [c.strip().lower() for c in args.leagues.split(",") if c.strip()]
+    unknown = [c for c in leagues if c not in LEAGUES]
+    if unknown:
+        parser.error(f"unknown league code(s): {','.join(unknown)} "
+                     f"(registered: {','.join(all_league_codes())})")
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    total_markets = total_game_matched + total_outright_mrkts
-    total_snaps   = total_game_snaps + total_outright_snaps
-    coverage = get_consensus_coverage()
-
-    logging.info("=== INGESTION COMPLETE ===")
-    logging.info("date_range:              %s → %s", args.start, args.end)
-    logging.info("espn_games_found:        %d", total_espn_games)
-    logging.info("game_markets_matched:    %d", total_game_matched)
-    logging.info("game_snapshots:          %d", total_game_snaps)
-    logging.info("outright_markets:        %d", total_outright_mrkts)
-    logging.info("outright_snapshots:      %d", total_outright_snaps)
-    logging.info("total_markets_ingested:  %d", total_markets)
-    logging.info("total_snapshots_ingested:%d", total_snaps)
-    logging.info("consensus_markets:       %d", consensus_markets)
-    logging.info("consensus_rows_updated:  %d", consensus_rows)
-    logging.info("consensus_coverage:      %d/%d snapshots (%d slugs)",
-                 coverage["with_consensus"], coverage["total"],
-                 coverage["slugs_with_consensus"])
-    logging.info("errors:                  %d", errors)
+    run_ingest(
+        start_dt, end_dt, leagues,
+        include_nba_outrights=args.include_nba_outrights,
+        consensus_window_days=args.consensus_window_days,
+        skip_consensus=args.skip_consensus,
+    )
 
 
 if __name__ == "__main__":

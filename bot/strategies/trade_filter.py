@@ -19,6 +19,8 @@ LEAGUE_MIN_EDGE = {
     "epl": 0.05,
     "nfl": 0.05,
     "mlb": 0.05,
+    "wnba": 0.05,   # thinner books, less efficient than NBA
+    "mls": 0.05,
     "ufc": 0.06,
 }
 DEFAULT_MIN_EDGE = 0.05

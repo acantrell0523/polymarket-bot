@@ -358,6 +358,33 @@ class Supervisor:
                 )
 
     # ------------------------------------------------------------------
+    # Daily data recorder — builds the historical dataset forward
+    # ------------------------------------------------------------------
+
+    def daily_data_recorder(self):
+        """Record yesterday's + today's games across all registered leagues.
+
+        The bot is focused on sports happening NOW; this job makes the
+        historical dataset (prices + sportsbook consensus) accumulate forward
+        automatically — no manual backfills. Off-season leagues return zero
+        games and cost one HTTP call each. Failures are logged, never fatal.
+        """
+        try:
+            import datetime as _dt
+            from scripts.ingest_historical import run_ingest
+            from bot.leagues import all_league_codes
+
+            today = _dt.datetime.now(_dt.timezone.utc).date()
+            totals = run_ingest(
+                start_dt=today - _dt.timedelta(days=1),
+                end_dt=today,
+                leagues=all_league_codes(),
+            )
+            self.logger.info("daily_data_recorder_complete", totals)
+        except Exception as e:
+            self.logger.error("daily_data_recorder_failed", {"error": str(e)})
+
+    # ------------------------------------------------------------------
     # Trading-loop liveness (heartbeat written by TradingBot every cycle)
     # ------------------------------------------------------------------
 
@@ -605,6 +632,14 @@ class Supervisor:
             minutes=5,
             id="heartbeat_check",
             name="Trading Loop Heartbeat Check",
+        )
+
+        scheduler.add_job(
+            self.daily_data_recorder,
+            CronTrigger(hour=5, minute=30),
+            id="daily_data_recorder",
+            name="Daily Data Recorder (current sports)",
+            misfire_grace_time=3600,
         )
 
         def shutdown(sig, frame):

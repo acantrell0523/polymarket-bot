@@ -2871,7 +2871,7 @@ class TestConsensusBackfillEndToEnd:
         import scripts.ingest_historical as ih
         monkeypatch.setattr(
             ih, "fetch_espn_pickcenter",
-            lambda session, espn_id, last_call: (
+            lambda session, espn_id, last_call, league="nba": (
                 [{"homeTeamOdds": {"moneyLine": -150},
                   "awayTeamOdds": {"moneyLine": 130}}],
                 last_call,
@@ -2907,7 +2907,7 @@ class TestConsensusBackfillEndToEnd:
         import scripts.ingest_historical as ih
         monkeypatch.setattr(
             ih, "fetch_espn_pickcenter",
-            lambda session, espn_id, last_call: ([], last_call),
+            lambda session, espn_id, last_call, league="nba": ([], last_call),
         )
         market_row = dict(conn.execute(
             "SELECT * FROM historical_markets").fetchone())
@@ -2916,3 +2916,112 @@ class TestConsensusBackfillEndToEnd:
         conn.close()
         assert n == 0
         assert get_consensus_coverage(db)["with_consensus"] == 0
+
+
+# ============================================================================
+# Current-sports focus: league registry, schedule coverage, multi-league ingest
+# ============================================================================
+
+from bot.leagues import (
+    LEAGUES, all_league_codes, scoreboard_url, summary_url,
+    game_seconds_remaining,
+)
+from scripts.ingest_historical import candidate_slugs, prune_leagues
+
+
+class TestLeagueRegistry:
+    def test_summer_sports_registered(self):
+        """The bot must track sports in season NOW (July): MLB, WNBA, MLS."""
+        for league in ("mlb", "wnba", "mls"):
+            assert league in LEAGUES
+            assert scoreboard_url(league).startswith("https://site.api.espn.com/")
+            assert summary_url(league).endswith("/summary")
+
+    def test_winter_sports_still_registered_for_when_seasons_return(self):
+        # Auto-reactivation: ESPN returns games again when seasons start,
+        # so these stay registered — off-season they return zero games.
+        for league in ("nba", "nhl", "nfl", "cbb", "epl"):
+            assert league in LEAGUES
+
+    def test_every_league_has_odds_api_key(self):
+        from bot.signals.odds_api import SPORT_MAP, ESPN_ODDS_ENDPOINTS
+        for code, info in LEAGUES.items():
+            assert SPORT_MAP.get(code) == info["odds_api_key"]
+            assert info["odds_api_key"] in ESPN_ODDS_ENDPOINTS
+
+    def test_game_clock_wnba(self):
+        # WNBA: 4x10min. In Q2 with 5:00 left: 2 future quarters + 300s
+        assert game_seconds_remaining("wnba", period=2, clock_seconds=300) == \
+            2 * 600 + 300
+
+    def test_game_clock_soccer_counts_up(self):
+        # MLS: 90 min total, clock counts up. 80 minutes elapsed -> 600s left
+        assert game_seconds_remaining("mls", period=2, clock_seconds=80 * 60) == 600
+
+    def test_game_clock_baseball_is_none(self):
+        # No clock in baseball — last-5-minutes block must not apply
+        assert game_seconds_remaining("mlb", period=7, clock_seconds=0) is None
+
+    def test_game_clock_unknown_league_is_none(self):
+        assert game_seconds_remaining("cricket", period=1, clock_seconds=0) is None
+
+    def test_game_schedule_watches_all_registered_leagues(self):
+        """Regression: GameSchedule previously watched only NBA/NCAA/NHL —
+        all off-season in July — so the live bot slept all summer."""
+        from bot.game_schedule import ESPN_ENDPOINTS
+        for league in LEAGUES:
+            assert league in ESPN_ENDPOINTS
+            assert ESPN_ENDPOINTS[league]
+
+
+class TestMultiLeagueIngest:
+    def test_candidate_slugs_mlb(self):
+        game = {"league": "mlb", "away_abbr": "nyy", "home_abbr": "bos",
+                "date": "20260705"}
+        slugs = candidate_slugs(game)
+        assert slugs[0] == "aec-mlb-nyy-bos-2026-07-05"
+
+    def test_candidate_slugs_nba_abbr_map_applied(self):
+        game = {"league": "nba", "away_abbr": "gs", "home_abbr": "ny",
+                "date": "20261101"}
+        slugs = candidate_slugs(game)
+        assert slugs[0] == "aec-nba-gsw-nyk-2026-11-01"
+        assert "aec-nba-gs-ny-2026-11-01" in slugs  # raw fallback
+
+    def test_candidate_slugs_soccer_uses_atc_family(self):
+        game = {"league": "mls", "away_abbr": "lafc", "home_abbr": "sea",
+                "date": "20260705"}
+        slugs = candidate_slugs(game)
+        assert slugs[0] == "atc-mls-lafc-sea-2026-07-05-lafc"
+        assert "atc-mls-lafc-sea-2026-07-05-sea" in slugs
+
+    def test_prune_leagues_removes_only_targeted_league(self, tmp_path):
+        db = str(tmp_path / "hist.db")
+        _hist_init_tables(db)
+        conn = _hist_get_conn(db)
+        _hist_upsert_market(conn, {"slug": "aec-nba-atl-hou-2025-01-05",
+                                   "league": "nba", "market_type": "moneyline_game"})
+        _hist_upsert_market(conn, {"slug": "will-the-celtics-win-the-2026-nba-finals",
+                                   "league": "NBA", "market_type": "nba_outright"})
+        _hist_upsert_market(conn, {"slug": "aec-mlb-nyy-bos-2026-07-04",
+                                   "league": "mlb", "market_type": "moneyline_game"})
+        _hist_upsert_snapshots(conn, "aec-nba-atl-hou-2025-01-05", [{"t": 0, "p": 0.5}])
+        _hist_upsert_snapshots(conn, "aec-mlb-nyy-bos-2026-07-04", [{"t": 0, "p": 0.6}])
+        conn.commit()
+
+        m_del, s_del = prune_leagues(conn, ["nba"])
+        assert m_del == 2   # game market + outright
+        assert s_del == 1   # only the NBA snapshot
+
+        remaining = [r[0] for r in conn.execute(
+            "SELECT slug FROM historical_markets").fetchall()]
+        assert remaining == ["aec-mlb-nyy-bos-2026-07-04"]
+        snaps = conn.execute("SELECT COUNT(*) FROM historical_snapshots").fetchone()[0]
+        assert snaps == 1
+        conn.close()
+
+    def test_run_ingest_importable_by_supervisor(self):
+        """The supervisor's daily recorder job imports these at call time."""
+        from scripts.ingest_historical import run_ingest, DEFAULT_DAYS_BACK
+        assert callable(run_ingest)
+        assert DEFAULT_DAYS_BACK >= 1

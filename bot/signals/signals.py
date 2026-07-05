@@ -329,7 +329,11 @@ def sports_context_signal(
                       metadata={"reason": "unparseable_slug"})
 
     sport_abbr = parts[1]
-    sport_map = {"nba": "basketball_nba", "cbb": "basketball_ncaab"}
+    sport_map = {
+        "nba": "basketball_nba",
+        "cbb": "basketball_ncaab",
+        "wnba": "basketball_wnba",
+    }
     sport_key = sport_map.get(sport_abbr)
     if not sport_key:
         return Signal(name="sports_context", value=0.5, confidence=0.0, direction="neutral",

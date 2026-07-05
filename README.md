@@ -5,6 +5,14 @@ An autonomous Python bot for detecting and trading pricing inefficiencies on
 edge detection, fractional Kelly sizing, layered risk controls, full decision
 auditability, backtesting, and Slack observability.
 
+**Strictly focused on current sports.** A central league registry
+(`bot/leagues.py`) covers MLB, WNBA, MLS, NBA, NHL, NFL, NCAA basketball, and
+EPL; off-season leagues return zero games from ESPN and reactivate
+automatically when their seasons start — the bot always follows whatever is
+being played today. A daily recorder (supervisor job at 05:30 ET, or
+`python scripts/ingest_historical.py`) builds the backtest dataset forward
+from today: game prices plus de-vigged sportsbook consensus per game.
+
 > **Disclaimer:** This is for educational purposes only. Trading prediction
 > markets involves risk of loss. This is not financial advice. Use at your own
 > risk.

@@ -8,28 +8,28 @@ from typing import Dict, Optional, List, Tuple
 from datetime import datetime, timezone
 
 
-# Sport key mapping: Polymarket slug prefix → the-odds-api sport key
+from bot.leagues import LEAGUES as _LEAGUES, scoreboard_url as _scoreboard_url
+
+# Sport key mapping: Polymarket slug prefix → the-odds-api sport key.
+# Registry leagues first, plus European soccer leagues the-odds-api supports
+# but which have no ESPN scoreboard integration here.
 SPORT_MAP = {
-    "nba": "basketball_nba",
-    "nhl": "icehockey_nhl",
-    "cbb": "basketball_ncaab",
-    "epl": "soccer_epl",
-    "nfl": "americanfootball_nfl",
-    "mlb": "baseball_mlb",
-    "mls": "soccer_usa_mls",
+    code: info["odds_api_key"] for code, info in _LEAGUES.items()
+}
+SPORT_MAP.update({
     "laliga": "soccer_spain_la_liga",
     "bundesliga": "soccer_germany_bundesliga",
     "seriea": "soccer_italy_serie_a",
     "ligue1": "soccer_france_ligue_one",
-}
+})
 
-# ESPN API endpoints for fallback odds
+# ESPN API endpoints for fallback odds — derived from the central league
+# registry so every supported league (including summer sports: MLB, WNBA,
+# MLS) automatically gets the free ESPN fallback. Off-season leagues simply
+# return no events.
 ESPN_ODDS_ENDPOINTS = {
-    "basketball_nba": "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
-    "basketball_ncaab": "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard",
-    "icehockey_nhl": "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard",
-    "americanfootball_nfl": "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
-    "baseball_mlb": "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard",
+    info["odds_api_key"]: _scoreboard_url(code)
+    for code, info in _LEAGUES.items()
 }
 
 
