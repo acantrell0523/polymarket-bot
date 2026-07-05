@@ -23,7 +23,8 @@ of this document (sections below have been updated in place):
 | **Env-var config overrides** | Any scalar config value: `POLYBOT_<SECTION>__<FIELD>` (e.g. `POLYBOT_TRADING__PAPER_TRADING=false`). Applied after YAML. |
 | **Containerized** | `Dockerfile` + `docker-compose.yml` (bot + supervisor services, shared data volume, heartbeat-based healthcheck). |
 | **Cleanup** | Dead `bot/test_signals.py` deleted; dead subgraph URL removed from config; `apscheduler`/`python-dateutil` added to requirements (supervisor previously crashed on missing dep); expiry windows now config-driven (`filters.sports_window_hours` / `nonsports_window_days`); paper/live fee simulation reads `trading.taker_fee_rate`. |
-| **Tests** | 152 tests passing (was 107): net-edge math, log-odds pooling, fee-aware Kelly, spread/net-edge filters, onchain signal, env overrides, health monitor, decision log, historical odds cache, backtest-fires-trades integration. |
+| **Consensus backfill** | `scripts/ingest_historical.py` Phase 3 (+ standalone `--consensus-only` mode): ESPN pickcenter odds → de-vigged consensus → `historical_snapshots.espn_consensus_prob`, with YES-team inference and a closing-line lookahead guard (`--consensus-window-days`, default 3). See §10. |
+| **Tests** | 168 tests passing (was 107): net-edge math, log-odds pooling, fee-aware Kelly, spread/net-edge filters, onchain signal, env overrides, health monitor, decision log, historical odds cache, backtest-fires-trades integration, consensus backfill (de-vig math, YES-team inference, window guard, end-to-end into HistoricalOddsCache). |
 
 ---
 
@@ -121,7 +122,7 @@ polymarket-bot/
 │   ├── logger.py               # Structured JSON logger
 │   └── models.py               # Shared dataclasses (OrderBook, TradeSignal, Position…)
 ├── tests/
-│   └── test_core.py            # pytest suite — 152 tests, all passing
+│   └── test_core.py            # pytest suite — 168 tests, all passing
 ├── configs/config.yaml         # CANONICAL master configuration file (only config file)
 ├── .env.example                # Environment variable template
 ├── requirements.txt            # Python dependencies
@@ -628,7 +629,7 @@ Total combinations: 5 × 5 × (4 + 4) = 200. Results sorted by Sharpe ratio.
 
 Two new SQLite tables (`historical_markets`, `historical_snapshots`) in `data/trades.db` store historical NBA market data for backtesting. Data is ingested by `scripts/ingest_historical.py` from free public APIs (ESPN + Polymarket CLOB/Gamma).
 
-### Two-Phase Ingestion (`scripts/ingest_historical.py`)
+### Three-Phase Ingestion (`scripts/ingest_historical.py`)
 
 **Phase 1 — Game-by-game (ESPN scoreboard)**:
 1. For each date in `[--start, --end]`, fetch NBA games from ESPN scoreboard API
@@ -644,10 +645,22 @@ Two new SQLite tables (`historical_markets`, `historical_snapshots`) in `data/tr
 3. Fetch CLOB `prices-history` for each market's YES token
 4. Insert into both tables
 
-**Re-running is fully idempotent**: uses `INSERT OR IGNORE` throughout. Timestamps are bucketed to UTC day boundaries (floor to 86400 s) before insert, so the `UNIQUE(slug, timestamp, source)` constraint catches duplicates even when the CLOB API returns slightly different intra-day timestamps across runs. This idempotency is verified by a regression test (`TestHistoricalDB.test_ingest_idempotency`).
+**Phase 3 — Consensus backfill (ESPN pickcenter)** — populates `espn_consensus_prob`, which `HistoricalOddsCache.from_db()` serves to the backtest's external validation gate:
+1. For every `moneyline_game` market with an `espn_game_id` (including ones ingested on previous runs), fetch the ESPN game **summary** endpoint's `pickcenter` block (free; retained for past games)
+2. Per provider: de-vig home/away moneylines into a win probability (normalize so they sum to 1); fall back to the point spread via the same calibrated logistic the live bot uses (ESPN's `spread` is the home spread, negative = favored — sign is flipped)
+3. Average across providers → consensus; provider count → `num_books`
+4. Infer which team the market's YES token refers to, strongest evidence first: (a) settled winner + decisive final price (≥0.75/≤0.25) — the data itself says which side YES was; (b) first team nickname mentioned in the question; (c) slug convention fallback (`aec-nba-{away}-{home}` → away)
+5. `UPDATE` `espn_consensus_prob`/`num_books` on snapshots within `--consensus-window-days` (default 3) before game start through 1 day after. **The pickcenter line is the closing line** — stamping it onto much older snapshots would leak tip-off-time information into the backtest, so earlier snapshots keep 0 (lookahead guard). Outrights have no consensus source and stay gated.
+
+**Re-running is fully idempotent**: `INSERT OR IGNORE` for price phases, plain `UPDATE` for the consensus backfill. Timestamps are bucketed to UTC day boundaries (floor to 86400 s) before insert, so the `UNIQUE(slug, timestamp, source)` constraint catches duplicates even when the CLOB API returns slightly different intra-day timestamps across runs. Verified by regression tests (`TestHistoricalDB.test_ingest_idempotency`, `TestUpdateSnapshotConsensus.test_rerun_is_idempotent`).
 
 ```bash
 python scripts/ingest_historical.py --start 2026-01-01 --end 2026-05-04
+
+# Backfill consensus for an already-populated database (no re-ingest):
+python scripts/ingest_historical.py --consensus-only
+
+# Options: --consensus-window-days N (default 3), --skip-consensus
 ```
 
 ### Current State of the Historical Database
@@ -846,8 +859,10 @@ decision_log
 historical_snapshots
   id, slug, timestamp,         -- timestamp is UTC day boundary (unix epoch)
   polymarket_price,            -- CLOB daily close price, clamped [0.01, 0.99]
-  espn_consensus_prob,         -- 0.0 for CLOB-sourced data (not yet populated)
-  num_books,                   -- 0 for CLOB-sourced data
+  espn_consensus_prob,         -- de-vigged sportsbook consensus for the YES
+                               --   outcome (populated by ingest Phase 3;
+                               --   0.0 = no consensus available)
+  num_books,                   -- pickcenter provider count (0 = no consensus)
   source,                      -- "clob_prices_history"
   trade_size_usd               -- 0.0 for CLOB-sourced data
   UNIQUE(slug, timestamp, source)
@@ -861,10 +876,10 @@ historical_snapshots
 
 ### ✅ Working
 
-- **Test suite** — 152 tests passing in `tests/test_core.py`. Run `pytest tests/test_core.py`. Covers: order book, signals, market type detection, probability estimator, validate_trade, position sizing, risk manager, portfolio, data generation, backtest engine, config, exit telemetry, live-loop let_it_ride safety, historical DB schema + idempotency, DB loader, exit proximity computation, and the analyze_exits script.
+- **Test suite** — 168 tests passing in `tests/test_core.py`. Run `pytest tests/test_core.py`. Covers: order book, signals, market type detection, probability estimator, validate_trade, position sizing, risk manager, portfolio, data generation, backtest engine, config, exit telemetry, live-loop let_it_ride safety, historical DB schema + idempotency, DB loader, exit proximity computation, and the analyze_exits script.
 
   ```
-  ============================= 152 passed in 2.10s ==============================
+  ============================= 168 passed in 2.23s ==============================
   ```
 
 - **Live trading loop** — `TradingBot.run()` is the production path. Dual-speed scanning (3s live / 60s full), sniper trade selection, full validation checklist, position lifecycle.
@@ -897,7 +912,7 @@ historical_snapshots
 
 ### ❌ Current Gaps / Not Yet Working
 
-1. **Historical consensus data not yet ingested** — The backtest PIPELINE gap is closed (`HistoricalOddsCache` + engine/runner wiring, verified by tests), but the SQLite historical data still has `espn_consensus_prob = 0` for every CLOB-ingested row, so SQLite-backed backtests still block on the external validation gate (by design). **Next required piece**: extend `scripts/ingest_historical.py` to populate historical consensus probabilities (e.g. archived closing lines) into `historical_snapshots.espn_consensus_prob`. Synthetic backtests exercise the full pipeline in the meantime.
+1. **Consensus backfill not yet RUN against the live ESPN API** — The ingest script now populates `espn_consensus_prob` (Phase 3 / `--consensus-only`, see §10), and the logic is fully unit-tested against ESPN's documented `pickcenter` payload shape, but it has not yet been executed on a network with ESPN access (this dev environment's proxy blocks `site.api.espn.com`). Run `python scripts/ingest_historical.py --consensus-only` from a deployment host, then `python scripts/inspect_historical.py` to confirm coverage. Caveats: only game markets get consensus (outrights have no pickcenter source and stay gated — the currently-ingested 2026 data is outrights-only, so a meaningful sports backtest also needs Phase 1 game data from 2024–25 dates, see gap #2); ESPN may carry few providers per historical game (`num_books` is clamped to ≥2 by `HistoricalOddsCache.from_db`, and the "3 books for >7% edges" rule still applies).
 
 2. **No game-level NBA Polymarket markets for 2026 playoffs** — Polymarket is only listing season-long outrights (Finals winner, MVP, Conference champion) for the current playoff window, not individual game moneylines. The `aec-nba-*` pattern in `scripts/ingest_historical.py` Phase 1 finds 0 matches for 2026 dates. Backtest data for individual game markets requires going back to 2024–25 regular season dates.
 

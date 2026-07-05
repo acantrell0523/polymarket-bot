@@ -150,6 +150,58 @@ def upsert_snapshots(
     return inserted
 
 
+def update_snapshot_consensus(
+    conn: sqlite3.Connection,
+    slug: str,
+    consensus_prob: float,
+    num_books: int,
+    start_ts: Optional[int] = None,
+    end_ts: Optional[int] = None,
+) -> int:
+    """Set espn_consensus_prob / num_books on existing snapshot rows.
+
+    Only touches rows whose timestamp falls in [start_ts, end_ts] when a
+    window is given — used to restrict a closing-line consensus value to the
+    days immediately around the game, limiting lookahead into earlier
+    snapshots. UPDATE is naturally idempotent, so re-running a backfill is
+    safe. Returns the number of rows updated.
+    """
+    query = (
+        "UPDATE historical_snapshots "
+        "SET espn_consensus_prob = ?, num_books = ? "
+        "WHERE slug = ?"
+    )
+    params: List[Any] = [float(consensus_prob), int(num_books), slug]
+    if start_ts is not None:
+        query += " AND timestamp >= ?"
+        params.append(int(start_ts))
+    if end_ts is not None:
+        query += " AND timestamp <= ?"
+        params.append(int(end_ts))
+    cur = conn.execute(query, params)
+    return cur.rowcount
+
+
+def get_consensus_coverage(db_path: Optional[str] = None) -> Dict[str, int]:
+    """How many snapshots have a real consensus value (backtest-gate ready)."""
+    conn = get_conn(db_path)
+    row = conn.execute(
+        """
+        SELECT
+            COUNT(*)                                            AS total,
+            SUM(CASE WHEN espn_consensus_prob > 0 THEN 1 ELSE 0 END) AS with_consensus,
+            COUNT(DISTINCT CASE WHEN espn_consensus_prob > 0 THEN slug END) AS slugs_with_consensus
+        FROM historical_snapshots
+        """
+    ).fetchone()
+    conn.close()
+    return {
+        "total": row["total"] or 0,
+        "with_consensus": row["with_consensus"] or 0,
+        "slugs_with_consensus": row["slugs_with_consensus"] or 0,
+    }
+
+
 # ── Read helpers (used by inspect_historical.py and tests) ────────────────────
 
 def get_all_markets(db_path: Optional[str] = None) -> List[Dict[str, Any]]:

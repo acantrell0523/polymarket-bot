@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from data.historical_db import (
     get_all_markets,
+    get_consensus_coverage,
     get_games_by_date,
     get_sample_snapshots,
     get_settled_outcome_distribution,
@@ -67,6 +68,12 @@ def main() -> None:
     print(f"  nba_outright         : {len(outright_markets)}")
     print(f"  other                : {total_markets - len(game_markets) - len(outright_markets)}")
     print(f"Total snapshots        : {total_snapshots}")
+    coverage = get_consensus_coverage()
+    print(f"Consensus coverage     : {coverage['with_consensus']}/{coverage['total']} "
+          f"snapshots across {coverage['slugs_with_consensus']} markets")
+    if coverage["with_consensus"] == 0 and total_snapshots > 0:
+        print("  → backtests will fire 0 sports trades (external validation gate).")
+        print("    Run: python scripts/ingest_historical.py --consensus-only")
     print()
 
     # ── 2. Game count by date ─────────────────────────────────────────────────

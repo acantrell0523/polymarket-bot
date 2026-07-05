@@ -2677,3 +2677,242 @@ class TestBacktestWithHistoricalOdds:
         engine = BacktestEngine(config, odds_cache=None)
         result = engine.run(markets)
         assert result.total_trades == 0
+
+
+# ============================================================================
+# Historical consensus backfill (scripts/ingest_historical.py Phase 3)
+# ============================================================================
+
+from data.historical_db import (
+    init_tables as _hist_init_tables,
+    get_conn as _hist_get_conn,
+    upsert_historical_market as _hist_upsert_market,
+    upsert_snapshots as _hist_upsert_snapshots,
+    update_snapshot_consensus,
+    get_consensus_coverage,
+)
+from scripts.ingest_historical import (
+    compute_consensus_from_pickcenter,
+    infer_yes_team,
+    backfill_consensus_for_market,
+    _parse_game_start_ts,
+)
+
+
+class TestConsensusComputation:
+    def test_moneyline_devig(self):
+        """Home -200 / away +170: raw implied probs sum > 1; devig must
+        normalize them so p_home + p_away == 1."""
+        pickcenter = [{
+            "provider": {"name": "Book A"},
+            "homeTeamOdds": {"moneyLine": -200},
+            "awayTeamOdds": {"moneyLine": 170},
+        }]
+        result = compute_consensus_from_pickcenter(pickcenter)
+        assert result is not None
+        p_home, p_away, books = result
+        # raw: home 0.6667, away 0.3704 -> devig home = 0.6667/1.0371 = 0.6429
+        assert p_home == pytest.approx(0.6429, abs=0.001)
+        assert p_home + p_away == pytest.approx(1.0)
+        assert books == 1
+
+    def test_multiple_providers_averaged(self):
+        pickcenter = [
+            {"homeTeamOdds": {"moneyLine": -110}, "awayTeamOdds": {"moneyLine": -110}},
+            {"homeTeamOdds": {"moneyLine": -200}, "awayTeamOdds": {"moneyLine": 170}},
+        ]
+        result = compute_consensus_from_pickcenter(pickcenter)
+        p_home, _, books = result
+        assert books == 2
+        # provider 1 devigs to exactly 0.50; provider 2 to ~0.643 -> mean ~0.571
+        assert p_home == pytest.approx((0.5 + 0.6429) / 2, abs=0.002)
+
+    def test_spread_fallback_sign_convention(self):
+        """ESPN spread is the HOME spread (negative = home favored) — a
+        home-favored -7.5 line must give p_home > 0.5."""
+        pickcenter = [{"spread": -7.5}]
+        p_home, p_away, books = compute_consensus_from_pickcenter(pickcenter)
+        assert p_home > 0.6
+        assert books == 1
+
+    def test_moneyline_preferred_over_spread(self):
+        """When a provider has both, the moneyline must win (spread would
+        give a very different number here)."""
+        pickcenter = [{
+            "homeTeamOdds": {"moneyLine": -110},
+            "awayTeamOdds": {"moneyLine": -110},
+            "spread": -12.5,
+        }]
+        p_home, _, _ = compute_consensus_from_pickcenter(pickcenter)
+        assert p_home == pytest.approx(0.50, abs=0.001)
+
+    def test_empty_or_junk_returns_none(self):
+        assert compute_consensus_from_pickcenter([]) is None
+        assert compute_consensus_from_pickcenter([{"provider": {"name": "x"}}]) is None
+        assert compute_consensus_from_pickcenter(["not-a-dict"]) is None
+
+
+class TestInferYesTeam:
+    def test_decisive_price_and_winner_agree(self):
+        # Home won, final price ~1 -> YES was the home team
+        assert infer_yes_team("", "Houston Rockets", "Atlanta Hawks",
+                              settled_outcome="home", last_price=0.97) == "home"
+
+    def test_decisive_price_and_winner_disagree(self):
+        # Home won but the market resolved to ~0 -> YES was the away team
+        assert infer_yes_team("", "Houston Rockets", "Atlanta Hawks",
+                              settled_outcome="home", last_price=0.03) == "away"
+
+    def test_indecisive_price_falls_through_to_question(self):
+        # last price 0.5 tells us nothing; question subject must decide
+        assert infer_yes_team("Will the Atlanta Hawks beat the Houston Rockets?",
+                              "Houston Rockets", "Atlanta Hawks",
+                              settled_outcome="home", last_price=0.50) == "away"
+
+    def test_question_first_mention_home(self):
+        assert infer_yes_team("Will the Rockets beat the Hawks?",
+                              "Houston Rockets", "Atlanta Hawks") == "home"
+
+    def test_default_is_away(self):
+        # No scores, no matching names in question -> slug convention (away first)
+        assert infer_yes_team("", "Houston Rockets", "Atlanta Hawks") == "away"
+
+    def test_parse_game_start_ts(self):
+        ts = _parse_game_start_ts("2025-01-16T00:30Z")
+        assert ts == int(datetime(2025, 1, 16, 0, 30, tzinfo=timezone.utc).timestamp())
+        assert _parse_game_start_ts("") is None
+        assert _parse_game_start_ts("garbage") is None
+
+
+class TestUpdateSnapshotConsensus:
+    def _make_db(self, tmp_path):
+        db = str(tmp_path / "hist.db")
+        _hist_init_tables(db)
+        conn = _hist_get_conn(db)
+        # 5 daily snapshots: days 0..4 (86400s apart)
+        history = [{"t": day * 86400, "p": 0.5 + day * 0.01} for day in range(5)]
+        _hist_upsert_snapshots(conn, "aec-nba-atl-hou-2025-01-05", history)
+        conn.commit()
+        return db, conn
+
+    def test_windowed_update_only_touches_window(self, tmp_path):
+        db, conn = self._make_db(tmp_path)
+        n = update_snapshot_consensus(
+            conn, "aec-nba-atl-hou-2025-01-05", 0.62, 3,
+            start_ts=2 * 86400, end_ts=3 * 86400,
+        )
+        conn.commit()
+        assert n == 2  # days 2 and 3 only
+        rows = conn.execute(
+            "SELECT timestamp, espn_consensus_prob, num_books "
+            "FROM historical_snapshots ORDER BY timestamp"
+        ).fetchall()
+        by_day = {r["timestamp"] // 86400: r for r in rows}
+        assert by_day[1]["espn_consensus_prob"] == 0
+        assert by_day[2]["espn_consensus_prob"] == pytest.approx(0.62)
+        assert by_day[3]["num_books"] == 3
+        assert by_day[4]["espn_consensus_prob"] == 0
+        conn.close()
+
+    def test_rerun_is_idempotent(self, tmp_path):
+        db, conn = self._make_db(tmp_path)
+        for _ in range(2):
+            n = update_snapshot_consensus(conn, "aec-nba-atl-hou-2025-01-05", 0.62, 3)
+            conn.commit()
+            assert n == 5  # UPDATE touches the same rows, never duplicates
+        total = conn.execute("SELECT COUNT(*) FROM historical_snapshots").fetchone()[0]
+        assert total == 5
+        conn.close()
+
+    def test_coverage_helper(self, tmp_path):
+        db, conn = self._make_db(tmp_path)
+        update_snapshot_consensus(conn, "aec-nba-atl-hou-2025-01-05", 0.62, 3,
+                                  start_ts=3 * 86400)
+        conn.commit()
+        conn.close()
+        cov = get_consensus_coverage(db)
+        assert cov["total"] == 5
+        assert cov["with_consensus"] == 2   # days 3 and 4
+        assert cov["slugs_with_consensus"] == 1
+
+
+class TestConsensusBackfillEndToEnd:
+    GAME_DAY = 4 * 86400  # game starts on day 4
+
+    def _seed_market(self, tmp_path):
+        """Temp DB with one game market + 5 daily snapshots ending at ~0.95
+        (home team won and YES resolved toward 1 -> YES = home)."""
+        db = str(tmp_path / "hist.db")
+        _hist_init_tables(db)
+        conn = _hist_get_conn(db)
+        _hist_upsert_market(conn, {
+            "slug": "aec-nba-atl-hou-2025-01-05",
+            "market_id": "123",
+            "question": "",                      # force data-driven inference
+            "home_team": "Houston Rockets",
+            "away_team": "Atlanta Hawks",
+            "espn_game_id": "401", 
+            "settled_outcome": "home",
+            "market_type": "moneyline_game",
+            "game_start_time": datetime.fromtimestamp(
+                self.GAME_DAY, tz=timezone.utc).isoformat(),
+            "token_id_0": "t0",
+        })
+        history = [{"t": day * 86400, "p": p}
+                   for day, p in enumerate([0.55, 0.58, 0.60, 0.70, 0.95])]
+        _hist_upsert_snapshots(conn, "aec-nba-atl-hou-2025-01-05", history)
+        conn.commit()
+        return db, conn
+
+    def test_backfill_writes_consensus_and_feeds_odds_cache(self, tmp_path, monkeypatch):
+        db, conn = self._seed_market(tmp_path)
+
+        # Fake ESPN summary: home favored -150/+130
+        import scripts.ingest_historical as ih
+        monkeypatch.setattr(
+            ih, "fetch_espn_pickcenter",
+            lambda session, espn_id, last_call: (
+                [{"homeTeamOdds": {"moneyLine": -150},
+                  "awayTeamOdds": {"moneyLine": 130}}],
+                last_call,
+            ),
+        )
+
+        market_row = dict(conn.execute(
+            "SELECT * FROM historical_markets").fetchone())
+        n, _ = backfill_consensus_for_market(
+            None, conn, market_row, window_days=3, last_call=0.0)
+
+        # window = [day1 .. day5]; day0 snapshot stays untouched (lookahead guard)
+        assert n == 4
+        rows = conn.execute(
+            "SELECT timestamp, espn_consensus_prob FROM historical_snapshots "
+            "ORDER BY timestamp").fetchall()
+        assert rows[0]["espn_consensus_prob"] == 0
+        # YES inferred as HOME (settled home + final price 0.95),
+        # devig(-150/+130): p_home = 0.6/(0.6+0.4348) = 0.5798
+        assert rows[-1]["espn_consensus_prob"] == pytest.approx(0.5798, abs=0.001)
+        conn.close()
+
+        # The consensus must now flow into the backtest's odds cache
+        cache = HistoricalOddsCache.from_db(db)
+        assert len(cache) == 4
+        cache.set_time(datetime.fromtimestamp(self.GAME_DAY, tz=timezone.utc))
+        prob, books = cache.get_probability_for_slug("aec-nba-atl-hou-2025-01-05")
+        assert prob == pytest.approx(0.5798, abs=0.001)
+        assert books >= 2
+
+    def test_backfill_no_pickcenter_leaves_zero(self, tmp_path, monkeypatch):
+        db, conn = self._seed_market(tmp_path)
+        import scripts.ingest_historical as ih
+        monkeypatch.setattr(
+            ih, "fetch_espn_pickcenter",
+            lambda session, espn_id, last_call: ([], last_call),
+        )
+        market_row = dict(conn.execute(
+            "SELECT * FROM historical_markets").fetchone())
+        n, _ = backfill_consensus_for_market(
+            None, conn, market_row, window_days=3, last_call=0.0)
+        conn.close()
+        assert n == 0
+        assert get_consensus_coverage(db)["with_consensus"] == 0

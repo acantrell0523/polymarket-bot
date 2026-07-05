@@ -46,8 +46,8 @@ def main():
         else:
             print(f"  NOTE: no historical consensus data (espn_consensus_prob) ingested;")
             print(f"        external validation gate will block sports trades. Zero")
-            print(f"        trades = gate working as designed. Ingest consensus data")
-            print(f"        to run a meaningful sports backtest.")
+            print(f"        trades = gate working as designed. To populate consensus:")
+            print(f"          python scripts/ingest_historical.py --consensus-only")
     else:
         market_data = load_historical_data(config.backtest.data_dir)
         if market_data is not None:
