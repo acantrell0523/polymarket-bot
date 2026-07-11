@@ -69,10 +69,11 @@ class ExecutionEngine:
 
         quantity = size_usd / price if price > 0 else 0
 
-        # Simulate fees at the configured taker rate (single source of truth
-        # shared with the net-edge calculation and Kelly sizing)
-        fee_rate = getattr(self.config, "taker_fee_rate", 0.02)
-        fees = size_usd * fee_rate
+        # Simulate fees on the US quadratic schedule, banker's-rounded like
+        # the exchange books them (single source: bot/strategies/fees.py)
+        from bot.strategies.fees import booked_fee_usd
+        coef = getattr(self.config, "taker_fee_coefficient", 0.06)
+        fees = booked_fee_usd(quantity, price, coef)
 
         trade = Trade(
             market_id=signal.market_id,

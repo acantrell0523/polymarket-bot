@@ -56,9 +56,10 @@ class PositionSizer:
         oversizes: Kelly is very sensitive to edge, and fees+spread eat 2-4
         points of it.
 
-        For a BUY of YES at cost c = ask*(1+fee):
+        Fees use the US quadratic schedule: fee/share = Θ·price·(1−price)
+        (bot/strategies/fees.py). For a BUY of YES at cost c = ask + fee:
             win  -> receive $1, profit (1-c) per share  =>  b = (1-c)/c
-        For a SELL (short YES) with proceeds c = bid*(1-fee), the bet risks
+        For a SELL (short YES) with proceeds c = bid - fee, the bet risks
         (1-c) per share to win c, and wins with probability q = 1-p:
             b = c/(1-c), win probability = 1-p
 
@@ -66,19 +67,25 @@ class PositionSizer:
         scales down f* because our p estimate is noisy — full Kelly on an
         overestimated edge is how bankrolls die.
         """
+        from bot.strategies.fees import fee_per_contract
+
         p = signal.estimated_prob
-        fee = signal.fee_rate if signal.fee_rate > 0 else getattr(self.config, "taker_fee_rate", 0.0)
+        # signal.fee_rate carries the quadratic fee COEFFICIENT (Θ),
+        # set by compute_edge_breakdown.
+        coef = signal.fee_rate if signal.fee_rate > 0 else getattr(
+            self.config, "taker_fee_coefficient", 0.06)
         exec_price = signal.exec_price if signal.exec_price > 0 else signal.market_price
 
         if exec_price <= 0 or exec_price >= 1:
             return 0.0
 
+        fee_share = fee_per_contract(exec_price, coef)
         if signal.side == "buy":
-            cost = min(exec_price * (1 + fee), 0.999)  # $ per share
+            cost = min(exec_price + fee_share, 0.999)  # $ per share incl. fee
             win_prob = p
         else:
             # Short YES: proceeds per share after fee; risk is (1-cost) to win cost.
-            cost = max(exec_price * (1 - fee), 0.001)
+            cost = max(exec_price - fee_share, 0.001)
             win_prob = 1 - p
 
         if signal.side == "buy":

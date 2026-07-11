@@ -2233,24 +2233,27 @@ class TestEdgeBreakdown:
 
     def test_buy_net_edge_charges_spread_and_fee(self):
         # p=0.60, mid=0.50 -> gross edge 0.10
-        # exec at ask 0.52, fee 2%: net = 0.60 - 0.52*1.02 = 0.0696
+        # exec at ask 0.52; quadratic fee/share = 0.06*0.52*0.48 = 0.014976
+        # net = 0.60 - (0.52 + 0.014976) = 0.065024
         snap = self._snapshot()
-        bd = compute_edge_breakdown(0.60, snap, "buy", fee_rate=0.02)
+        bd = compute_edge_breakdown(0.60, snap, "buy", fee_coefficient=0.06)
         assert bd.gross_edge == pytest.approx(0.10)
         assert bd.exec_price == pytest.approx(0.52)
-        assert bd.net_edge == pytest.approx(0.60 - 0.52 * 1.02)
+        assert bd.net_edge == pytest.approx(0.60 - 0.52 - 0.06 * 0.52 * 0.48)
         assert bd.net_edge < bd.gross_edge
 
     def test_sell_net_edge(self):
-        # p=0.40, sell at bid 0.48, fee 2%: net = 0.48*0.98 - 0.40 = 0.0704
+        # p=0.40, sell at bid 0.48; fee/share = 0.06*0.48*0.52 = 0.014976
+        # net = (0.48 - 0.014976) - 0.40 = 0.065024
         snap = self._snapshot()
-        bd = compute_edge_breakdown(0.40, snap, "sell", fee_rate=0.02)
-        assert bd.net_edge == pytest.approx(0.48 * 0.98 - 0.40)
+        bd = compute_edge_breakdown(0.40, snap, "sell", fee_coefficient=0.06)
+        assert bd.net_edge == pytest.approx(0.48 - 0.06 * 0.48 * 0.52 - 0.40)
 
     def test_marginal_gross_edge_goes_negative_net(self):
-        # 3% gross edge on a 4-cent-wide book with 2% fee is NOT tradeable
+        # 3% gross edge on a 4-cent-wide book with the quadratic fee is NOT
+        # tradeable: net = 0.53 - 0.52 - 0.06*0.52*0.48 = -0.005
         snap = self._snapshot()
-        bd = compute_edge_breakdown(0.53, snap, "buy", fee_rate=0.02)
+        bd = compute_edge_breakdown(0.53, snap, "buy", fee_coefficient=0.06)
         assert bd.gross_edge == pytest.approx(0.03)
         assert bd.net_edge < 0
 
@@ -2317,9 +2320,9 @@ class TestLogOddsPooling:
 
 class TestFeeAwareKelly:
     def test_fee_reduces_kelly_size(self):
-        cfg_free = TradingConfig(position_sizing_method="kelly", taker_fee_rate=0.0,
+        cfg_free = TradingConfig(position_sizing_method="kelly", taker_fee_coefficient=0.0,
                                  max_position_size_usd=10000, max_portfolio_exposure_usd=10000)
-        cfg_fee = TradingConfig(position_sizing_method="kelly", taker_fee_rate=0.05,
+        cfg_fee = TradingConfig(position_sizing_method="kelly", taker_fee_coefficient=0.20,
                                 max_position_size_usd=10000, max_portfolio_exposure_usd=10000)
         signal = TradeSignal(
             market_id="m", token_id="t", side="buy",
@@ -2331,7 +2334,7 @@ class TestFeeAwareKelly:
         assert size_fee < size_free
 
     def test_kelly_uses_exec_price_when_set(self):
-        cfg = TradingConfig(position_sizing_method="kelly", taker_fee_rate=0.0,
+        cfg = TradingConfig(position_sizing_method="kelly", taker_fee_coefficient=0.0,
                             max_position_size_usd=10000, max_portfolio_exposure_usd=10000)
         cheap = TradeSignal(market_id="m", token_id="t", side="buy",
                             estimated_prob=0.60, market_price=0.50,
@@ -2343,8 +2346,9 @@ class TestFeeAwareKelly:
         assert sizer.size_position(expensive, 1000, 0) < sizer.size_position(cheap, 1000, 0)
 
     def test_negative_net_edge_sizes_zero(self):
-        """A trade whose costs exceed the edge must get zero Kelly size."""
-        cfg = TradingConfig(position_sizing_method="kelly", taker_fee_rate=0.10,
+        """A trade whose costs exceed the edge must get zero Kelly size.
+        coef 0.10 at price 0.50 -> fee/share 0.025 > the 0.02 edge."""
+        cfg = TradingConfig(position_sizing_method="kelly", taker_fee_coefficient=0.10,
                             max_position_size_usd=10000, max_portfolio_exposure_usd=10000)
         signal = TradeSignal(market_id="m", token_id="t", side="buy",
                              estimated_prob=0.52, market_price=0.50,
@@ -2352,7 +2356,7 @@ class TestFeeAwareKelly:
         assert PositionSizer(cfg).size_position(signal, 1000, 0) == 0.0
 
     def test_sell_side_kelly_positive_for_overpriced_market(self):
-        cfg = TradingConfig(position_sizing_method="kelly", taker_fee_rate=0.02,
+        cfg = TradingConfig(position_sizing_method="kelly", taker_fee_coefficient=0.06,
                             max_position_size_usd=10000, max_portfolio_exposure_usd=10000)
         signal = TradeSignal(market_id="m", token_id="t", side="sell",
                              estimated_prob=0.40, market_price=0.55,
@@ -3038,3 +3042,139 @@ class TestMultiLeagueIngest:
         from scripts.ingest_historical import run_ingest, DEFAULT_DAYS_BACK
         assert callable(run_ingest)
         assert DEFAULT_DAYS_BACK >= 1
+
+
+# ============================================================================
+# Polymarket US fee schedule (bot/strategies/fees.py)
+# ============================================================================
+
+from bot.strategies.fees import (
+    fee_per_contract, fee_usd, booked_fee_usd,
+    TAKER_FEE_COEFFICIENT, MAKER_REBATE_COEFFICIENT,
+)
+
+
+class TestFeeSchedule:
+    def test_documented_taker_cap(self):
+        """docs.polymarket.us/fees: taker fee tops out at $1.50 per 100
+        contracts at p=$0.50."""
+        assert fee_usd(100, 0.50) == pytest.approx(1.50)
+
+    def test_documented_maker_rebate_cap(self):
+        """Maker rebate tops out at ~$0.31 per 100 contracts at p=$0.50."""
+        rebate = fee_usd(100, 0.50, MAKER_REBATE_COEFFICIENT)
+        assert rebate == pytest.approx(-0.3125)
+
+    def test_symmetric_around_half(self):
+        assert fee_per_contract(0.30) == pytest.approx(fee_per_contract(0.70))
+        assert fee_per_contract(0.10) == pytest.approx(fee_per_contract(0.90))
+
+    def test_shrinks_toward_extremes(self):
+        assert fee_per_contract(0.90) < fee_per_contract(0.70) < fee_per_contract(0.50)
+
+    def test_much_cheaper_than_flat_2pct_for_favorites(self):
+        """The old flat 2%-of-notional model overcharged favorites: at p=0.90
+        the real fee is 0.0054/share (0.6% of notional), not 1.8c."""
+        real = fee_per_contract(0.90)
+        flat = 0.02 * 0.90
+        assert real == pytest.approx(0.06 * 0.90 * 0.10)
+        assert real < flat / 3
+
+    def test_price_clamped(self):
+        assert fee_per_contract(0.0) == fee_per_contract(0.01)
+        assert fee_per_contract(1.0) == fee_per_contract(0.99)
+
+    def test_booked_fee_rounds_to_whole_cents(self):
+        """Booked fees land on whole cents, within half a cent of raw."""
+        assert booked_fee_usd(10, 0.50) == pytest.approx(0.15)
+        for contracts, price in ((7, 0.37), (23.5, 0.61), (2.5, 0.44)):
+            raw = fee_usd(contracts, price)
+            booked = booked_fee_usd(contracts, price)
+            assert abs(booked - raw) <= 0.005 + 1e-9
+            assert booked == pytest.approx(round(booked * 100) / 100)
+
+    def test_tiny_trade_rounds_to_zero(self):
+        """Docs: small trades can round to $0.00."""
+        assert booked_fee_usd(0.3, 0.50) == 0.0
+
+    def test_defaults_match_exchange(self):
+        assert TAKER_FEE_COEFFICIENT == 0.06
+        assert MAKER_REBATE_COEFFICIENT == -0.0125
+
+
+# ============================================================================
+# Market discovery pagination (audit blocker #1)
+# ============================================================================
+
+from bot.market_data import MarketDataClient
+from utils.config import APIConfig
+
+
+def _future_iso(hours):
+    return (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+
+
+class TestMarketPagination:
+    """Measured live 2026-07-11: 6,000+ active markets on the US gateway;
+    WNBA games first appear at offset ~2,500. A single 500-limit request
+    never saw a single tradeable game — discovery MUST paginate."""
+
+    def _client(self, pages_by_offset, page_size=2):
+        client = MarketDataClient(APIConfig(), logger=None)
+        calls = []
+
+        def fake_get(url, params=None):
+            calls.append(dict(params or {}))
+            offset = (params or {}).get("offset", 0)
+            return {"markets": pages_by_offset.get(offset, [])}
+
+        client._get = fake_get
+        client._calls = calls
+        return client
+
+    @staticmethod
+    def _mk(slug, hours_out=5):
+        # Sports market with a gameStartTime inside the scan window
+        return {"slug": slug, "gameStartTime": _future_iso(hours_out),
+                "endDate": _future_iso(hours_out + 4)}
+
+    def test_paginates_until_short_page(self):
+        pages = {
+            0: [self._mk("aec-mlb-a-b-2026-07-11"), self._mk("aec-mlb-c-d-2026-07-11")],
+            2: [self._mk("aec-wnba-e-f-2026-07-11"), self._mk("aec-wnba-g-h-2026-07-11")],
+            4: [self._mk("aec-mls-i-j-2026-07-11")],   # short page ends the walk
+        }
+        client = self._client(pages)
+        markets = client.get_active_markets(page_size=2)
+        slugs = {m["slug"] for m in markets}
+        # The deep-offset WNBA/MLS markets are the whole point of the fix
+        assert "aec-wnba-e-f-2026-07-11" in slugs
+        assert "aec-mls-i-j-2026-07-11" in slugs
+        assert len(client._calls) == 3
+        assert [c["offset"] for c in client._calls] == [0, 2, 4]
+
+    def test_first_page_failure_returns_empty(self):
+        client = self._client({})
+        client._get = lambda url, params=None: None
+        assert client.get_active_markets(page_size=2) == []
+
+    def test_later_page_failure_keeps_partial_results(self):
+        pages = {0: [self._mk("aec-mlb-a-b-2026-07-11"), self._mk("aec-mlb-c-d-2026-07-11")]}
+        client = self._client(pages)
+        orig = client._get
+
+        def flaky(url, params=None):
+            if (params or {}).get("offset", 0) >= 2:
+                return None  # API blip mid-scan
+            return orig(url, params)
+
+        client._get = flaky
+        markets = client.get_active_markets(page_size=2)
+        assert len(markets) == 2  # page 0 kept, scan degraded not blanked
+
+    def test_safety_cap_stops_runaway(self):
+        # Every page full -> walk must stop at max_markets
+        full_page = [self._mk(f"aec-mlb-x{i}-y-2026-07-11") for i in range(2)]
+        client = self._client({o: full_page for o in range(0, 100, 2)})
+        client.get_active_markets(page_size=2, max_markets=6)
+        assert [c["offset"] for c in client._calls] == [0, 2, 4]

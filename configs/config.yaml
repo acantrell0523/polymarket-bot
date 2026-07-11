@@ -43,7 +43,10 @@ trading:
   max_open_positions: 5
   paper_trading: true
   # --- Cost-aware edge accounting ---
-  taker_fee_rate: 0.02        # exchange taker fee on notional
+  # US fee schedule (effective 2026-07-01): fee = coef * contracts * p * (1-p)
+  # Takers pay 0.06 (peaks at 3% of notional at 50c, shrinks toward extremes).
+  taker_fee_coefficient: 0.06
+  taker_fee_rate: 0.02        # DEPRECATED (flat model) — no longer read
   min_net_edge: 0.02          # min edge AFTER fees + crossing the spread
   # --- Market-quality gates (previously hardcoded in trade_filter.py) ---
   min_price: 0.15             # skip extreme longshots

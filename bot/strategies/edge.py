@@ -5,7 +5,9 @@ mid/last price). That number overstates the real opportunity because:
 
   1. We execute with IOC taker orders, so a BUY fills at the best ask and a
      SELL fills at the best bid — we always pay the spread, never earn it.
-  2. The exchange charges a taker fee on notional (config: trading.taker_fee_rate).
+  2. The exchange charges a quadratic taker fee per contract:
+     fee = Θ·contracts·price·(1−price), Θ = trading.taker_fee_coefficient
+     (Polymarket US schedule effective 2026-07-01; see bot/strategies/fees.py).
 
 This module converts a gross probability estimate into a NET edge measured at
 the executable price with fees included. Everything downstream (trade filter,
@@ -42,7 +44,7 @@ class EdgeBreakdown:
     mid_price: float          # snapshot price the gross edge was computed against
     exec_price: float         # price we would actually fill at (ask for buy, bid for sell)
     spread: float             # best_ask - best_bid (absolute price units); 0 if book empty
-    fee_rate: float           # taker fee rate applied to notional
+    fee_rate: float           # quadratic fee coefficient Θ (see fees.py)
     gross_edge: float         # |estimated_prob - mid_price|
     net_edge: float           # edge after crossing the spread and paying the fee
 
@@ -77,24 +79,32 @@ def compute_edge_breakdown(
     estimated_prob: float,
     snapshot: MarketSnapshot,
     side: str,
-    fee_rate: float,
+    fee_coefficient: float,
 ) -> EdgeBreakdown:
     """Compute the net, executable edge for a candidate trade.
 
     net_edge > 0 means the trade has positive expected value at the price we
     would actually pay, after fees. This is the number the trade filter gates
     on and the number Kelly sizing should be driven by.
+
+    Fees use the Polymarket US quadratic schedule (bot/strategies/fees.py):
+    fee per contract = Θ·p·(1−p), NOT a flat percentage of notional. The
+    difference is material: at a 50¢ price the taker fee is 3% of notional,
+    at 85¢ it's ~0.9% — a flat 2% model misprices both.
     """
+    from bot.strategies.fees import fee_per_contract
+
     exec_px = executable_price(snapshot, side)
     exec_px = min(max(exec_px, 0.01), 0.99)
     spread = book_spread(snapshot)
+    fee_share = fee_per_contract(exec_px, fee_coefficient)
 
     if side == "buy":
-        # Pay ask*(1+fee) per share, receive $1 with probability p.
-        net = estimated_prob - exec_px * (1.0 + fee_rate)
+        # Pay (ask + fee) per share, receive $1 with probability p.
+        net = estimated_prob - (exec_px + fee_share)
     else:
-        # Receive bid*(1-fee) per share, pay $1 with probability p.
-        net = exec_px * (1.0 - fee_rate) - estimated_prob
+        # Receive (bid - fee) per share, pay $1 with probability p.
+        net = (exec_px - fee_share) - estimated_prob
 
     return EdgeBreakdown(
         side=side,
@@ -102,7 +112,7 @@ def compute_edge_breakdown(
         mid_price=snapshot.price,
         exec_price=exec_px,
         spread=spread,
-        fee_rate=fee_rate,
+        fee_rate=fee_coefficient,   # carries the coefficient Θ (see fees.py)
         gross_edge=abs(estimated_prob - snapshot.price),
         net_edge=net,
     )

@@ -50,8 +50,13 @@ class TradingConfig:
     max_daily_trades: int = 15
     paper_trading: bool = True
     # --- Cost-aware edge accounting ---
-    # Taker fee charged by the exchange on notional. Both the paper simulator,
-    # the live fee estimate, and the net-edge calculation read this one value.
+    # Polymarket US fee schedule (effective 2026-07-01, docs.polymarket.us/fees):
+    #   fee = coefficient * contracts * price * (1 - price)
+    # Takers pay 0.06; see bot/strategies/fees.py. Edge math, Kelly sizing,
+    # paper fills, live fills, and the backtest all read this ONE value.
+    taker_fee_coefficient: float = 0.06
+    # DEPRECATED: legacy flat fee-on-notional model. No longer read by edge,
+    # sizing, execution, or backtest. Kept so old env overrides don't crash.
     taker_fee_rate: float = 0.02
     # Minimum edge AFTER subtracting fees and the cost of crossing the spread.
     # Gross edge thresholds alone overstate profitability: a 5% gross edge with

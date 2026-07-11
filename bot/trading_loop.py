@@ -382,7 +382,7 @@ class TradingBot:
             # the signal so the trade filter and Kelly sizing use net numbers.
             breakdown = compute_edge_breakdown(
                 trade_signal.estimated_prob, snapshot, trade_signal.side,
-                fee_rate=tcfg.taker_fee_rate,
+                fee_coefficient=tcfg.taker_fee_coefficient,
             )
             trade_signal.net_edge = breakdown.net_edge
             trade_signal.exec_price = breakdown.exec_price
