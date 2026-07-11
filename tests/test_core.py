@@ -3178,3 +3178,229 @@ class TestMarketPagination:
         client = self._client({o: full_page for o in range(0, 100, 2)})
         client.get_active_markets(page_size=2, max_markets=6)
         assert [c["offset"] for c in client._calls] == [0, 2, 4]
+
+
+# ============================================================================
+# Live fill reconciliation (audit blocker #3)
+# ============================================================================
+
+from bot.execution import ExecutionEngine
+
+
+class _FakeOrders:
+    def __init__(self, response=None, error=None):
+        self.response = response
+        self.error = error
+        self.created = []
+
+    def create(self, payload):
+        self.created.append(payload)
+        if self.error:
+            raise self.error
+        return self.response
+
+
+class _FakePortfolioAPI:
+    def __init__(self, positions=None, error=None):
+        self._positions = positions
+        self._error = error
+
+    def positions(self):
+        if self._error:
+            raise self._error
+        return {"positions": self._positions or {}}
+
+
+class _FakeClient:
+    def __init__(self, orders=None, portfolio=None):
+        self.orders = orders or _FakeOrders(response={"id": "o1", "executions": []})
+        self.portfolio = portfolio or _FakePortfolioAPI()
+
+
+def _live_engine(client, **cfg_overrides):
+    cfg = TradingConfig(paper_trading=False, **cfg_overrides)
+    engine = ExecutionEngine(cfg)
+    engine._client = client
+    engine.CLOSE_VERIFY_DELAY_SECONDS = 0  # no real sleeps in tests
+    return engine
+
+
+def _live_signal(**kw):
+    base = dict(market_id="m1", token_id="t1", side="buy",
+                estimated_prob=0.60, market_price=0.50, edge=0.10,
+                position_size_usd=10.0, slug="aec-mlb-nyy-bos-2026-07-11",
+                exec_price=0.52)
+    base.update(kw)
+    return TradeSignal(**base)
+
+
+class TestFillReconciliation:
+    def test_reconcile_parses_float_quantities(self):
+        """A 2.5-share fill is 2.5 shares — the old int() made it 2."""
+        qty, vwap = ExecutionEngine.reconcile_executions(
+            [{"quantity": "2.5", "price": {"value": "0.52"}}], limit_price=0.52)
+        assert qty == pytest.approx(2.5)
+        assert vwap == pytest.approx(0.52)
+
+    def test_reconcile_unknown_fields_is_zero_not_full(self):
+        """Unparseable executions must yield ZERO fills. The old code fell
+        back to the FULL requested quantity (2.5-share partial -> 20-share
+        phantom trade)."""
+        qty, _ = ExecutionEngine.reconcile_executions(
+            [{"mystery_field": 20}], limit_price=0.52)
+        assert qty == 0.0
+
+    def test_reconcile_vwap_across_executions(self):
+        qty, vwap = ExecutionEngine.reconcile_executions(
+            [{"quantity": 10, "price": 0.50}, {"quantity": 5, "price": 0.56}],
+            limit_price=0.52)
+        assert qty == 15
+        assert vwap == pytest.approx((10 * 0.50 + 5 * 0.56) / 15)
+
+    def test_reconcile_alternate_field_names(self):
+        qty, vwap = ExecutionEngine.reconcile_executions(
+            [{"filledQuantity": "3", "executionPrice": "0.40"}], limit_price=0.52)
+        assert qty == 3
+        assert vwap == pytest.approx(0.40)
+
+    def test_zero_fill_creates_no_trade(self):
+        client = _FakeClient(_FakeOrders(response={"id": "o1", "executions": []}))
+        engine = _live_engine(client)
+        assert engine.execute_trade(_live_signal()) is None
+
+    def test_unparseable_fill_creates_no_trade(self):
+        client = _FakeClient(_FakeOrders(response={
+            "id": "o1", "executions": [{"weird": 20}]}))
+        engine = _live_engine(client)
+        assert engine.execute_trade(_live_signal()) is None
+
+    def test_partial_fill_books_partial_trade(self):
+        client = _FakeClient(_FakeOrders(response={
+            "id": "o1",
+            "executions": [{"quantity": "2.5", "price": {"value": "0.52"}}]}))
+        engine = _live_engine(client)
+        trade = engine.execute_trade(_live_signal(position_size_usd=10.0))
+        assert trade is not None
+        assert trade.quantity == pytest.approx(2.5)      # NOT the 19 requested
+        assert trade.size_usd == pytest.approx(2.5 * 0.52)
+        # fee on ACTUAL fill: 0.06 * 2.5 * 0.52 * 0.48, banker's-rounded
+        assert trade.fees == pytest.approx(0.04, abs=0.005)
+
+    def test_order_submitted_at_exec_price_with_automatic_flag(self):
+        orders = _FakeOrders(response={"id": "o1", "executions": [
+            {"quantity": 19, "price": 0.52}]})
+        engine = _live_engine(_FakeClient(orders))
+        engine.execute_trade(_live_signal(market_price=0.50, exec_price=0.52))
+        payload = orders.created[0]
+        assert payload["price"]["value"] == "0.52"        # executable, not mid
+        assert payload["automaticOrder"] is True
+        assert payload["tif"] == "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL"
+
+    def test_missing_exec_price_refuses_to_submit(self):
+        orders = _FakeOrders(response={"id": "o1", "executions": []})
+        engine = _live_engine(_FakeClient(orders))
+        assert engine.execute_trade(_live_signal(exec_price=0.0)) is None
+        assert orders.created == []                       # never reached the API
+
+    def test_fill_price_uses_execution_vwap_not_limit(self):
+        client = _FakeClient(_FakeOrders(response={
+            "id": "o1", "executions": [{"quantity": 10, "price": 0.49}]}))
+        engine = _live_engine(client)
+        trade = engine.execute_trade(_live_signal(exec_price=0.52))
+        assert trade.price == pytest.approx(0.49)         # price improvement kept
+
+
+# ============================================================================
+# Position closing (audit blocker #4)
+# ============================================================================
+
+def _open_position(side="buy", slug="aec-mlb-nyy-bos-2026-07-11"):
+    return Position(
+        market_id="m1", token_id="t1", side=side, entry_price=0.52,
+        size_usd=10.0, quantity=19, estimated_prob=0.60,
+        entry_time=datetime.now(timezone.utc), slug=slug,
+    )
+
+
+class TestPositionClosing:
+    def test_api_error_is_not_success(self):
+        """The killer bug: fetch failure used to look like 'position absent'
+        and the bot stopped managing a REAL open position."""
+        client = _FakeClient(portfolio=_FakePortfolioAPI(error=RuntimeError("503")))
+        engine = _live_engine(client)
+        assert engine.close_position(_open_position()) is False
+
+    def test_confirmed_absent_is_success(self):
+        client = _FakeClient(portfolio=_FakePortfolioAPI(positions={}))
+        engine = _live_engine(client)
+        assert engine.close_position(_open_position()) is True
+
+    def test_long_closes_with_sell_at_floor(self):
+        slug = "aec-mlb-nyy-bos-2026-07-11"
+        orders = _FakeOrders(response={"id": "o1", "executions": [{"quantity": 19}]})
+        # position present before close; gone after (two fetches)
+        portfolio = _FakePortfolioAPI(positions={slug: {"netPosition": "19",
+                                                        "qtyAvailable": "19"}})
+        client = _FakeClient(orders, portfolio)
+        engine = _live_engine(client)
+        fetches = iter([{slug: {"netPosition": "19", "qtyAvailable": "19"}}, {}])
+        engine.get_exchange_positions = lambda: next(fetches)
+        assert engine.close_position(_open_position()) is True
+        payload = orders.created[0]
+        assert payload["intent"] == "ORDER_INTENT_SELL_LONG"
+        assert payload["price"]["value"] == "0.01"
+
+    def test_short_closes_with_buy_at_ceiling(self):
+        """Shorts were sent BUY_SHORT @ $0.01 — a buy limit that can never
+        take the ask. Closing a short is a BUY at an aggressive HIGH price."""
+        slug = "aec-mlb-nyy-bos-2026-07-11"
+        orders = _FakeOrders(response={"id": "o1", "executions": [{"quantity": 19}]})
+        client = _FakeClient(orders, _FakePortfolioAPI())
+        engine = _live_engine(client)
+        fetches = iter([{slug: {"netPosition": "-19", "qtyAvailable": "19"}}, {}])
+        engine.get_exchange_positions = lambda: next(fetches)
+        assert engine.close_position(_open_position(side="sell")) is True
+        payload = orders.created[0]
+        assert payload["intent"] == "ORDER_INTENT_BUY_LONG"
+        assert payload["price"]["value"] == "0.99"
+
+    def test_order_error_without_resolution_is_failure(self):
+        slug = "aec-mlb-nyy-bos-2026-07-11"
+        orders = _FakeOrders(error=RuntimeError("market closed for trading"))
+        client = _FakeClient(orders, _FakePortfolioAPI(
+            positions={slug: {"netPosition": "19", "qtyAvailable": "19"}}))
+        engine = _live_engine(client)
+        engine._is_market_resolved = lambda s: False     # NOT resolved
+        assert engine.close_position(_open_position()) is False
+
+    def test_order_error_with_confirmed_resolution_auto_settles(self):
+        slug = "aec-mlb-nyy-bos-2026-07-11"
+        orders = _FakeOrders(error=RuntimeError("market closed for trading"))
+        client = _FakeClient(orders, _FakePortfolioAPI(
+            positions={slug: {"netPosition": "19", "qtyAvailable": "19"}}))
+        engine = _live_engine(client)
+        engine._is_market_resolved = lambda s: True      # exchange confirms
+        assert engine.close_position(_open_position()) is True
+        assert engine._last_close_was_auto_settle is True
+
+    def test_three_nofill_closes_do_not_settle_active_market(self):
+        """3 unfilled attempts used to become 'auto-settling' with no proof.
+        On an ACTIVE market that must stay False forever."""
+        slug = "aec-mlb-nyy-bos-2026-07-11"
+        orders = _FakeOrders(response={"id": "o1", "executions": []})
+        client = _FakeClient(orders, _FakePortfolioAPI())
+        engine = _live_engine(client)
+        engine._is_market_resolved = lambda s: False
+        pos_state = {slug: {"netPosition": "19", "qtyAvailable": "19"}}
+        engine.get_exchange_positions = lambda: pos_state
+        for _ in range(4):
+            assert engine.close_position(_open_position()) is False
+
+    def test_verification_fetch_failure_is_not_success(self):
+        slug = "aec-mlb-nyy-bos-2026-07-11"
+        orders = _FakeOrders(response={"id": "o1", "executions": [{"quantity": 19}]})
+        client = _FakeClient(orders, _FakePortfolioAPI())
+        engine = _live_engine(client)
+        fetches = iter([{slug: {"netPosition": "19", "qtyAvailable": "19"}}, None])
+        engine.get_exchange_positions = lambda: next(fetches)
+        assert engine.close_position(_open_position()) is False
