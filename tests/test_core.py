@@ -2975,24 +2975,37 @@ class TestLeagueRegistry:
 
 
 class TestMultiLeagueIngest:
-    def test_candidate_slugs_mlb(self):
+    def test_candidate_slugs_mlb_bare_first(self):
+        """Verified live against Gamma 2026-07-11: game markets use BARE
+        {league}-{away}-{home}-{date} slugs (e.g. mlb-mil-pit-2026-07-10);
+        the aec- prefix is the polymarket.us convention, kept as fallback."""
         game = {"league": "mlb", "away_abbr": "nyy", "home_abbr": "bos",
                 "date": "20260705"}
         slugs = candidate_slugs(game)
-        assert slugs[0] == "aec-mlb-nyy-bos-2026-07-05"
+        assert slugs[0] == "mlb-nyy-bos-2026-07-05"
+        assert "aec-mlb-nyy-bos-2026-07-05" in slugs  # legacy fallback
 
     def test_candidate_slugs_nba_abbr_map_applied(self):
         game = {"league": "nba", "away_abbr": "gs", "home_abbr": "ny",
                 "date": "20261101"}
         slugs = candidate_slugs(game)
-        assert slugs[0] == "aec-nba-gsw-nyk-2026-11-01"
-        assert "aec-nba-gs-ny-2026-11-01" in slugs  # raw fallback
+        assert slugs[0] == "nba-gsw-nyk-2026-11-01"
+        assert "nba-gs-ny-2026-11-01" in slugs      # raw-abbr fallback
+        assert "aec-nba-gsw-nyk-2026-11-01" in slugs  # legacy fallback
 
-    def test_candidate_slugs_soccer_uses_atc_family(self):
+    def test_candidate_slugs_wnba_abbr_map(self):
+        # Verified live: Valkyries/Sun slugs use gsv/conn, not ESPN's gs/con
+        game = {"league": "wnba", "away_abbr": "gs", "home_abbr": "con",
+                "date": "20260710"}
+        slugs = candidate_slugs(game)
+        assert slugs[0] == "wnba-gsv-conn-2026-07-10"
+
+    def test_candidate_slugs_soccer_bare_then_atc(self):
         game = {"league": "mls", "away_abbr": "lafc", "home_abbr": "sea",
                 "date": "20260705"}
         slugs = candidate_slugs(game)
-        assert slugs[0] == "atc-mls-lafc-sea-2026-07-05-lafc"
+        assert slugs[0] == "mls-lafc-sea-2026-07-05"
+        assert "atc-mls-lafc-sea-2026-07-05-lafc" in slugs
         assert "atc-mls-lafc-sea-2026-07-05-sea" in slugs
 
     def test_prune_leagues_removes_only_targeted_league(self, tmp_path):

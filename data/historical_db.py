@@ -54,6 +54,7 @@ def init_tables(db_path: Optional[str] = None) -> None:
             market_type     TEXT    DEFAULT '',
             token_id_0      TEXT    DEFAULT '',
             token_id_1      TEXT    DEFAULT '',
+            token0_side     TEXT    DEFAULT '',
             ingest_time     TEXT    DEFAULT (datetime('now')),
             UNIQUE(slug)
         );
@@ -83,6 +84,20 @@ def init_tables(db_path: Optional[str] = None) -> None:
             ON historical_snapshots(slug, timestamp);
     """)
     conn.commit()
+
+    # Migration guard: token0_side was added after the first deployments.
+    # Game markets on Polymarket aren't Yes/No — outcomes are
+    # ["Away Team", "Home Team"] and token 0 prices outcomes[0]. This column
+    # records which side ("home"/"away") token 0 refers to, read directly
+    # from the market object at ingest time.
+    try:
+        conn.execute(
+            "ALTER TABLE historical_markets ADD COLUMN token0_side TEXT DEFAULT ''"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists — nothing to do.
+
     conn.close()
 
 
@@ -96,8 +111,8 @@ def upsert_historical_market(
             (slug, market_id, condition_id, league, sport, question,
              home_team, away_team, home_abbr, away_abbr,
              game_start_time, espn_game_id, home_score, away_score,
-             settled_outcome, market_type, token_id_0, token_id_1)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             settled_outcome, market_type, token_id_0, token_id_1, token0_side)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             m.get("slug", ""),
@@ -118,6 +133,7 @@ def upsert_historical_market(
             m.get("market_type", ""),
             m.get("token_id_0", ""),
             m.get("token_id_1", ""),
+            m.get("token0_side", ""),
         ),
     )
 

@@ -75,6 +75,23 @@ def all_league_codes() -> List[str]:
     return list(LEAGUES.keys())
 
 
+def league_from_slug(slug: str) -> Optional[str]:
+    """Extract the league code from a game slug, or None.
+
+    Handles both slug families:
+      * bare (polymarket.com / Gamma): "mlb-mil-pit-2026-07-10"     → parts[0]
+      * prefixed (polymarket.us):      "aec-nba-atl-hou-2026-03-20" → parts[1]
+    """
+    parts = slug.lower().split("-")
+    if not parts:
+        return None
+    if parts[0] in LEAGUES:
+        return parts[0]
+    if len(parts) >= 2 and parts[1] in LEAGUES:
+        return parts[1]
+    return None
+
+
 def scoreboard_url(league: str) -> Optional[str]:
     """ESPN scoreboard URL for a league code, or None if unregistered."""
     info = LEAGUES.get(league)

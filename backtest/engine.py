@@ -88,8 +88,10 @@ class BacktestEngine:
             if self.odds_cache is not None and hasattr(self.odds_cache, "set_time"):
                 self.odds_cache.set_time(snapshot.timestamp)
 
-            # Skip if insufficient history
-            if len(snapshot.price_history) < 10:
+            # Skip if insufficient history. Backtest-scoped knob: recorded game
+            # markets carry only a few daily candles, so the live filter value
+            # (10) would silently skip every real snapshot.
+            if len(snapshot.price_history) < self.config.backtest.min_price_history_length:
                 continue
 
             # Check existing positions for this market

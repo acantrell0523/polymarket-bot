@@ -112,10 +112,19 @@ class SignalConfig:
     liquidity_imbalance_weight: float = 0.10
     sports_context_weight: float = 0.15
     # How signals are pooled into one probability:
+    #   "linear"  — confidence-weighted arithmetic mean (DEFAULT). The edge
+    #               thresholds (league 4-7% minimums), benchmark win rates,
+    #               and exit tuning were all calibrated against this pool,
+    #               where a lone external signal passes its consensus through
+    #               at full strength.
     #   "logodds" — Bayesian update in log-odds space anchored on the market
-    #               price as the prior (recommended; see estimator.py)
-    #   "linear"  — legacy confidence-weighted arithmetic mean of probabilities
-    combination_method: str = "logodds"
+    #               price as the prior. Better multi-signal math, but it
+    #               shrinks the combined edge by overall confidence — with
+    #               the odds_value confidence formula (min(books/5)*min(edge*5))
+    #               a 6% single-book edge collapses to <1% combined and
+    #               nothing ever clears min_edge_threshold. EXPERIMENTAL:
+    #               requires recalibrating every edge threshold before use.
+    combination_method: str = "linear"
     weights: Dict[str, Dict[str, float]] = field(
         default_factory=lambda: {
             market: dict(signal_weights)
@@ -155,6 +164,11 @@ class BacktestConfig:
     latency_ms: int = 500
     benchmark_win_rate: float = 0.62
     benchmark_trade_count: int = 366
+    # Minimum prior price points before a replayed snapshot is tradeable.
+    # Separate from filters.min_price_history_length (live scanning, 10):
+    # recorded game markets carry only a few daily candles, so the live value
+    # would silently skip every real snapshot.
+    min_price_history_length: int = 1
 
 
 @dataclass

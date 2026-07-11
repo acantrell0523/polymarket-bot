@@ -38,7 +38,12 @@ SHORT_BIAS_BONUS = 0.005  # 0.5% edge bonus for shorts
 
 
 def get_league_from_slug(slug: str) -> str:
-    """Extract league code from slug."""
+    """Extract league code from slug (bare or prefixed slug family)."""
+    from bot.leagues import league_from_slug
+    league = league_from_slug(slug)
+    if league:
+        return league
+    # Unregistered league (e.g. ufc): keep the prefixed-slug convention
     parts = slug.split("-")
     return parts[1] if len(parts) >= 2 else ""
 

@@ -99,6 +99,12 @@ def detect_market_type(snapshot: MarketSnapshot) -> str:
     if any(slug.startswith(p) for p in SPORTS_PREFIXES):
         return "sports"
 
+    # Bare league slugs (polymarket.com / Gamma family — what the historical
+    # recorder stores): "mlb-mil-pit-2026-07-10", "wnba-gsv-conn-2026-07-10"
+    from bot.leagues import LEAGUES
+    if slug.split("-", 1)[0] in LEAGUES:
+        return "sports"
+
     # NBA outright slugs (Finals winner, MVP, Conference finals, etc.) contain
     # "-nba-" anywhere in the slug, e.g. "will-the-celtics-win-the-2026-nba-finals"
     # or "will-nikola-jokic-win-the-20252026-nba-mvp".

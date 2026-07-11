@@ -4,7 +4,26 @@ This document is a comprehensive reference for AI assistants (and human develope
 
 ---
 
-## Latest Changes — 2026-07-05 (production-hardening audit)
+## Latest Changes — 2026-07-11 (live verification on real APIs)
+
+First session on a machine with real network access. The recorder, consensus
+backfill, and real-data backtest are now all VERIFIED WORKING end-to-end.
+
+| Area | Change |
+|------|--------|
+| **Recorder verified live** | `python scripts/ingest_historical.py` (no args) now matches **71/71 games** across MLB/WNBA for the last 3 days, with **219/221 snapshots (99%) carrying consensus**, 0 errors. Off-season leagues correctly return zero games. |
+| **Slug discovery (real conventions)** | Gamma game markets use BARE slugs — `{league}-{away}-{home}-{date}` (e.g. `mlb-mil-pit-2026-07-10`), NOT the `aec-` prefixed family (that's polymarket.us). Spread/total markets are separate `-spread-*`/`-total-*` slugs. `candidate_slugs()` tries bare first, prefixed as fallback. `detect_market_type()`/`get_league_from_slug()` now recognize bare league prefixes via `bot.leagues.league_from_slug()`. |
+| **Closed-market lookup fix** | Gamma `/markets?slug=` EXCLUDES closed markets by default — resolved games (2+ days old) returned 0 rows and silently missed. `find_game_market()` retries each candidate with `closed=true`. |
+| **Verified abbreviation maps** | MLB: ESPN `chw`→PM `cws`, `ath`→`oak`. WNBA: `gs`→`gsv`, `con`→`conn`, `lv`→`las`, `ny`→`nyl`. All confirmed against real Polymarket slugs. |
+| **token0_side (exact YES-team)** | Game markets aren't Yes/No — `outcomes` is `["Away Team", "Home Team"]` and token 0 prices `outcomes[0]`. New `historical_markets.token0_side` column (migration-guarded) records home/away by matching outcomes[0] to ESPN names at ingest; the consensus backfill uses it before falling back to inference. All 70 recorded markets: `token0_side=away`. |
+| **combination_method default reverted to `linear`** | Real-data replay exposed a calibration regression: log-odds pooling shrinks combined edge by overall confidence, and with the odds_value confidence formula (`min(books/5)·min(edge·5)`) a 5-7% single-book edge collapses below every threshold — live trading would have been silently disabled too. All edge thresholds/benchmarks were tuned on linear pooling, so linear is the default again; `logodds` remains available but EXPERIMENTAL (needs threshold recalibration). |
+| **Backtest runs on real data** | `python -m backtest.runner` out of the box: 70 real markets → 4 trades through the full pipeline (real prices + real DraftKings consensus + Kelly + risk exits). Two config fixes made this work: `backtest.initial_bankroll_usd` 200→1000 (quarter-Kelly at 5% edge sizes ~2% of bankroll; below ~$600 everything lands under the $5 min position), and new backtest-scoped `backtest.min_price_history_length: 1` (engine previously hardcoded 10, which skipped every real daily-candle snapshot). |
+| **Known data limitation** | ESPN pickcenter carries ONE provider (DraftKings) per game → `num_books` clamps to 2 → the ">7% edge needs 3 books" safety rule blocks all large edges in replays. Highest-value next step: when `THE_ODDS_API_KEY` is set, have the recorder also snapshot point-in-time multi-book consensus for today's games (true num_books, zero lookahead). |
+| **Tests** | 182 passing. |
+
+---
+
+## Changes — 2026-07-05 (production-hardening audit)
 
 A full audit + upgrade pass landed. Key changes to know before reading the rest
 of this document (sections below have been updated in place):
@@ -12,7 +31,7 @@ of this document (sections below have been updated in place):
 | Area | Change |
 |------|--------|
 | **Net-edge accounting** | New `bot/strategies/edge.py`. Edge is now computed at the EXECUTABLE price (best ask for buys / best bid for sells) net of the taker fee. `TradeSignal` carries `net_edge/exec_price/spread/fee_rate`; the trade filter gates on `trading.min_net_edge` (default 2%) and rejects books wider than `trading.max_spread`. |
-| **Bayesian pooling** | `ProbabilityEstimator` now defaults to log-odds pooling anchored on the market price as the prior (`signals.combination_method: logodds`). No signal evidence ⇒ estimate == market price ⇒ zero edge. Legacy linear pooling remains available (`linear`). |
+| **Bayesian pooling** | Log-odds pooling anchored on the market price added as `signals.combination_method: logodds`. *(2026-07-11: default reverted to `linear` — see Latest Changes; logodds is experimental pending threshold recalibration.)* |
 | **Fee-aware Kelly** | Default sizing is fractional Kelly (`position_sizing_method: kelly`, `kelly_fraction: 0.25`) computed on the executable price grossed up by the taker fee. Tiered flat-dollar sizing remains available. |
 | **On-chain signal wired** | `OnChainEnrichmentClient` is now instantiated in the trading loop (when `onchain.enabled`) and feeds a new supporting `onchain_flow` signal (weight 0.10, confidence capped at 0.5) in all market types. |
 | **Backtest 0-trades gap CLOSED** | New `backtest/historical_odds.py` — a time-aware, lookahead-free `HistoricalOddsCache` satisfies the external validation gate in replays. Synthetic backtests generate synthetic consensus and now exercise the full pipeline (gate → ranking → sizing → risk). SQLite-backed backtests read `historical_snapshots.espn_consensus_prob`, populated by the recorder's consensus phase as data accumulates. |
@@ -125,7 +144,7 @@ polymarket-bot/
 │   ├── logger.py               # Structured JSON logger
 │   └── models.py               # Shared dataclasses (OrderBook, TradeSignal, Position…)
 ├── tests/
-│   └── test_core.py            # pytest suite — 181 tests, all passing
+│   └── test_core.py            # pytest suite — 182 tests, all passing
 ├── configs/config.yaml         # CANONICAL master configuration file (only config file)
 ├── .env.example                # Environment variable template
 ├── requirements.txt            # Python dependencies
@@ -274,9 +293,11 @@ Additional caps:
 
 ### Probability Combination Formula
 
-Selected by `signals.combination_method` (default `logodds`):
+Selected by `signals.combination_method` (default `linear` — all edge
+thresholds and benchmarks were calibrated against the linear pool; see the
+2026-07-11 Latest Changes for why logodds is not the default):
 
-**Log-odds Bayesian pooling (default)** — market price is the prior; each
+**Log-odds Bayesian pooling (experimental)** — market price is the prior; each
 signal shifts the posterior in log-odds space proportional to its
 confidence-scaled weight:
 
@@ -289,7 +310,7 @@ estimated_prob = sigmoid(posterior)               # clamped [0.01, 0.99]
 Key property: with no signal evidence the estimate IS the market price (zero
 edge) — the math itself is humble, not just the gates.
 
-**Linear pooling (legacy, `combination_method: linear`)**:
+**Linear pooling (default, `combination_method: linear`)**:
 
 ```
 estimated_prob = sum(w_i * c_i * v_i) / sum(w_i * c_i)
@@ -891,10 +912,10 @@ historical_snapshots
 
 ### ✅ Working
 
-- **Test suite** — 181 tests passing in `tests/test_core.py`. Run `pytest tests/test_core.py`. Covers: order book, signals, market type detection, probability estimator, validate_trade, position sizing, risk manager, portfolio, data generation, backtest engine, config, exit telemetry, live-loop let_it_ride safety, historical DB schema + idempotency, DB loader, exit proximity computation, and the analyze_exits script.
+- **Test suite** — 182 tests passing in `tests/test_core.py`. Run `pytest tests/test_core.py`. Covers: order book, signals, market type detection, probability estimator, validate_trade, position sizing, risk manager, portfolio, data generation, backtest engine, config, exit telemetry, live-loop let_it_ride safety, historical DB schema + idempotency, DB loader, exit proximity computation, and the analyze_exits script.
 
   ```
-  ============================= 181 passed in 1.85s ==============================
+  ============================= 182 passed in 0.88s ==============================
   ```
 
 - **Live trading loop** — `TradingBot.run()` is the production path. Dual-speed scanning (3s live / 60s full), sniper trade selection, full validation checklist, position lifecycle.
@@ -927,7 +948,7 @@ historical_snapshots
 
 ### ❌ Current Gaps / Not Yet Working
 
-1. **Recorder not yet RUN against the live APIs** — The forward-looking recorder (see §10) and its consensus phase are fully unit-tested, but neither has been executed on a network with ESPN access (this dev environment's proxy blocks `site.api.espn.com`). From a deployment host, run `python scripts/ingest_historical.py` daily (or rely on the supervisor's 05:30 ET job), then `python scripts/inspect_historical.py` to confirm coverage. Expect the first runs to surface Polymarket slug-pattern/abbreviation mismatches for MLB/WNBA/MLS as `no_market` log lines — extend `ABBR_MAP` / `candidate_slugs()` in `scripts/ingest_historical.py` as they're discovered (only the NBA mapping is battle-tested).
+1. **Single-provider consensus limits big-edge replay** — ESPN pickcenter carries only DraftKings for MLB/WNBA games, so `num_books` clamps to 2 and the ">7% edge needs 3 books" rule blocks all large edges in backtests (working as designed, but it caps what replays can evaluate). Next step: when `THE_ODDS_API_KEY` is set, extend the recorder to also snapshot point-in-time multi-book consensus from the live `OddsCache` for today's games — true `num_books`, zero lookahead, and a real closing-line-value dataset. (The recorder itself is now VERIFIED live: 71/71 games matched, 99% consensus coverage, 0 errors — see Latest Changes.)
 
 2. **Backtest data accumulates forward, so it starts thin** — The strategy is strictly current-sports: the recorder builds the dataset from today onward (MLB/WNBA/MLS right now). That means meaningful sports backtests need a few weeks of recorded data before they carry statistical weight. The old 2026 NBA outright data can be dropped with `--prune-leagues nba`. ESPN may carry few pickcenter providers per game (`num_books` is clamped to ≥2 by `HistoricalOddsCache.from_db`, and the "3 books for >7% edges" rule still applies).
 

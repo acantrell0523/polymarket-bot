@@ -191,8 +191,8 @@ def _parse_token_ids(market: Dict) -> Tuple[str, str]:
 
 
 # Known ESPN ↔ Polymarket abbreviation differences, per league.
-# Other leagues' mismatches surface as "no_market" log lines on the first
-# recorded day — add mappings here as they're discovered.
+# Verified live against Gamma on 2026-07-11 (MLB/WNBA); other leagues'
+# mismatches surface as "no_market" log lines — add mappings as discovered.
 ABBR_MAP = {
     "nba": {
         "sa":  "sas",   # San Antonio Spurs
@@ -200,16 +200,28 @@ ABBR_MAP = {
         "ny":  "nyk",   # New York Knicks
         "no":  "nor",   # New Orleans Pelicans
     },
+    "mlb": {
+        "chw": "cws",   # Chicago White Sox
+        "ath": "oak",   # Athletics (Polymarket kept the oak code)
+    },
+    "wnba": {
+        "gs":  "gsv",   # Golden State Valkyries
+        "con": "conn",  # Connecticut Sun
+        "lv":  "las",   # Las Vegas Aces
+        "ny":  "nyl",   # New York Liberty
+    },
 }
 
 
 def candidate_slugs(game: Dict) -> List[str]:
     """Possible Polymarket slugs for one ESPN game, most likely first.
 
-    Two-outcome sports use the aec- moneyline family
-    (aec-{league}-{away}-{home}-{date}); soccer uses the 3-outcome atc-
-    family with a team suffix (atc-{league}-{away}-{home}-{date}-{team}).
-    Each candidate costs one Gamma lookup, so the list is kept short.
+    Verified live against Gamma (2026-07-11): game markets use BARE slugs —
+    {league}-{away}-{home}-{date}, e.g. mlb-mil-pit-2026-07-10 — with
+    outcomes [away_team, home_team] on a single market. The aec-/atc-
+    prefixed families are the polymarket.us gateway convention and are kept
+    as fallbacks. Each candidate costs one Gamma lookup, so the list is
+    kept short.
     """
     league = game["league"]
     away = game["away_abbr"]
@@ -220,14 +232,15 @@ def candidate_slugs(game: Dict) -> List[str]:
     away_pm = amap.get(away, away)
     home_pm = amap.get(home, home)
 
+    slugs = [f"{league}-{away_pm}-{home_pm}-{date_iso}"]
+    if (away_pm, home_pm) != (away, home):
+        slugs.append(f"{league}-{away}-{home}-{date_iso}")
+
     if league in SOCCER_LEAGUES:
         base = f"atc-{league}-{away_pm}-{home_pm}-{date_iso}"
-        return [f"{base}-{away_pm}", f"{base}-{home_pm}",
-                f"aec-{league}-{away_pm}-{home_pm}-{date_iso}"]
-
-    slugs = [f"aec-{league}-{away_pm}-{home_pm}-{date_iso}"]
-    if (away_pm, home_pm) != (away, home):
-        slugs.append(f"aec-{league}-{away}-{home}-{date_iso}")
+        slugs += [f"{base}-{away_pm}", f"{base}-{home_pm}"]
+    else:
+        slugs.append(f"aec-{league}-{away_pm}-{home_pm}-{date_iso}")
     return slugs
 
 
@@ -237,15 +250,22 @@ def find_game_market(
     """
     Try to find a Polymarket moneyline market for a given ESPN game.
     Returns (market_dict | None, last_call).
+
+    Gamma's /markets?slug= excludes CLOSED markets by default (verified live
+    2026-07-11: a resolved game returns 0 rows without closed=true). The
+    recorder mostly sweeps finished games, so each candidate slug is tried
+    open-first, then with closed=true.
     """
     for slug in candidate_slugs(game):
-        last_call = _throttle(last_call)
-        data = _get(session, f"{GAMMA_BASE}/markets", params={"slug": slug})
-        last_call = time.time()
-        if data:
-            items = data if isinstance(data, list) else data.get("data", [])
-            if items:
-                return items[0], last_call
+        for extra in ({}, {"closed": "true"}):
+            last_call = _throttle(last_call)
+            data = _get(session, f"{GAMMA_BASE}/markets",
+                        params={"slug": slug, **extra})
+            last_call = time.time()
+            if data:
+                items = data if isinstance(data, list) else data.get("data", [])
+                if items:
+                    return items[0], last_call
 
     return None, last_call
 
@@ -467,21 +487,24 @@ def backfill_consensus_for_market(
         return 0, last_call
     p_home, p_away, num_books = consensus
 
-    # Final price for the YES-team inference (step 1 needs it)
-    row = conn.execute(
-        "SELECT polymarket_price FROM historical_snapshots "
-        "WHERE slug = ? ORDER BY timestamp DESC LIMIT 1",
-        (slug,),
-    ).fetchone()
-    last_price = float(row[0]) if row else None
-
-    yes_team = infer_yes_team(
-        question=market_row.get("question", ""),
-        home_name=market_row.get("home_team", ""),
-        away_name=market_row.get("away_team", ""),
-        settled_outcome=market_row.get("settled_outcome", ""),
-        last_price=last_price,
-    )
+    # Which team does the stored price series (token 0) refer to?
+    # token0_side is exact — read from the market's outcomes array at ingest.
+    # Rows ingested before that column existed fall back to inference.
+    yes_team = (market_row.get("token0_side") or "").lower()
+    if yes_team not in ("home", "away"):
+        row = conn.execute(
+            "SELECT polymarket_price FROM historical_snapshots "
+            "WHERE slug = ? ORDER BY timestamp DESC LIMIT 1",
+            (slug,),
+        ).fetchone()
+        last_price = float(row[0]) if row else None
+        yes_team = infer_yes_team(
+            question=market_row.get("question", ""),
+            home_name=market_row.get("home_team", ""),
+            away_name=market_row.get("away_team", ""),
+            settled_outcome=market_row.get("settled_outcome", ""),
+            last_price=last_price,
+        )
     yes_prob = p_home if yes_team == "home" else p_away
 
     # Closing-line lookahead guard: only stamp snapshots near the game.
@@ -548,6 +571,15 @@ def ingest_game_market(
     except (ValueError, TypeError):
         settled = _settled_from_price(history[-1]["p"]) if history else ""
 
+    # Which side does token 0 (the price series we store) refer to?
+    # Game markets aren't Yes/No — Gamma returns outcomes as a JSON string,
+    # e.g. '["Milwaukee Brewers", "Pittsburgh Pirates"]', ordered like
+    # clobTokenIds. Matching outcomes[0] against the ESPN team names gives an
+    # exact answer, so the consensus backfill never has to guess.
+    token0_side = _token0_side_from_outcomes(
+        market.get("outcomes"), game["home_name"], game["away_name"]
+    )
+
     m_row = {
         "slug":            slug,
         "market_id":       str(market.get("id", "")),
@@ -566,15 +598,39 @@ def ingest_game_market(
         "market_type":     "moneyline_game",
         "token_id_0":      t0,
         "token_id_1":      t1,
+        "token0_side":     token0_side,
     }
     upsert_historical_market(conn, m_row)
     n = upsert_snapshots(conn, slug, history)
     conn.commit()
 
     logging.info(
-        "game_market_ingested slug=%s snapshots=%d settled=%s", slug, n, settled
+        "game_market_ingested slug=%s snapshots=%d settled=%s token0=%s",
+        slug, n, settled, token0_side or "?",
     )
     return n, last_call
+
+
+def _token0_side_from_outcomes(
+    outcomes, home_name: str, away_name: str
+) -> str:
+    """Match outcomes[0] to the home or away team. Returns "home"/"away"/""."""
+    import json as _json
+    if isinstance(outcomes, str):
+        try:
+            outcomes = _json.loads(outcomes)
+        except ValueError:
+            return ""
+    if not isinstance(outcomes, list) or not outcomes:
+        return ""
+    first = str(outcomes[0]).lower()
+    home_nick = home_name.split()[-1].lower() if home_name else ""
+    away_nick = away_name.split()[-1].lower() if away_name else ""
+    if away_nick and away_nick in first:
+        return "away"
+    if home_nick and home_nick in first:
+        return "home"
+    return ""
 
 
 def ingest_outright_market(
@@ -637,7 +693,7 @@ def run_consensus_backfill(
     """
     rows = conn.execute(
         "SELECT slug, espn_game_id, league, question, home_team, away_team, "
-        "       settled_outcome, game_start_time "
+        "       settled_outcome, game_start_time, token0_side "
         "FROM historical_markets "
         "WHERE market_type = 'moneyline_game' AND espn_game_id != '' "
         "ORDER BY slug"

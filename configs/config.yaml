@@ -57,11 +57,13 @@ signals:
   order_book_imbalance_weight: 0.15
   liquidity_imbalance_weight: 0.1
   # How signals are pooled into one probability estimate:
-  #   logodds — Bayesian update in log-odds space, market price as the prior.
-  #             With no signal evidence the estimate IS the market price
-  #             (edge 0); low-confidence signals barely move it.
-  #   linear  — legacy confidence-weighted arithmetic mean.
-  combination_method: logodds
+  #   linear  — confidence-weighted arithmetic mean (DEFAULT). All edge
+  #             thresholds and benchmarks were calibrated against this pool.
+  #   logodds — Bayesian log-odds update anchored on the market price.
+  #             EXPERIMENTAL: shrinks combined edge by overall confidence,
+  #             so the current 4-7% edge thresholds almost never fire.
+  #             Recalibrate thresholds before switching this on.
+  combination_method: linear
   # Per-market-type weights used by ProbabilityEstimator.
   # These values exactly match the hardcoded defaults — edit here to tune behavior.
   # onchain_flow is a no-op unless onchain.enabled is true.
@@ -106,7 +108,13 @@ backtest:
   data_dir: ./data/historical
   start_date: '2024-01-01'
   end_date: '2024-12-31'
-  initial_bankroll_usd: 200.0
+  # Quarter-Kelly on a 5% edge sizes ~2% of bankroll; below ~$600 that lands
+  # under min_position_size_usd ($5) and every trade is skipped as too small.
+  initial_bankroll_usd: 1000.0
+  # Replay-scoped history requirement (live scanning uses
+  # filters.min_price_history_length=10; recorded game markets only have a
+  # few daily candles)
+  min_price_history_length: 1
   slippage_model: depth_based
   fixed_slippage_bps: 50
   depth_slippage_multiplier: 0.001
