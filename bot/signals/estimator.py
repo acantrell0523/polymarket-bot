@@ -171,6 +171,26 @@ class ProbabilityEstimator:
 
         return signals
 
+    @staticmethod
+    def _direction_reversed(edge: float, primary: Signal, market_price: float) -> bool:
+        """True when the combined edge points the OPPOSITE way from the
+        primary external signal's own view of the market.
+
+        The external view is the signed edge the primary signal computed
+        (metadata["edge"] = external_prob - market_price); when a primary
+        doesn't record it, fall back to its value vs the market price.
+        A reversal means auxiliary signals overpowered the books — that is
+        never a trade, no matter the magnitude.
+        """
+        ext_signed = primary.metadata.get("edge")
+        if ext_signed is None:
+            ext_signed = primary.value - market_price
+        # No meaningful external direction => nothing to reverse (the edge
+        # cap at ext+1% keeps any aux-driven edge below trade thresholds).
+        if abs(ext_signed) < 1e-9:
+            return False
+        return (edge > 0) != (ext_signed > 0) and abs(edge) > 1e-9
+
     def _get_primary_signal(self, signals: List[Signal], market_type: str) -> Optional[Signal]:
         """Get the primary external validation signal for this market type."""
         primary_name = {
@@ -338,6 +358,16 @@ class ProbabilityEstimator:
 
         # Edge = estimated probability - market price
         edge = estimated_prob - snapshot.price
+
+        # DIRECTION GUARD: the primary external signal defines the only
+        # permitted trade direction. Auxiliary signals (order-book imbalance,
+        # line movement, ...) express 0.5-anchored ABSOLUTE values, so in the
+        # linear pool they can drag the blend across the market price AGAINST
+        # the books — e.g. price 0.25, consensus 0.20 (sell!), heavy bids
+        # push the blend to 0.31 and the magnitude cap below still emits a
+        # BUY. Aux signals may temper the external view, never reverse it.
+        if self._direction_reversed(edge, primary, snapshot.price):
+            return None
 
         # Edge cap: combined edge cannot exceed external edge + 1%
         max_allowed_edge = ext_edge + 0.01

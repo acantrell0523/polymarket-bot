@@ -3404,3 +3404,77 @@ class TestPositionClosing:
         fetches = iter([{slug: {"netPosition": "19", "qtyAvailable": "19"}}, None])
         engine.get_exchange_positions = lambda: next(fetches)
         assert engine.close_position(_open_position()) is False
+
+
+# ============================================================================
+# Signal direction guard (audit blocker #5)
+# ============================================================================
+
+class TestDirectionGuard:
+    def _reversal_snapshot(self):
+        """Audit scenario: market at 0.25, books say 0.20 (SELL), but the
+        order book is massively bid-heavy so aux signals scream BUY."""
+        ob = OrderBook(
+            bids=[OrderBookLevel(price=0.24, size=5000),
+                  OrderBookLevel(price=0.23, size=5000)],
+            asks=[OrderBookLevel(price=0.26, size=100)],
+        )
+        return MarketSnapshot(
+            market_id="m", token_id="t", question="q", price=0.25,
+            volume_24h=5000, liquidity=5000, order_book=ob,
+            price_history=[0.25] * 30, timestamp=datetime.now(timezone.utc),
+            slug="aec-nba-aaa-bbb-2026-11-01",
+        )
+
+    def test_reversal_helper(self):
+        primary = Signal(name="odds_value", value=0.20, confidence=0.2,
+                         metadata={"edge": -0.05})
+        assert ProbabilityEstimator._direction_reversed(+0.06, primary, 0.25) is True
+        assert ProbabilityEstimator._direction_reversed(-0.04, primary, 0.25) is False
+
+    def test_reversal_helper_falls_back_to_value(self):
+        primary = Signal(name="cross_market", value=0.20, confidence=0.5, metadata={})
+        assert ProbabilityEstimator._direction_reversed(+0.06, primary, 0.25) is True
+
+    def test_no_external_direction_is_not_reversal(self):
+        primary = Signal(name="odds_value", value=0.25, confidence=0.2,
+                         metadata={"edge": 0.0})
+        assert ProbabilityEstimator._direction_reversed(+0.005, primary, 0.25) is False
+
+    def test_audit_scenario_buy_against_consensus_blocked(self):
+        """Books at 0.20 vs market 0.25: the only permitted trade is a SELL.
+        Bid-heavy aux signals used to flip the blend to ~0.31 -> BUY."""
+        cache = HistoricalOddsCache({
+            "aec-nba-aaa-bbb-2026-11-01": [(0.0, 0.20, 4)],
+        })
+        cfg = SignalConfig()
+        cfg.combination_method = "linear"
+        est = ProbabilityEstimator(cfg, odds_cache=cache)
+        snap = self._reversal_snapshot()
+
+        # Sanity: without the guard this configuration produced a BUY —
+        # prove the raw blend really does cross the price.
+        mt = detect_market_type(snap)
+        signals = est.compute_signals(snap, mt)
+        weights = est._effective_weights(mt)
+        raw_prob, _ = est._combine(signals, weights, snap.price)
+        assert raw_prob > snap.price, "scenario no longer reproduces the reversal"
+
+        result = est.detect_edge(snap, min_edge=0.05, max_edge=0.40)
+        assert result is None or result.side == "sell"
+        if result is not None:
+            assert result.edge < 0
+
+    def test_aligned_aux_signals_still_trade(self):
+        """Guard must not block trades where aux signals AGREE with books:
+        consensus 0.32 vs price 0.25 -> BUY passes."""
+        cache = HistoricalOddsCache({
+            "aec-nba-aaa-bbb-2026-11-01": [(0.0, 0.32, 4)],
+        })
+        cfg = SignalConfig()
+        cfg.combination_method = "linear"
+        est = ProbabilityEstimator(cfg, odds_cache=cache)
+        snap = self._reversal_snapshot()  # bid-heavy book agrees with buy
+        result = est.detect_edge(snap, min_edge=0.05, max_edge=0.40)
+        assert result is not None
+        assert result.side == "buy"

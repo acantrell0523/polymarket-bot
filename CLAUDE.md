@@ -4,7 +4,30 @@ This document is a comprehensive reference for AI assistants (and human develope
 
 ---
 
-## Latest Changes — 2026-07-11 (live verification on real APIs)
+## Latest Changes — 2026-07-11 PM (external audit: blockers 1-5 fixed)
+
+An external audit (GPT session) flagged 4 critical execution blockers + a
+signal-pooling flaw. All 5 verified against the code and live APIs, then
+fixed. paper_trading remains TRUE — live trading stays blocked until the
+remaining audit items (position-state persistence, ESPN clock parsing,
+backtest rebuild, CI) land.
+
+| # | Blocker | Fix |
+|---|---------|-----|
+| 1 | **Market discovery saw nothing** — single limit=500 request; measured live: 6,000+ active markets, WNBA games at offset ~2,500, MLB ~3,500 | `get_active_markets()` paginates limit+offset until a short page (20k cap); first-page failure → [] (degraded mode), later-page failure keeps partial results |
+| 2 | **Fees modeled flat 2%** — US schedule (eff. 2026-07-01, verified at docs.polymarket.us/fees) is `fee = Θ·C·p·(1−p)`, taker Θ=0.06, maker −0.0125 | New `bot/strategies/fees.py` single source (banker's-rounded bookings); net-edge, Kelly, paper fills, live fills, backtest all use `trading.taker_fee_coefficient`. Flat model overcharged favorites ~3× and undercharged mid-priced markets |
+| 3 | **Unsafe fill reconciliation** — submitted the MID as IOC limit; `int()` truncated fractional fills; unknown execution fields summed to 0 then FELL BACK TO FULL QUANTITY (phantom fills); no automated-order flag | Submits at `signal.exec_price` (refuses if missing); `automaticOrder: true`; `reconcile_executions()` parses float quantities across field-name variants, VWAPs fill price, zero-parseable ⇒ NO trade; fees booked on actual fills |
+| 4 | **False close success** — API errors read as "position absent"; 3 unfilled IOCs became "auto-settling"; shorts closed with BUY_SHORT @ $0.01 (can never fill) | `get_exchange_positions()` returns None on failure vs {} when empty; close success requires post-close verification; auto-settle requires the market-status endpoint to confirm resolution; shorts close BUY_LONG @ $0.99 |
+| 5 | **Aux signals could reverse the books** — 0.5-anchored absolute values dragged the blend across the price (BUY at 0.31 when market 0.25, consensus 0.20); the ext+1% cap clamps magnitude, not sign | `_direction_reversed()` guard in `detect_edge()`: the primary external signal defines the only permitted trade direction; aux signals may temper it, never flip it. Integration test reproduces the audit's exact scenario |
+
+Tests: 218 passing (36 new). Remaining audit items (next): persist
+bot-owned position state across restarts, ESPN clock parsing from recorded
+payloads, aux signals as deltas around the prior, point-in-time backtest
+rebuild, CI + Ruff cleanup (83 findings).
+
+---
+
+## Changes — 2026-07-11 AM (live verification on real APIs)
 
 First session on a machine with real network access. The recorder, consensus
 backfill, and real-data backtest are now all VERIFIED WORKING end-to-end.
