@@ -208,6 +208,7 @@ class TradingBot:
             alert_config=config.alerts,
             paper_mode=config.trading.paper_trading,
             initial_bankroll=config.backtest.initial_bankroll_usd,
+            restore_state=True,  # survive restarts: entry_time/prob/telemetry
         )
         self.logger.info("portfolio_initialized", {
             "paper_mode": config.trading.paper_trading,
@@ -710,10 +711,13 @@ class TradingBot:
             # --- Exit telemetry: update running P&L extremes each cycle ---
             # unrealized_usd is positive when we're winning, negative when losing
             unrealized_usd = pnl_per_unit * position.quantity
+            telemetry_changed = False
             if unrealized_usd > position.max_favorable_pnl_usd:
                 position.max_favorable_pnl_usd = unrealized_usd
+                telemetry_changed = True
             if unrealized_usd < position.max_adverse_pnl_usd:
                 position.max_adverse_pnl_usd = unrealized_usd
+                telemetry_changed = True
 
             # Log diagnostics every 10th cycle
             if log_diagnostics:
@@ -732,10 +736,16 @@ class TradingBot:
                     "would_take_profit": would_tp,
                 })
 
-            # Check risk thresholds
+            # Check risk thresholds (also updates position.peak_price)
             close_reason = self.risk.check_position(
                 position, position.current_price, position.estimated_prob
             )
+
+            # Persist bot-owned state so peak/extremes/estimated_prob survive
+            # scan reconstruction and restarts (audit: state used to reset
+            # every cycle, silently disabling min-hold/trailing/take-profit).
+            if telemetry_changed or close_reason == "let_it_ride" or position.peak_price > 0:
+                self.portfolio.persist_position_state(position)
 
             # Let winners ride — don't close, alert instead
             if close_reason == "let_it_ride":

@@ -106,6 +106,29 @@ def init_db():
             metadata_json TEXT DEFAULT '{}'
         );
 
+        -- Bot-owned position state, keyed by slug. The exchange is the source
+        -- of truth for QUANTITY and COST, but it knows nothing about WHEN we
+        -- entered, what probability we believed, or the peak/telemetry the
+        -- risk logic needs. Without this table those reset on every scan
+        -- (entry_time=now => the 10-minute hold gate never elapsed and no
+        -- exit besides stop-loss could ever fire) and on every restart.
+        CREATE TABLE IF NOT EXISTS live_position_state (
+            slug TEXT PRIMARY KEY,
+            market_id TEXT DEFAULT '',
+            token_id TEXT DEFAULT '',
+            side TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            quantity REAL NOT NULL,
+            size_usd REAL NOT NULL,
+            estimated_prob REAL NOT NULL,
+            entry_time TEXT NOT NULL,
+            peak_price REAL DEFAULT 0,
+            max_favorable_pnl_usd REAL DEFAULT 0,
+            max_adverse_pnl_usd REAL DEFAULT 0,
+            let_it_ride_count INTEGER DEFAULT 0,
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
         CREATE INDEX IF NOT EXISTS idx_trades_close_time ON trades(close_time);
         CREATE INDEX IF NOT EXISTS idx_trades_slug ON trades(slug);
         CREATE INDEX IF NOT EXISTS idx_signal_log_slug ON signal_log(slug);
@@ -150,6 +173,49 @@ def insert_decision(
          polymarket_price, exec_price, estimated_prob, gross_edge, net_edge,
          spread, fee_rate, position_size_usd, decision, reason, metadata_json),
     )
+    conn.commit()
+    conn.close()
+
+
+def upsert_position_state(position) -> None:
+    """Persist a Position's bot-owned state (keyed by slug).
+
+    Called on open and on every telemetry update; INSERT OR REPLACE keeps it
+    idempotent. entry_time round-trips so hold-time logic survives both scan
+    reconstruction and process restarts.
+    """
+    conn = _get_conn()
+    entry_time = position.entry_time
+    entry_iso = entry_time.isoformat() if hasattr(entry_time, "isoformat") else str(entry_time)
+    conn.execute(
+        """INSERT OR REPLACE INTO live_position_state
+           (slug, market_id, token_id, side, entry_price, quantity, size_usd,
+            estimated_prob, entry_time, peak_price,
+            max_favorable_pnl_usd, max_adverse_pnl_usd, let_it_ride_count,
+            updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+        (position.slug, position.market_id, position.token_id, position.side,
+         position.entry_price, position.quantity, position.size_usd,
+         position.estimated_prob, entry_iso, position.peak_price,
+         position.max_favorable_pnl_usd, position.max_adverse_pnl_usd,
+         position.let_it_ride_count),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_position_states() -> Dict[str, Dict[str, Any]]:
+    """All persisted position states, keyed by slug."""
+    conn = _get_conn()
+    rows = conn.execute("SELECT * FROM live_position_state").fetchall()
+    conn.close()
+    return {r["slug"]: dict(r) for r in rows}
+
+
+def delete_position_state(slug: str) -> None:
+    """Remove a slug's state once the position is closed/settled."""
+    conn = _get_conn()
+    conn.execute("DELETE FROM live_position_state WHERE slug = ?", (slug,))
     conn.commit()
     conn.close()
 

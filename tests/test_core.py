@@ -3478,3 +3478,153 @@ class TestDirectionGuard:
         result = est.detect_edge(snap, min_edge=0.05, max_edge=0.40)
         assert result is not None
         assert result.side == "buy"
+
+
+# ============================================================================
+# Position state persistence (audit item #6)
+# ============================================================================
+
+class TestPositionStatePersistence:
+    def _tmp_db(self, tmp_path, monkeypatch):
+        import bot.trade_db as tdb
+        monkeypatch.setattr(tdb, "DB_PATH", str(tmp_path / "state.db"))
+        tdb.init_db()
+        return tdb
+
+    def _position(self, slug="aec-mlb-nyy-bos-2026-07-11", minutes_ago=45):
+        pos = Position(
+            market_id="m1", token_id="t1", side="buy", entry_price=0.52,
+            size_usd=10.0, quantity=19.0, estimated_prob=0.61,
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=minutes_ago),
+            slug=slug,
+        )
+        pos.peak_price = 0.60
+        pos.max_favorable_pnl_usd = 1.52
+        pos.max_adverse_pnl_usd = -0.40
+        pos.let_it_ride_count = 3
+        return pos
+
+    def test_roundtrip(self, tmp_path, monkeypatch):
+        tdb = self._tmp_db(tmp_path, monkeypatch)
+        pos = self._position()
+        tdb.upsert_position_state(pos)
+        states = tdb.get_position_states()
+        s = states[pos.slug]
+        assert s["estimated_prob"] == pytest.approx(0.61)
+        assert s["peak_price"] == pytest.approx(0.60)
+        assert s["let_it_ride_count"] == 3
+        restored_entry = datetime.fromisoformat(s["entry_time"])
+        assert abs((restored_entry - pos.entry_time).total_seconds()) < 1
+        tdb.delete_position_state(pos.slug)
+        assert tdb.get_position_states() == {}
+
+    def test_upsert_is_idempotent(self, tmp_path, monkeypatch):
+        tdb = self._tmp_db(tmp_path, monkeypatch)
+        pos = self._position()
+        tdb.upsert_position_state(pos)
+        pos.let_it_ride_count = 7
+        tdb.upsert_position_state(pos)
+        states = tdb.get_position_states()
+        assert len(states) == 1
+        assert states[pos.slug]["let_it_ride_count"] == 7
+
+    def test_paper_restore_survives_restart(self, tmp_path, monkeypatch):
+        """Restarted paper bot must keep managing its open positions with the
+        ORIGINAL entry_time — otherwise the 10-min hold gate re-arms forever."""
+        tdb = self._tmp_db(tmp_path, monkeypatch)
+        tdb.upsert_position_state(self._position(minutes_ago=45))
+
+        portfolio = Portfolio(paper_mode=True, initial_bankroll=1000,
+                              restore_state=True)
+        restored = portfolio.get_open_positions()
+        assert len(restored) == 1
+        pos = restored[0]
+        assert pos.slug == "aec-mlb-nyy-bos-2026-07-11"
+        assert pos.estimated_prob == pytest.approx(0.61)
+        assert pos.peak_price == pytest.approx(0.60)
+        held = (datetime.now(timezone.utc) - pos.entry_time).total_seconds()
+        assert held > 600  # min-hold gate already elapsed — exits can fire
+
+    def test_no_restore_by_default_keeps_tests_hermetic(self, tmp_path, monkeypatch):
+        tdb = self._tmp_db(tmp_path, monkeypatch)
+        tdb.upsert_position_state(self._position())
+        portfolio = Portfolio(paper_mode=True, initial_bankroll=1000)
+        assert portfolio.get_open_positions() == []
+
+    def test_live_reconstruction_overlays_persisted_state(self, tmp_path, monkeypatch):
+        """The audit bug: every scan rebuilt live positions with
+        entry_time=now and estimated_prob=0.5. The overlay must restore the
+        persisted values while the EXCHANGE stays authoritative for qty/cost."""
+        tdb = self._tmp_db(tmp_path, monkeypatch)
+        slug = "aec-mlb-nyy-bos-2026-07-11"
+        tdb.upsert_position_state(self._position(slug=slug, minutes_ago=45))
+
+        class _Client:
+            class account:
+                @staticmethod
+                def balances():
+                    return {"buyingPower": {"value": "500"}}
+
+            class portfolio:
+                @staticmethod
+                def positions():
+                    return {"positions": {slug: {
+                        "netPosition": "19",
+                        "cost": {"value": "9.88"},
+                        "cashValue": {"value": "11.40"},
+                    }}}
+
+        portfolio = Portfolio(exchange_client=_Client(), paper_mode=False)
+        positions = portfolio.get_open_positions()
+        assert len(positions) == 1
+        pos = positions[0]
+        # Bot-owned state restored:
+        assert pos.estimated_prob == pytest.approx(0.61)      # not 0.5
+        held = (datetime.now(timezone.utc) - pos.entry_time).total_seconds()
+        assert held > 600                                     # not "now"
+        assert pos.peak_price == pytest.approx(0.60)
+        assert pos.let_it_ride_count == 3
+        # Exchange stays authoritative for size:
+        assert pos.quantity == 19
+        assert pos.size_usd == pytest.approx(9.88)
+
+    def test_live_position_without_state_gets_safe_defaults(self, tmp_path, monkeypatch):
+        self._tmp_db(tmp_path, monkeypatch)
+
+        class _Client:
+            class account:
+                @staticmethod
+                def balances():
+                    return {"buyingPower": {"value": "500"}}
+
+            class portfolio:
+                @staticmethod
+                def positions():
+                    return {"positions": {"mystery-slug": {
+                        "netPosition": "5",
+                        "cost": {"value": "2.50"},
+                        "cashValue": {"value": "2.60"},
+                    }}}
+
+        portfolio = Portfolio(exchange_client=_Client(), paper_mode=False)
+        positions = portfolio.get_open_positions()
+        assert len(positions) == 1
+        assert positions[0].estimated_prob == pytest.approx(0.5)
+
+    def test_close_deletes_state(self, tmp_path, monkeypatch):
+        tdb = self._tmp_db(tmp_path, monkeypatch)
+        portfolio = Portfolio(paper_mode=True, initial_bankroll=1000)
+        signal = TradeSignal(market_id="m1", token_id="t1", side="buy",
+                             estimated_prob=0.61, market_price=0.52, edge=0.09,
+                             position_size_usd=10, slug="close-state-test")
+        trade = Trade(market_id="m1", token_id="t1", side="buy", price=0.52,
+                      quantity=19, size_usd=10,
+                      timestamp=datetime.now(timezone.utc) - timedelta(minutes=20))
+        pos = portfolio.open_position(signal, trade)
+        assert "close-state-test" in tdb.get_position_states()
+
+        with patch("bot.trade_db.insert_exit_log"), \
+             patch("bot.trade_db.insert_trade"), \
+             patch("bot.edge_log.update_edge_log_outcome"):
+            portfolio.close_position(pos, current_price=0.58, reason="take_profit")
+        assert "close-state-test" not in tdb.get_position_states()
