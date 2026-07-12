@@ -1032,9 +1032,25 @@ class TradingBot:
 
                     live_markets, pregame_markets = self._split_markets(markets)
 
-                    # Build all snapshots, then rank and process best opportunities
+                    # Build snapshots ONLY for the priceable universe. Each
+                    # snapshot costs rate-limited API calls; the raw in-window
+                    # list (~2,000 on a Sunday: tennis, NPB, props) took 10+
+                    # minutes per full scan and froze the heartbeat. Priceable:
+                    # game markets in registered leagues, plus non-sports
+                    # markets (crypto/politics — no gameStartTime).
+                    from bot.signals.live_win_prob import slug_game_teams
+                    scannable = [
+                        m for m in markets
+                        if slug_game_teams(m.get("slug", "")) is not None
+                        or not m.get("gameStartTime")
+                    ]
+                    self.logger.info("full_scan_universe", {
+                        "in_window": len(markets),
+                        "priceable": len(scannable),
+                    })
+
                     snapshots = []
-                    for market in markets:
+                    for market in scannable:
                         if not self.running:
                             break
                         snapshot = self.market_data.build_snapshot(market)

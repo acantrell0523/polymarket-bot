@@ -10,7 +10,11 @@ api:
   max_retries: 3
   retry_backoff_base: 2.0
 onchain:
-  enabled: true
+  # DISABLED 2026-07-12: queries the INTL venue (clob.polymarket.com) with
+  # polymarket.us slugs (audit #8 — wrong exchange, unrelated data), ignores
+  # enrich_on_edge_only, and adds ~0.33s/market to every scan. Re-enable only
+  # after it's rebuilt against US-venue data and gated on edge candidates.
+  enabled: false
   max_requests_per_second: 3
   cache_ttl_seconds: 120
   enrich_all_markets: false
