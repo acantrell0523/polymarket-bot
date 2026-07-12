@@ -84,6 +84,7 @@ _DEFAULT_SIGNAL_WEIGHTS: Dict[str, Dict[str, float]] = {
         "order_book_imbalance": 0.15,
         "liquidity_imbalance": 0.10,
         "onchain_flow": 0.10,
+        "live_win_prob": 0.55,   # in-game only (confidence 0 pregame)
     },
     "crypto": {
         "crypto_model": 0.45,

@@ -190,27 +190,10 @@ def _parse_token_ids(market: Dict) -> Tuple[str, str]:
         return "", ""
 
 
-# Known ESPN ↔ Polymarket abbreviation differences, per league.
-# Verified live against Gamma on 2026-07-11 (MLB/WNBA); other leagues'
-# mismatches surface as "no_market" log lines — add mappings as discovered.
-ABBR_MAP = {
-    "nba": {
-        "sa":  "sas",   # San Antonio Spurs
-        "gs":  "gsw",   # Golden State Warriors
-        "ny":  "nyk",   # New York Knicks
-        "no":  "nor",   # New Orleans Pelicans
-    },
-    "mlb": {
-        "chw": "cws",   # Chicago White Sox
-        "ath": "oak",   # Athletics (Polymarket kept the oak code)
-    },
-    "wnba": {
-        "gs":  "gsv",   # Golden State Valkyries
-        "con": "conn",  # Connecticut Sun
-        "lv":  "las",   # Las Vegas Aces
-        "ny":  "nyl",   # New York Liberty
-    },
-}
+# ABBR_MAP now lives in bot/leagues.py (canonical copy) — the live
+# win-prob cache and book matching need it too, and bot code must not
+# import from scripts/.
+from bot.leagues import ABBR_MAP
 
 
 def candidate_slugs(game: Dict) -> List[str]:

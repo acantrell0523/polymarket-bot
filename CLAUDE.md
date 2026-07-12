@@ -34,10 +34,33 @@ richer pre-game consensus. **Verified live: upcoming games record
 num_books=3-5; the ">7% edge needs 3 books" rule is now unlockable in
 backtests.**
 
-Tests: 234 passing. Remaining audit items (next): ESPN clock parsing from
-recorded payloads (#7), aux signals as deltas around the prior (full fix
-behind the direction guard), point-in-time backtest rebuild, CI + Ruff
-cleanup (83 findings).
+**Live in-game edge engine (same session, late PM):** the flagship feature.
+New `bot/signals/live_win_prob.py` — `LiveWinProbCache` sweeps registered
+leagues' scoreboards for in-progress games (TTL 20s) and reads ESPN's
+per-play `winprobability` model from the game summary (verified live against
+TOR@SD in the 8th: model 16.6% vs Polymarket 17.7c). New `live_win_prob`
+signal (freshness-gated: conf 0.90 under 30s old, decays to 0 at 150s —
+stale model output gets NO vote) becomes the PRIMARY external signal for
+live sports snapshots, replacing the stale pregame line; the external gate
+and direction guard operate on it. Weight 0.55 in-game, strict no-op
+pregame. Wired into both estimators via `live_cache`.
+
+**Audit #7 FIXED (same session):** `displayClock`/`period` were read off
+`status["type"]` where they don't exist (verified against a live payload) —
+always defaulting to full-game time remaining, defeating the last-5-minutes
+gate. Now read from `event["status"]`, and a live clocked game with an
+unreadable clock FAILS CLOSED (0s remaining = entries blocked).
+
+**Book dedup (same session):** FanDuel sometimes double-lists a game's
+moneyline; the aggregator now keeps one entry per book, so num_books counts
+DISTINCT books (a 3-book game had reported 5).
+
+**ABBR_MAP** moved to `bot/leagues.py` (canonical; scripts import from there;
+`normalize_abbr()` helper).
+
+Tests: 252 passing. Remaining audit items: aux signals as deltas around the
+prior (full fix behind the direction guard), point-in-time backtest rebuild,
+CI + Ruff cleanup (83 findings).
 
 ---
 

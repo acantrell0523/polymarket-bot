@@ -3776,3 +3776,230 @@ class TestMultiBookRecorder:
             rich["espn_consensus_prob"])
         assert existing_num_books(conn, "mlb-nyy-bos-2026-07-11") == 3
         conn.close()
+
+
+# ============================================================================
+# Live in-game edge engine (live win prob), clock fix (audit #7), book dedup
+# ============================================================================
+
+from bot.signals.live_win_prob import LiveWinProbCache, slug_game_teams
+from bot.signals.signals import live_win_prob_signal
+from bot.game_schedule import GameSchedule
+
+
+class TestSlugGameTeams:
+    def test_prefixed_and_bare_families(self):
+        assert slug_game_teams("aec-mlb-nyy-bos-2026-07-11") == ("mlb", "nyy", "bos")
+        assert slug_game_teams("mlb-nyy-bos-2026-07-11") == ("mlb", "nyy", "bos")
+        assert slug_game_teams("aec-wnba-gsv-conn-2026-07-10") == ("wnba", "gsv", "conn")
+
+    def test_non_game_slugs_are_none(self):
+        assert slug_game_teams("will-the-celtics-win-the-2026-nba-finals") is None
+        assert slug_game_teams("bitcoin-100k-2026") is None
+
+
+class _StubLiveCache(LiveWinProbCache):
+    """LiveWinProbCache with canned payloads (no network)."""
+
+    def __init__(self, scoreboard=None, summary=None, **kw):
+        super().__init__(**kw)
+        self._scoreboard_payload = scoreboard
+        self._summary_payload = summary
+
+    def _fetch_json(self, url, params=None):
+        if "scoreboard" in url:
+            return self._scoreboard_payload
+        return self._summary_payload
+
+
+def _espn_live_scoreboard(away="TOR", home="SD", game_id="401696001"):
+    return {"events": [{
+        "id": game_id,
+        "status": {"type": {"state": "in"}},
+        "competitions": [{"competitors": [
+            {"homeAway": "home", "team": {"abbreviation": home}},
+            {"homeAway": "away", "team": {"abbreviation": away}},
+        ]}],
+    }]}
+
+
+class TestLiveWinProbCache:
+    def test_maps_slug_to_away_team_probability(self):
+        cache = _StubLiveCache(
+            scoreboard=_espn_live_scoreboard(),
+            summary={"winprobability": [
+                {"homeWinPercentage": 0.5, "playId": "1"},
+                {"homeWinPercentage": 0.835, "playId": "2"},   # latest point wins
+            ]},
+        )
+        result = cache.get_live_prob("aec-mlb-tor-sd-2026-07-11")
+        assert result is not None
+        prob, age = result
+        assert prob == pytest.approx(1 - 0.835)   # away = YES side
+        assert age < 5
+
+    def test_abbr_normalization_applies(self):
+        # ESPN says CHW; slugs say cws — normalize_abbr must bridge them
+        cache = _StubLiveCache(
+            scoreboard=_espn_live_scoreboard(away="CHW", home="DET"),
+            summary={"winprobability": [{"homeWinPercentage": 0.40}]},
+        )
+        assert cache.get_live_prob("aec-mlb-cws-det-2026-07-11") is not None
+
+    def test_no_live_game_returns_none(self):
+        cache = _StubLiveCache(
+            scoreboard={"events": [{"id": "1",
+                                    "status": {"type": {"state": "pre"}},
+                                    "competitions": [{"competitors": []}]}]},
+            summary=None,
+        )
+        assert cache.get_live_prob("aec-mlb-tor-sd-2026-07-11") is None
+
+    def test_missing_model_output_returns_none(self):
+        cache = _StubLiveCache(scoreboard=_espn_live_scoreboard(),
+                               summary={"winprobability": []})
+        assert cache.get_live_prob("aec-mlb-tor-sd-2026-07-11") is None
+
+    def test_network_failure_returns_none(self):
+        cache = _StubLiveCache(scoreboard=None, summary=None)
+        assert cache.get_live_prob("aec-mlb-tor-sd-2026-07-11") is None
+
+
+class _FixedProbCache:
+    def __init__(self, prob, age):
+        self.prob, self.age = prob, age
+
+    def get_live_prob(self, slug):
+        return (self.prob, self.age)
+
+
+class TestLiveWinProbSignal:
+    def _live_snapshot(self, price=0.40):
+        snap = MarketSnapshot(
+            market_id="m", token_id="t", question="q", price=price,
+            volume_24h=5000, liquidity=5000, order_book=OrderBook(
+                bids=[OrderBookLevel(price=price - 0.02, size=800)],
+                asks=[OrderBookLevel(price=price + 0.02, size=800)]),
+            price_history=[price] * 20, timestamp=datetime.now(timezone.utc),
+            slug="aec-mlb-tor-sd-2026-07-11",
+        )
+        snap.is_live = True
+        return snap
+
+    def test_fresh_data_high_confidence_signed_edge(self, signal_config):
+        sig = live_win_prob_signal(self._live_snapshot(0.40), signal_config,
+                                   _FixedProbCache(0.55, age=10))
+        assert sig.confidence == pytest.approx(0.90)
+        assert sig.value == pytest.approx(0.55)
+        assert sig.metadata["edge"] == pytest.approx(0.15)
+
+    def test_stale_data_gets_zero_confidence(self, signal_config):
+        sig = live_win_prob_signal(self._live_snapshot(), signal_config,
+                                   _FixedProbCache(0.55, age=200))
+        assert sig.confidence == 0.0
+
+    def test_confidence_decays_between_30_and_150s(self, signal_config):
+        c90 = live_win_prob_signal(self._live_snapshot(), signal_config,
+                                   _FixedProbCache(0.55, age=90)).confidence
+        assert 0 < c90 < 0.90
+
+    def test_pregame_snapshot_is_noop(self, signal_config):
+        snap = self._live_snapshot()
+        snap.is_live = False
+        sig = live_win_prob_signal(snap, signal_config, _FixedProbCache(0.55, 10))
+        assert sig.confidence == 0.0
+
+    def test_estimator_uses_live_model_as_primary_in_game(self, signal_config):
+        """The heart of the live-edge feature: in a live game, ESPN's model
+        (not the stale pregame line) is the primary external signal, and its
+        divergence from the Polymarket price becomes the trade edge."""
+        est = ProbabilityEstimator(signal_config, odds_cache=None,
+                                   live_cache=_FixedProbCache(0.55, age=10))
+        snap = self._live_snapshot(price=0.40)
+        result = est.detect_edge(snap, min_edge=0.05, max_edge=0.40)
+        assert result is not None
+        assert result.side == "buy"
+        assert result.edge > 0.05
+        # And the direction guard operates on the LIVE signal now:
+        est2 = ProbabilityEstimator(signal_config, odds_cache=None,
+                                    live_cache=_FixedProbCache(0.36, age=10))
+        r2 = est2.detect_edge(snap, min_edge=0.03, max_edge=0.40)
+        assert r2 is None or r2.side == "sell"
+
+    def test_pregame_still_requires_odds_value(self, signal_config):
+        """No live data + no odds cache => external gate blocks, unchanged."""
+        est = ProbabilityEstimator(signal_config, odds_cache=None,
+                                   live_cache=_FixedProbCache(0.55, age=10))
+        snap = self._live_snapshot(price=0.40)
+        snap.is_live = False
+        assert est.detect_edge(snap, min_edge=0.05, max_edge=0.40) is None
+
+
+class TestClockParsingFix:
+    """Audit #7: displayClock/period live on event['status'], NOT on
+    status['type'] — reading the type object defaulted to full-game time
+    remaining and defeated the last-5-minutes gate."""
+
+    def _schedule_with_event(self, event):
+        gs = GameSchedule(cache_ttl=999)
+        gs._get_events = lambda sport: [event]
+        return gs
+
+    @staticmethod
+    def _event(display_clock, period, away="PHX", home="LV"):
+        return {
+            "status": {"type": {"name": "STATUS_IN_PROGRESS"},
+                       "displayClock": display_clock, "period": period},
+            "competitions": [{"competitors": [
+                {"homeAway": "home", "team": {"abbreviation": home,
+                                              "displayName": home}},
+                {"homeAway": "away", "team": {"abbreviation": away,
+                                              "displayName": away}},
+            ]}],
+        }
+
+    def test_reads_clock_from_status_object(self):
+        # WNBA Q2 with 3:07 left: 2 future quarters (1200s) + 187s = 1387s —
+        # NOT 2400 (the audit's full-game misread)
+        gs = self._schedule_with_event(self._event("3:07", 2))
+        remaining = gs.get_game_time_remaining("wnba", "phx", "lv")
+        assert remaining == pytest.approx(2 * 600 + 187)
+
+    def test_last_five_minutes_detectable(self):
+        gs = self._schedule_with_event(self._event("2:30", 4))
+        remaining = gs.get_game_time_remaining("wnba", "phx", "lv")
+        assert remaining == pytest.approx(150)
+        assert remaining < 300  # the safety gate can actually fire now
+
+    def test_unreadable_clock_fails_closed(self):
+        # Live clocked game, no parseable clock -> 0 remaining (BLOCKS entry),
+        # never "full game left"
+        ev = self._event(None, 0)
+        del ev["status"]["displayClock"]
+        gs = self._schedule_with_event(ev)
+        assert gs.get_game_time_remaining("wnba", "phx", "lv") == 0.0
+
+    def test_clockless_sport_returns_none(self):
+        gs = self._schedule_with_event(self._event("0:00", 7, away="TOR", home="SD"))
+        assert gs.get_game_time_remaining("mlb", "tor", "sd") is None
+
+
+class TestBookDedup:
+    def test_duplicate_book_entries_counted_once(self):
+        from bot.signals.book_scrapers import MultiBookAggregator
+        agg = MultiBookAggregator(cache_ttl=999)
+        # FanDuel double-lists the game; Pinnacle lists once
+        events = [
+            {"book": "fanduel", "home_team": "Boston Red Sox",
+             "away_team": "New York Yankees", "home_prob": 0.60, "away_prob": 0.40},
+            {"book": "fanduel", "home_team": "Boston Red Sox",
+             "away_team": "New York Yankees", "home_prob": 0.61, "away_prob": 0.39},
+            {"book": "pinnacle", "home_team": "Boston Red Sox",
+             "away_team": "New York Yankees", "home_prob": 0.58, "away_prob": 0.42},
+        ]
+        agg.fanduel.get_odds = lambda sk: events[:2]
+        agg.pinnacle.get_odds = lambda sk: events[2:]
+        consensus = agg.get_consensus("baseball_mlb")
+        assert len(consensus) == 1
+        assert consensus[0]["num_books"] == 2          # not 3
+        assert sorted(consensus[0]["books"]) == ["fanduel", "pinnacle"]

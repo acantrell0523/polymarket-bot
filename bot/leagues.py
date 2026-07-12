@@ -71,6 +71,36 @@ LEAGUES: Dict[str, Dict] = {
 }
 
 
+# Known ESPN ↔ Polymarket abbreviation differences, per league.
+# Verified live against Gamma slugs (2026-07-11). This is the canonical copy;
+# scripts/ingest_historical.py imports it from here. Everything downstream
+# (slug candidates, book matching, live win-prob mapping) uses the
+# NORMALIZED abbr: ABBR_MAP[league].get(espn_abbr, espn_abbr).
+ABBR_MAP = {
+    "nba": {
+        "sa":  "sas",   # San Antonio Spurs
+        "gs":  "gsw",   # Golden State Warriors
+        "ny":  "nyk",   # New York Knicks
+        "no":  "nor",   # New Orleans Pelicans
+    },
+    "mlb": {
+        "chw": "cws",   # Chicago White Sox
+        "ath": "oak",   # Athletics (Polymarket kept the oak code)
+    },
+    "wnba": {
+        "gs":  "gsv",   # Golden State Valkyries
+        "con": "conn",  # Connecticut Sun
+        "lv":  "las",   # Las Vegas Aces
+        "ny":  "nyl",   # New York Liberty
+    },
+}
+
+
+def normalize_abbr(league: str, espn_abbr: str) -> str:
+    """ESPN team abbreviation → the normalized/Polymarket abbr space."""
+    return ABBR_MAP.get(league, {}).get(espn_abbr, espn_abbr)
+
+
 def all_league_codes() -> List[str]:
     return list(LEAGUES.keys())
 

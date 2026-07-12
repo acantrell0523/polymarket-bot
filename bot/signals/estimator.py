@@ -23,6 +23,7 @@ from bot.signals.signals import (
     crypto_model_signal,
     sports_context_signal,
     onchain_flow_signal,
+    live_win_prob_signal,
 )
 from bot.signals.odds_api import OddsCache
 from bot.signals.cross_market import PredictItCache
@@ -55,6 +56,10 @@ WEIGHTS = {
         "order_book_imbalance": 0.15,
         "liquidity_imbalance": 0.10,
         "onchain_flow": 0.10,
+        # ESPN in-game win-probability model. Confidence 0 pregame, so this
+        # weight only participates during live games — where it dominates
+        # the pool (0.55 * conf 0.9 outweighs everything else combined).
+        "live_win_prob": 0.55,
     },
     "crypto": {
         "crypto_model": 0.45,
@@ -132,6 +137,7 @@ class ProbabilityEstimator:
         espn_cache: Optional[ESPNCache] = None,
         game_context_analyzer: Optional[GameContextAnalyzer] = None,
         onchain_client=None,
+        live_cache=None,
     ):
         self.config = config
         self.odds_cache = odds_cache
@@ -140,6 +146,8 @@ class ProbabilityEstimator:
         self.espn_cache = espn_cache
         self.game_context_analyzer = game_context_analyzer
         self.onchain_client = onchain_client
+        # LiveWinProbCache: ESPN in-game win probabilities (live-edge engine)
+        self.live_cache = live_cache
 
     def compute_signals(self, snapshot: MarketSnapshot, market_type: str) -> List[Signal]:
         """Compute signals appropriate for the market type."""
@@ -159,6 +167,11 @@ class ProbabilityEstimator:
             signals.append(sports_context_signal(
                 snapshot, self.config, self.espn_cache, self.game_context_analyzer
             ))
+            # Live games: ESPN's per-play win-probability model becomes the
+            # primary external signal (see _get_primary_signal). No-op
+            # (confidence 0) pregame or without a live cache.
+            if self.live_cache is not None and getattr(snapshot, "is_live", False):
+                signals.append(live_win_prob_signal(snapshot, self.config, self.live_cache))
         elif market_type == "crypto":
             signals.append(crypto_model_signal(snapshot, self.config, self.crypto_cache))
             signals.append(cross_market_signal(snapshot, self.config, self.predictit_cache))
@@ -192,7 +205,20 @@ class ProbabilityEstimator:
         return (edge > 0) != (ext_signed > 0) and abs(edge) > 1e-9
 
     def _get_primary_signal(self, signals: List[Signal], market_type: str) -> Optional[Signal]:
-        """Get the primary external validation signal for this market type."""
+        """Get the primary external validation signal for this market type.
+
+        Sports: DURING a live game the ESPN win-probability model outranks
+        the pregame sportsbook consensus — the pregame line is stale the
+        moment anything happens on the field/court. The live signal only
+        exists (confidence > 0) for in-progress games with fresh model data,
+        so pregame behavior is unchanged.
+        """
+        if market_type == "sports":
+            live = next((s for s in signals
+                         if s.name == "live_win_prob" and s.confidence > 0), None)
+            if live is not None:
+                return live
+
         primary_name = {
             "sports": "odds_value",
             "crypto": "crypto_model",

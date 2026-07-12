@@ -260,6 +260,57 @@ def liquidity_imbalance_signal(snapshot: MarketSnapshot, config: SignalConfig) -
     )
 
 
+def live_win_prob_signal(
+    snapshot: MarketSnapshot,
+    config: SignalConfig,
+    live_cache=None,
+) -> Signal:
+    """ESPN live win-probability model vs the Polymarket price — the PRIMARY
+    external signal for live games.
+
+    While a game is in progress, the pregame sportsbook consensus is stale
+    the moment anything happens; ESPN's per-play model reprices within
+    seconds. Edge = model prob − market price captures Polymarket's repricing
+    lag, which is where in-game edges live.
+
+    Confidence is freshness-driven: 0.90 for data under 30s old, decaying
+    linearly to 0 at 150s. A stale model output is misinformation during a
+    live game, so it gets no vote rather than a reduced one.
+    """
+    neutral = Signal(name="live_win_prob", value=0.5, confidence=0.0,
+                     direction="neutral", metadata={"reason": "no_live_data"})
+    if live_cache is None or not getattr(snapshot, "is_live", False):
+        return neutral
+
+    try:
+        result = live_cache.get_live_prob(snapshot.slug)
+    except Exception as e:
+        neutral.metadata["reason"] = f"live_lookup_failed: {e}"
+        return neutral
+    if result is None:
+        return neutral
+
+    prob, age = result
+    prob = max(0.01, min(0.99, prob))
+
+    if age <= 30:
+        confidence = 0.90
+    elif age >= 150:
+        return Signal(name="live_win_prob", value=prob, confidence=0.0,
+                      direction="neutral", metadata={"reason": "stale", "age": age})
+    else:
+        confidence = 0.90 * (150 - age) / 120
+
+    edge = prob - snapshot.price
+    return Signal(
+        name="live_win_prob",
+        value=float(prob),
+        confidence=float(confidence),
+        direction="bullish" if edge > 0 else "bearish" if edge < 0 else "neutral",
+        metadata={"edge": edge, "age_seconds": age, "source": "espn_win_probability"},
+    )
+
+
 def cross_market_signal(
     snapshot: MarketSnapshot,
     config: SignalConfig,

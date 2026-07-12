@@ -183,26 +183,43 @@ class GameSchedule:
             if not matched:
                 continue
 
-            # Parse clock and period to estimate time remaining
-            clock = status.get("displayClock", "0:00")
-            period = status.get("period", 0)
+            # AUDIT #7 FIX: displayClock and period live on event["status"],
+            # NOT on status["type"] (verified against a live payload
+            # 2026-07-11). Reading them off the type object always defaulted
+            # to "0:00"/period 0, which computed FULL-GAME time remaining
+            # (e.g. 3:07 left in Q2 read as 2,400s) and silently defeated the
+            # last-5-minutes safety gate.
+            status_obj = event.get("status", {})
+            clock_raw = status_obj.get("displayClock")
+            period = int(status_obj.get("period") or 0)
 
-            try:
-                # Soccer clocks render as "67'" (minutes elapsed, counting up);
-                # stoppage time as "90'+". Strip the markers before parsing.
-                clean = clock.replace("'", "").replace("+", "").strip()
-                parts = clean.split(":")
-                if len(parts) == 2:
-                    clock_seconds = int(parts[0]) * 60 + int(float(parts[1]))
-                elif "'" in clock:
-                    clock_seconds = int(float(parts[0])) * 60  # minutes elapsed
-                else:
-                    clock_seconds = int(float(parts[0]))
-            except (ValueError, TypeError):
-                clock_seconds = 0
+            clock_seconds: Optional[float] = None
+            if clock_raw is not None:
+                try:
+                    # Soccer clocks render as "67'" (minutes elapsed, counting
+                    # up); stoppage time as "90'+". Strip markers before parsing.
+                    clock = str(clock_raw)
+                    clean = clock.replace("'", "").replace("+", "").strip()
+                    parts = clean.split(":")
+                    if len(parts) == 2:
+                        clock_seconds = int(parts[0]) * 60 + int(float(parts[1]))
+                    elif "'" in clock:
+                        clock_seconds = int(float(parts[0])) * 60  # minutes elapsed
+                    else:
+                        clock_seconds = float(parts[0])
+                except (ValueError, TypeError):
+                    clock_seconds = None
 
-            # Per-league clock math lives in the registry. None = clockless
-            # sport (baseball) or unknown league — no last-5-minutes block.
+            # Clockless sport (baseball)? The registry says so — no block.
+            if game_seconds_remaining(sport, 1, 0) is None:
+                return None
+
+            # FAIL-CLOSED: a clocked sport that is LIVE but whose clock we
+            # cannot read gets 0 seconds remaining, which BLOCKS new entries.
+            # The old behavior (default to full game) failed open.
+            if clock_seconds is None or (clock_seconds == 0 and period == 0):
+                return 0.0
+
             remaining = game_seconds_remaining(sport, period, clock_seconds)
             if remaining is None:
                 return None

@@ -402,12 +402,20 @@ class MultiBookAggregator:
         except Exception:
             pass
 
-        # Group by game (league-aware abbr matching)
+        # Group by game (league-aware abbr matching), ONE entry per book —
+        # FanDuel sometimes lists duplicate moneyline markets for a game,
+        # which inflated num_books (observed live: a 3-book game reporting 5)
+        # and over-weighted that book in the consensus.
         games: Dict[str, List[dict]] = {}
         for ev in all_events:
             key = self._game_key(ev["home_team"], ev["away_team"], sport_key)
-            if key:
-                games.setdefault(key, []).append(ev)
+            if not key:
+                continue
+            entries = games.setdefault(key, [])
+            book = ev.get("book", "unknown")
+            if any(e.get("book", "unknown") == book for e in entries):
+                continue  # dedup: keep the first entry per book
+            entries.append(ev)
 
         self._cache[cache_key] = (now, games)
         return games

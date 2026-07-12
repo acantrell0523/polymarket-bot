@@ -176,6 +176,10 @@ class TradingBot:
                 cache_ttl=config.onchain.cache_ttl_seconds,
             )
 
+        # Live in-game win probabilities (ESPN model) — the live-edge engine
+        from bot.signals.live_win_prob import LiveWinProbCache
+        self.live_cache = LiveWinProbCache()
+
         # Liveness + API health tracking (heartbeat file read by supervisor)
         self._data_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
         self.health = HealthMonitor(
@@ -199,6 +203,7 @@ class TradingBot:
         self.estimator = ProbabilityEstimator(
             config.signals, self.odds_cache, self.predictit_cache, self.crypto_cache,
             self.espn_cache, self.game_context, onchain_client=self.onchain_client,
+            live_cache=self.live_cache,
         )
 
         self.portfolio = Portfolio(
@@ -235,6 +240,7 @@ class TradingBot:
         self.live_estimator = ProbabilityEstimator(
             live_signal_config, self.odds_cache, self.predictit_cache, self.crypto_cache,
             self.espn_cache, self.game_context, onchain_client=self.onchain_client,
+            live_cache=self.live_cache,
         )
 
         # Live-game trading overrides — use same edge threshold as config
