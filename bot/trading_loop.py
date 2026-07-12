@@ -286,12 +286,25 @@ class TradingBot:
         return game_start <= datetime.now(timezone.utc)
 
     def _split_markets(self, markets: List[Dict]):
-        """Split markets into live and pre-game lists."""
+        """Split markets into live and pre-game lists.
+
+        The live list is restricted to GAME markets in registered leagues —
+        markets our signals can actually price. Measured live during UFC 329:
+        476 markets carried a started gameStartTime, ~140 of them UFC props
+        (method-of-victory, round props) that no signal can value; scanning
+        them stretched the intended 3-second live pass to 5+ minutes of API
+        calls for zero tradeable output.
+        """
+        from bot.signals.live_win_prob import slug_game_teams
+
         live = []
         pregame = []
         for m in markets:
             if self._is_live_market(m):
-                live.append(m)
+                if slug_game_teams(m.get("slug", "")) is not None:
+                    live.append(m)
+                # non-game live markets (props etc.): unpriceable — drop from
+                # the fast path; the 60s full scan still sees them.
             else:
                 pregame.append(m)
         return live, pregame
@@ -1055,6 +1068,15 @@ class TradingBot:
                     live_markets, _ = self._split_markets(self._cached_markets)
 
                     if live_markets:
+                        # Beat inside the fast path too: a long live pass must
+                        # not look like a dead loop to the supervisor.
+                        self.health.beat({
+                            "cycle": cycle,
+                            "mode": mode,
+                            "phase": "live_scan",
+                            "live_count": len(live_markets),
+                            "open_positions": len(self.portfolio.get_open_positions()),
+                        })
                         self.logger.info("live_scan_start", {
                             "cycle": cycle,
                             "live_count": len(live_markets),

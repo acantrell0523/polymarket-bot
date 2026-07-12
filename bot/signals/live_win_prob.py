@@ -52,9 +52,18 @@ def slug_game_teams(slug: str) -> Optional[Tuple[str, str, str]]:
     if not league:
         return None
     idx = 0 if parts[0] == league else 1
-    if len(parts) < idx + 4:
+    # Strict shape: {league}-{away}-{home}-{yyyy}-{mm}-{dd} and NOTHING after
+    # the date. Prop/outright slugs share the league token but have extra
+    # segments (astatc-ufc-...-mov-f1-ko) or non-team fields
+    # (tec-mlb-nlchamp-2026-...) — those are not priceable game markets.
+    if len(parts) != idx + 6:
         return None
-    return league, parts[idx + 1], parts[idx + 2]
+    away, home, year = parts[idx + 1], parts[idx + 2], parts[idx + 3]
+    if not (away.isalpha() and home.isalpha()):
+        return None
+    if not (len(year) == 4 and year.isdigit()):
+        return None
+    return league, away, home
 
 
 class LiveWinProbCache:
