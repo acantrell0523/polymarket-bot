@@ -31,9 +31,79 @@ def _normalize_team(name: str) -> str:
     return name.lower().strip()
 
 
-def _match_abbr(full_name: str) -> str:
-    """Reverse-lookup: find the abbreviation for a full team name."""
+# League-scoped team fragments, keyed by the ABBR_MAP-normalized ESPN
+# abbreviation the recorder uses (== Polymarket's where verified live).
+# Nicknames are unique WITHIN a league, which sidesteps the flat-dict
+# collisions: "Las Vegas Aces" contains NHL's "vegas" fragment (vgk),
+# "Chicago Cubs" contains NBA's "chicago" (chi), "Golden State Valkyries"
+# contains "golden state" (gs) — city-first matching returned the wrong
+# league's abbreviation for all of them.
+LEAGUE_TEAM_FRAGMENTS = {
+    "baseball_mlb": {
+        "ari": "diamondbacks", "atl": "braves", "bal": "orioles",
+        "bos": "red sox", "chc": "cubs", "cws": "white sox",
+        "cin": "reds", "cle": "guardians", "col": "rockies",
+        "det": "tigers", "hou": "astros", "kc": "royals",
+        "laa": "angels", "lad": "dodgers", "mia": "marlins",
+        "mil": "brewers", "min": "twins", "nym": "mets",
+        "nyy": "yankees", "oak": "athletics", "phi": "phillies",
+        "pit": "pirates", "sd": "padres", "sea": "mariners",
+        "sf": "giants", "stl": "cardinals", "tb": "rays",
+        "tex": "rangers", "tor": "blue jays", "wsh": "nationals",
+    },
+    "basketball_wnba": {
+        "atl": "dream", "chi": "sky", "conn": "sun", "dal": "wings",
+        "gsv": "valkyries", "ind": "fever", "la": "sparks",
+        "las": "aces", "min": "lynx", "nyl": "liberty",
+        "phx": "mercury", "por": "fire", "sea": "storm",
+        "tor": "tempo", "wsh": "mystics",
+    },
+    "soccer_usa_mls": {
+        # Pinnacle/ESPN use distinctive club names; extend as matches surface
+        "atl": "atlanta united", "atx": "austin", "clt": "charlotte fc",
+        "chi": "chicago fire", "cin": "fc cincinnati", "col": "colorado rapids",
+        "clb": "columbus crew", "dal": "fc dallas", "dc": "d.c. united",
+        "hou": "dynamo", "skc": "sporting kansas city", "la": "la galaxy",
+        "lafc": "lafc", "mia": "inter miami", "min": "minnesota united",
+        "mtl": "montr", "nsh": "nashville", "ne": "new england",
+        "nyc": "new york city", "rbny": "red bulls", "orl": "orlando city",
+        "phi": "philadelphia union", "por": "timbers", "rsl": "real salt lake",
+        "sd": "san diego fc", "sj": "earthquakes", "sea": "sounders",
+        "stl": "st. louis city", "tor": "toronto fc", "van": "whitecaps",
+    },
+}
+
+
+def fighter_code(full_name: str) -> str:
+    """Polymarket's UFC fighter code: first 3 of first name + first 3 of last.
+
+    Verified against tonight's card (2026-07-11): "Max Holloway" -> maxhol,
+    "Conor McGregor" -> conmcg (slug aec-ufc-maxhol-conmcg-2026-07-11).
+    """
+    parts = [p for p in full_name.lower().replace(".", "").split() if p]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0][:6]
+    return (parts[0][:3] + parts[-1][:3])
+
+
+def _match_abbr(full_name: str, sport_key: str = "") -> str:
+    """Reverse-lookup: find the abbreviation for a full team name.
+
+    League-scoped nickname fragments take precedence when the caller knows
+    the sport; MMA derives the fighter code from the name (no fixed roster);
+    the flat cross-league TEAM_ABBREVS remains the fallback for the original
+    NBA/NHL/NCAA paths.
+    """
     name = full_name.lower()
+    if sport_key == "mma_mixed_martial_arts":
+        return fighter_code(full_name)
+    league_fragments = LEAGUE_TEAM_FRAGMENTS.get(sport_key)
+    if league_fragments:
+        for abbr, fragment in league_fragments.items():
+            if fragment and fragment in name:
+                return abbr
     for abbr, fragment in TEAM_ABBREVS.items():
         if fragment and fragment in name:
             return abbr
@@ -49,6 +119,10 @@ FANDUEL_SPORTS = {
     "basketball_nba": "nba",
     "basketball_ncaab": "ncaab",
     "icehockey_nhl": "nhl",
+    # Summer sports (verified live 2026-07-11: mlb=27 ML markets, wnba=5).
+    # No MLS custom page exists — MLS coverage comes from Pinnacle + ESPN.
+    "baseball_mlb": "mlb",
+    "basketball_wnba": "wnba",
 }
 
 
@@ -176,6 +250,11 @@ PINNACLE_LEAGUES = {
     "basketball_nba": 487,
     "basketball_ncaab": 493,
     "icehockey_nhl": 1456,
+    # Discovered live 2026-07-11 via /0.1/sports/{id}/leagues
+    "baseball_mlb": 246,
+    "basketball_wnba": 578,
+    "soccer_usa_mls": 2663,
+    "mma_mixed_martial_arts": 1624,   # UFC (Pinnacle serves live fight lines)
 }
 
 
@@ -341,12 +420,20 @@ class MultiBookAggregator:
         except Exception:
             pass
 
-        # Group by game
+        # Group by game (league-aware abbr matching), ONE entry per book —
+        # FanDuel sometimes lists duplicate moneyline markets for a game,
+        # which inflated num_books (observed live: a 3-book game reporting 5)
+        # and over-weighted that book in the consensus.
         games: Dict[str, List[dict]] = {}
         for ev in all_events:
-            key = self._game_key(ev["home_team"], ev["away_team"])
-            if key:
-                games.setdefault(key, []).append(ev)
+            key = self._game_key(ev["home_team"], ev["away_team"], sport_key)
+            if not key:
+                continue
+            entries = games.setdefault(key, [])
+            book = ev.get("book", "unknown")
+            if any(e.get("book", "unknown") == book for e in entries):
+                continue  # dedup: keep the first entry per book
+            entries.append(ev)
 
         self._cache[cache_key] = (now, games)
         return games
@@ -438,10 +525,10 @@ class MultiBookAggregator:
 
         return results
 
-    def _game_key(self, home: str, away: str) -> str:
+    def _game_key(self, home: str, away: str, sport_key: str = "") -> str:
         """Normalize game into a matchable key using abbreviations."""
-        h_abbr = _match_abbr(home)
-        a_abbr = _match_abbr(away)
+        h_abbr = _match_abbr(home, sport_key)
+        a_abbr = _match_abbr(away, sport_key)
         if h_abbr and a_abbr:
             return f"{a_abbr}@{h_abbr}"
         # Fallback: use lowercase fragments
@@ -453,8 +540,8 @@ class MultiBookAggregator:
         """Find consensus for a specific game by team abbreviations."""
         consensus = self.get_consensus(sport_key)
         for game in consensus:
-            h = _match_abbr(game["home_team"])
-            a = _match_abbr(game["away_team"])
+            h = _match_abbr(game["home_team"], sport_key)
+            a = _match_abbr(game["away_team"], sport_key)
             # Cross-check both orderings
             if (h == home_abbr and a == away_abbr) or (h == away_abbr and a == home_abbr):
                 return game

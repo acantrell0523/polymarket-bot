@@ -10,6 +10,7 @@ The external validation gate applies to ALL types: no external data = no trade.
 """
 
 import re
+import math
 from typing import List, Optional, Tuple, Dict
 from utils.models import MarketSnapshot, Signal, TradeSignal
 from utils.config import SignalConfig
@@ -21,6 +22,8 @@ from bot.signals.signals import (
     cross_market_signal,
     crypto_model_signal,
     sports_context_signal,
+    onchain_flow_signal,
+    live_win_prob_signal,
 )
 from bot.signals.odds_api import OddsCache
 from bot.signals.cross_market import PredictItCache
@@ -41,7 +44,10 @@ POLITICS_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
-# Weights per market type
+# Weights per market type.
+# onchain_flow is a supporting signal (whale/smart-money flow from free CLOB
+# data). It returns confidence=0 when no OnChainEnrichmentClient is wired in,
+# so listing it here is a strict no-op for deployments with onchain disabled.
 WEIGHTS = {
     "sports": {
         "odds_value": 0.40,
@@ -49,26 +55,45 @@ WEIGHTS = {
         "line_movement": 0.20,
         "order_book_imbalance": 0.15,
         "liquidity_imbalance": 0.10,
+        "onchain_flow": 0.10,
+        # ESPN in-game win-probability model. Confidence 0 pregame, so this
+        # weight only participates during live games — where it dominates
+        # the pool (0.55 * conf 0.9 outweighs everything else combined).
+        "live_win_prob": 0.55,
     },
     "crypto": {
         "crypto_model": 0.45,
         "cross_market": 0.25,
         "order_book_imbalance": 0.20,
         "liquidity_imbalance": 0.10,
+        "onchain_flow": 0.10,
     },
     "politics": {
         "cross_market": 0.45,
         "order_book_imbalance": 0.25,
         "line_movement": 0.15,
         "liquidity_imbalance": 0.15,
+        "onchain_flow": 0.10,
     },
     "other": {
         "cross_market": 0.40,
         "order_book_imbalance": 0.25,
         "line_movement": 0.20,
         "liquidity_imbalance": 0.15,
+        "onchain_flow": 0.10,
     },
 }
+
+
+def _logit(p: float) -> float:
+    """Log-odds of p, clamped away from 0/1 so it stays finite."""
+    p = min(max(p, 0.01), 0.99)
+    return math.log(p / (1.0 - p))
+
+
+def _sigmoid(x: float) -> float:
+    """Inverse of _logit."""
+    return 1.0 / (1.0 + math.exp(-x))
 
 
 def detect_market_type(snapshot: MarketSnapshot) -> str:
@@ -77,6 +102,12 @@ def detect_market_type(snapshot: MarketSnapshot) -> str:
 
     # Game-level slugs use structured prefixes (aec-, asc-, tsc-, atc-)
     if any(slug.startswith(p) for p in SPORTS_PREFIXES):
+        return "sports"
+
+    # Bare league slugs (polymarket.com / Gamma family — what the historical
+    # recorder stores): "mlb-mil-pit-2026-07-10", "wnba-gsv-conn-2026-07-10"
+    from bot.leagues import LEAGUES
+    if slug.split("-", 1)[0] in LEAGUES:
         return "sports"
 
     # NBA outright slugs (Finals winner, MVP, Conference finals, etc.) contain
@@ -105,6 +136,8 @@ class ProbabilityEstimator:
         crypto_cache: Optional[CryptoCache] = None,
         espn_cache: Optional[ESPNCache] = None,
         game_context_analyzer: Optional[GameContextAnalyzer] = None,
+        onchain_client=None,
+        live_cache=None,
     ):
         self.config = config
         self.odds_cache = odds_cache
@@ -112,6 +145,9 @@ class ProbabilityEstimator:
         self.crypto_cache = crypto_cache
         self.espn_cache = espn_cache
         self.game_context_analyzer = game_context_analyzer
+        self.onchain_client = onchain_client
+        # LiveWinProbCache: ESPN in-game win probabilities (live-edge engine)
+        self.live_cache = live_cache
 
     def compute_signals(self, snapshot: MarketSnapshot, market_type: str) -> List[Signal]:
         """Compute signals appropriate for the market type."""
@@ -120,12 +156,22 @@ class ProbabilityEstimator:
             liquidity_imbalance_signal(snapshot, self.config),
         ]
 
+        # Supplementary whale/smart-money flow — no-op (confidence=0) when the
+        # onchain client isn't wired in or has no data for this market.
+        if self.onchain_client is not None:
+            signals.append(onchain_flow_signal(snapshot, self.config, self.onchain_client))
+
         if market_type == "sports":
             signals.append(odds_value_signal(snapshot, self.config, self.odds_cache))
             signals.append(line_movement_signal(snapshot, self.config))
             signals.append(sports_context_signal(
                 snapshot, self.config, self.espn_cache, self.game_context_analyzer
             ))
+            # Live games: ESPN's per-play win-probability model becomes the
+            # primary external signal (see _get_primary_signal). No-op
+            # (confidence 0) pregame or without a live cache.
+            if self.live_cache is not None and getattr(snapshot, "is_live", False):
+                signals.append(live_win_prob_signal(snapshot, self.config, self.live_cache))
         elif market_type == "crypto":
             signals.append(crypto_model_signal(snapshot, self.config, self.crypto_cache))
             signals.append(cross_market_signal(snapshot, self.config, self.predictit_cache))
@@ -138,8 +184,41 @@ class ProbabilityEstimator:
 
         return signals
 
+    @staticmethod
+    def _direction_reversed(edge: float, primary: Signal, market_price: float) -> bool:
+        """True when the combined edge points the OPPOSITE way from the
+        primary external signal's own view of the market.
+
+        The external view is the signed edge the primary signal computed
+        (metadata["edge"] = external_prob - market_price); when a primary
+        doesn't record it, fall back to its value vs the market price.
+        A reversal means auxiliary signals overpowered the books — that is
+        never a trade, no matter the magnitude.
+        """
+        ext_signed = primary.metadata.get("edge")
+        if ext_signed is None:
+            ext_signed = primary.value - market_price
+        # No meaningful external direction => nothing to reverse (the edge
+        # cap at ext+1% keeps any aux-driven edge below trade thresholds).
+        if abs(ext_signed) < 1e-9:
+            return False
+        return (edge > 0) != (ext_signed > 0) and abs(edge) > 1e-9
+
     def _get_primary_signal(self, signals: List[Signal], market_type: str) -> Optional[Signal]:
-        """Get the primary external validation signal for this market type."""
+        """Get the primary external validation signal for this market type.
+
+        Sports: DURING a live game the ESPN win-probability model outranks
+        the pregame sportsbook consensus — the pregame line is stale the
+        moment anything happens on the field/court. The live signal only
+        exists (confidence > 0) for in-progress games with fresh model data,
+        so pregame behavior is unchanged.
+        """
+        if market_type == "sports":
+            live = next((s for s in signals
+                         if s.name == "live_win_prob" and s.confidence > 0), None)
+            if live is not None:
+                return live
+
         primary_name = {
             "sports": "odds_value",
             "crypto": "crypto_model",
@@ -173,6 +252,55 @@ class ProbabilityEstimator:
         estimated_prob = weighted_sum / weight_sum
         estimated_prob = max(0.01, min(0.99, estimated_prob))
 
+        return estimated_prob, self._overall_confidence(signals, weights)
+
+    def estimate_probability_logodds(
+        self, signals: List[Signal], weights: Dict[str, float], market_price: float
+    ) -> Tuple[float, float]:
+        """Bayesian pooling in log-odds space, anchored on the market price.
+
+        Model: the market price is the PRIOR — with no information of our own,
+        the best estimate of the true probability is what the market says
+        (efficient-market humility). Each signal is an independent expert whose
+        view v_i shifts the posterior in log-odds space:
+
+            posterior_logodds = prior + sum_i k_i * (logit(v_i) - prior)
+            k_i = (w_i * c_i) / sum_j(w_j)         # confidence-scaled weight
+
+        Properties that the legacy linear pool lacks:
+          * No signals (all confidence 0) -> posterior == market price, edge 0.
+            The linear pool collapses to 0.5, manufacturing fake edge on any
+            market not priced at 50%, and only the external-validation gate
+            saved it. Here the math itself is safe.
+          * sum(k_i) <= 1, so low-confidence signals barely move the estimate
+            instead of dragging it toward their 0.5 neutral values.
+          * Updates compose multiplicatively in probability space, so evidence
+            near 0 or 1 behaves correctly (no linear-average distortion at the
+            extremes, which is where prediction markets pay).
+        """
+        prior = _logit(market_price)
+        total_weight = sum(w for w in weights.values() if w > 0)
+        if total_weight <= 0:
+            return market_price, 0.0
+
+        posterior = prior
+        saw_evidence = False
+        for signal in signals:
+            w = weights.get(signal.name, 0)
+            if w <= 0 or signal.confidence <= 0:
+                continue
+            k = (w * signal.confidence) / total_weight
+            posterior += k * (_logit(signal.value) - prior)
+            saw_evidence = True
+
+        if not saw_evidence:
+            return min(max(market_price, 0.01), 0.99), 0.0
+
+        estimated_prob = max(0.01, min(0.99, _sigmoid(posterior)))
+        return estimated_prob, self._overall_confidence(signals, weights)
+
+    def _overall_confidence(self, signals: List[Signal], weights: Dict[str, float]) -> float:
+        """Weight-averaged confidence across all weighted signals."""
         conf_sum = 0.0
         w_total = 0.0
         for signal in signals:
@@ -180,9 +308,44 @@ class ProbabilityEstimator:
             if w > 0:
                 conf_sum += w * signal.confidence
                 w_total += w
-        overall_confidence = conf_sum / w_total if w_total > 0 else 0.0
+        return conf_sum / w_total if w_total > 0 else 0.0
 
-        return estimated_prob, overall_confidence
+    def _combine(
+        self, signals: List[Signal], weights: Dict[str, float], market_price: float
+    ) -> Tuple[float, float]:
+        """Pool signals using the configured combination method."""
+        method = getattr(self.config, "combination_method", "linear")
+        if method == "logodds":
+            return self.estimate_probability_logodds(signals, weights, market_price)
+        return self.estimate_probability(signals, weights)
+
+    def _effective_weights(self, market_type: str) -> Dict[str, float]:
+        """Hardcoded defaults overlaid with config.signals.weights values."""
+        default_weights = WEIGHTS.get(market_type, WEIGHTS["other"])
+        config_weights = getattr(self.config, "weights", {}).get(market_type, {})
+        return {**default_weights, **config_weights}
+
+    def estimate_for_snapshot(self, snapshot: MarketSnapshot) -> Optional[float]:
+        """Re-estimate probability for an existing position's market.
+
+        Used by the trading loop to refresh Position.estimated_prob as new
+        information arrives, so take-profit ("edge converged") decisions track
+        the CURRENT edge instead of the stale entry-time estimate.
+
+        Returns None when the primary external signal is unavailable — in that
+        case the caller should keep the previous estimate rather than degrade
+        to an uninformed one.
+        """
+        market_type = detect_market_type(snapshot)
+        weights = self._effective_weights(market_type)
+        signals = self.compute_signals(snapshot, market_type)
+
+        primary = self._get_primary_signal(signals, market_type)
+        if primary is None or primary.confidence == 0:
+            return None
+
+        estimated_prob, _ = self._combine(signals, weights, snapshot.price)
+        return estimated_prob
 
     def detect_edge(
         self,
@@ -198,13 +361,9 @@ class ProbabilityEstimator:
         3. Combined edge capped at external edge + 1%.
         """
         market_type = detect_market_type(snapshot)
-        # Build effective weights: start from the hardcoded defaults, then overlay
-        # any values present in config.signals.weights so config changes take effect.
-        # Per-signal fallback: if a key is absent from the config dict the hardcoded
-        # default remains, so existing deployments keep working unchanged.
-        default_weights = WEIGHTS.get(market_type, WEIGHTS["other"])
-        config_weights = getattr(self.config, "weights", {}).get(market_type, {})
-        weights = {**default_weights, **config_weights}
+        # Effective weights: hardcoded defaults overlaid with config.signals.weights
+        # so config changes take effect without touching code.
+        weights = self._effective_weights(market_type)
         signals = self.compute_signals(snapshot, market_type)
 
         # Gate: require external validation
@@ -221,10 +380,20 @@ class ProbabilityEstimator:
                 if s.name != primary.name:
                     s.confidence *= 0.5
 
-        estimated_prob, confidence = self.estimate_probability(signals, weights)
+        estimated_prob, confidence = self._combine(signals, weights, snapshot.price)
 
         # Edge = estimated probability - market price
         edge = estimated_prob - snapshot.price
+
+        # DIRECTION GUARD: the primary external signal defines the only
+        # permitted trade direction. Auxiliary signals (order-book imbalance,
+        # line movement, ...) express 0.5-anchored ABSOLUTE values, so in the
+        # linear pool they can drag the blend across the market price AGAINST
+        # the books — e.g. price 0.25, consensus 0.20 (sell!), heavy bids
+        # push the blend to 0.31 and the magnitude cap below still emits a
+        # BUY. Aux signals may temper the external view, never reverse it.
+        if self._direction_reversed(edge, primary, snapshot.price):
+            return None
 
         # Edge cap: combined edge cannot exceed external edge + 1%
         max_allowed_edge = ext_edge + 0.01
@@ -237,7 +406,11 @@ class ProbabilityEstimator:
         side = "buy" if edge > 0 else "sell"
         estimated_prob = snapshot.price + edge
 
-        # Log signals to SQLite for the dashboard
+        # Log signals to SQLite for the dashboard.
+        # Skipped during backtest replays (historical odds cache) so replays
+        # never write into the live trades.db.
+        if getattr(self.odds_cache, "is_historical", False):
+            return self._build_trade_signal(snapshot, side, estimated_prob, edge, signals)
         try:
             from bot.trade_db import log_signals_for_slug
             log_signals_for_slug(
@@ -250,6 +423,12 @@ class ProbabilityEstimator:
         except Exception:
             pass  # DB errors must not block trading
 
+        return self._build_trade_signal(snapshot, side, estimated_prob, edge, signals)
+
+    def _build_trade_signal(
+        self, snapshot: MarketSnapshot, side: str, estimated_prob: float,
+        edge: float, signals: List[Signal],
+    ) -> TradeSignal:
         return TradeSignal(
             market_id=snapshot.market_id,
             token_id=snapshot.token_id,

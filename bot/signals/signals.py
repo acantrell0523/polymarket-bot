@@ -138,19 +138,22 @@ def odds_value_signal(
 
     edge = consensus_prob - polymarket_price
 
-    # Record line movement for tracking
-    try:
-        from bot.edge_log import record_line_movement
-        record_line_movement(
-            slug=snapshot.slug,
-            consensus_prob=consensus_prob,
-            polymarket_price=polymarket_price,
-            num_books=num_books,
-            sharp_consensus=sharp_consensus,
-            overall_consensus=consensus_prob,
-        )
-    except Exception:
-        pass
+    # Record line movement for tracking.
+    # Skipped for historical caches (backtest replays) so backtests never
+    # write time-series rows into the live trades.db.
+    if not getattr(odds_cache, "is_historical", False):
+        try:
+            from bot.edge_log import record_line_movement
+            record_line_movement(
+                slug=snapshot.slug,
+                consensus_prob=consensus_prob,
+                polymarket_price=polymarket_price,
+                num_books=num_books,
+                sharp_consensus=sharp_consensus,
+                overall_consensus=consensus_prob,
+            )
+        except Exception:
+            pass
 
     # Require 3 books for edges over 7% — large edges from a single source are unreliable
     if abs(edge) > 0.07 and num_books < 3:
@@ -257,6 +260,57 @@ def liquidity_imbalance_signal(snapshot: MarketSnapshot, config: SignalConfig) -
     )
 
 
+def live_win_prob_signal(
+    snapshot: MarketSnapshot,
+    config: SignalConfig,
+    live_cache=None,
+) -> Signal:
+    """ESPN live win-probability model vs the Polymarket price — the PRIMARY
+    external signal for live games.
+
+    While a game is in progress, the pregame sportsbook consensus is stale
+    the moment anything happens; ESPN's per-play model reprices within
+    seconds. Edge = model prob − market price captures Polymarket's repricing
+    lag, which is where in-game edges live.
+
+    Confidence is freshness-driven: 0.90 for data under 30s old, decaying
+    linearly to 0 at 150s. A stale model output is misinformation during a
+    live game, so it gets no vote rather than a reduced one.
+    """
+    neutral = Signal(name="live_win_prob", value=0.5, confidence=0.0,
+                     direction="neutral", metadata={"reason": "no_live_data"})
+    if live_cache is None or not getattr(snapshot, "is_live", False):
+        return neutral
+
+    try:
+        result = live_cache.get_live_prob(snapshot.slug)
+    except Exception as e:
+        neutral.metadata["reason"] = f"live_lookup_failed: {e}"
+        return neutral
+    if result is None:
+        return neutral
+
+    prob, age = result
+    prob = max(0.01, min(0.99, prob))
+
+    if age <= 30:
+        confidence = 0.90
+    elif age >= 150:
+        return Signal(name="live_win_prob", value=prob, confidence=0.0,
+                      direction="neutral", metadata={"reason": "stale", "age": age})
+    else:
+        confidence = 0.90 * (150 - age) / 120
+
+    edge = prob - snapshot.price
+    return Signal(
+        name="live_win_prob",
+        value=float(prob),
+        confidence=float(confidence),
+        direction="bullish" if edge > 0 else "bearish" if edge < 0 else "neutral",
+        metadata={"edge": edge, "age_seconds": age, "source": "espn_win_probability"},
+    )
+
+
 def cross_market_signal(
     snapshot: MarketSnapshot,
     config: SignalConfig,
@@ -326,7 +380,11 @@ def sports_context_signal(
                       metadata={"reason": "unparseable_slug"})
 
     sport_abbr = parts[1]
-    sport_map = {"nba": "basketball_nba", "cbb": "basketball_ncaab"}
+    sport_map = {
+        "nba": "basketball_nba",
+        "cbb": "basketball_ncaab",
+        "wnba": "basketball_wnba",
+    }
     sport_key = sport_map.get(sport_abbr)
     if not sport_key:
         return Signal(name="sports_context", value=0.5, confidence=0.0, direction="neutral",
@@ -366,6 +424,82 @@ def sports_context_signal(
             "away_record": context.get("away_record", ""),
             "context_modifier": modifier,
             "neutral_site": context.get("neutral_site", False),
+        },
+    )
+
+
+def onchain_flow_signal(
+    snapshot: MarketSnapshot,
+    config: SignalConfig,
+    onchain_client=None,
+) -> Signal:
+    """Whale / smart-money flow from free Polymarket CLOB trade data.
+
+    Supporting signal only: it expresses a small directional TILT away from the
+    current market price rather than an independent probability estimate,
+    because trade-flow data tells you which way informed money is leaning but
+    not what the fair probability is.
+
+        value = price + 0.05 * whale_net_direction + 0.05 * smart_money_sentiment
+
+    Both components are in [-1, 1], so the tilt is capped at ±10 points of
+    probability. Confidence is capped at 0.5 so this can never dominate the
+    external validation signals, and scales with how much real volume backs
+    the reading.
+
+    Returns confidence=0 (no-op) when no client is wired in or there is no
+    trade activity to analyze.
+    """
+    if not onchain_client:
+        return Signal(name="onchain_flow", value=0.5, confidence=0.0, direction="neutral",
+                      metadata={"reason": "no_onchain_client"})
+
+    try:
+        enrichment = onchain_client.get_enrichment_for_market(snapshot)
+    except Exception as e:
+        # On-chain data is best-effort — a failed fetch must never block a scan.
+        return Signal(name="onchain_flow", value=0.5, confidence=0.0, direction="neutral",
+                      metadata={"reason": f"enrichment_failed: {e}"})
+
+    smart = enrichment.get("market_detail", {}).get("data", {})
+    smart_sentiment = float(smart.get("smart_money_sentiment", 0) or 0)
+
+    whale_items = enrichment.get("whale_data", {}).get("data", [])
+    whale_net = 0.0
+    whale_volume = 0.0
+    whale_count = 0
+    if whale_items:
+        item = whale_items[0]
+        whale_volume = float(item.get("amount", 0) or 0)
+        whale_count = int(item.get("whale_count", 0) or 0)
+        whale_net = 1.0 if item.get("direction") == "buy" else -1.0
+
+    if whale_count == 0 and abs(smart_sentiment) < 0.05:
+        return Signal(name="onchain_flow", value=0.5, confidence=0.0, direction="neutral",
+                      metadata={"reason": "no_flow_activity"})
+
+    tilt = 0.05 * whale_net + 0.05 * smart_sentiment
+    value = max(0.01, min(0.99, snapshot.price + tilt))
+
+    # Confidence: needs real money behind it. $2k of whale volume or strong
+    # smart-money sentiment reaches the 0.5 cap.
+    volume_conf = min(whale_volume / 2000.0, 1.0)
+    sentiment_conf = min(abs(smart_sentiment), 1.0)
+    confidence = min(0.5, 0.5 * max(volume_conf, sentiment_conf))
+
+    direction = "bullish" if tilt > 0.005 else "bearish" if tilt < -0.005 else "neutral"
+
+    return Signal(
+        name="onchain_flow",
+        value=float(value),
+        confidence=float(confidence),
+        direction=direction,
+        metadata={
+            "whale_net_direction": whale_net,
+            "whale_volume_usd": whale_volume,
+            "whale_count": whale_count,
+            "smart_money_sentiment": smart_sentiment,
+            "tilt": tilt,
         },
     )
 

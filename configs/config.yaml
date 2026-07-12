@@ -1,7 +1,10 @@
+# Any scalar value in this file can be overridden per-environment without
+# editing it: POLYBOT_<SECTION>__<KEY>, e.g. POLYBOT_TRADING__PAPER_TRADING=false
 api:
   clob_url: https://clob.polymarket.com
   gamma_url: https://gamma-api.polymarket.com
-  subgraph_url: https://api.thegraph.com/subgraphs/name/polymarket/polymarket-matic
+  # subgraph_url removed: The Graph's free hosted endpoint is dead; on-chain
+  # data now comes from the free CLOB/Gamma APIs via bot/signals/onchain.py.
   scan_interval_seconds: 5
   max_requests_per_second: 5
   max_retries: 3
@@ -19,9 +22,13 @@ wallet:
 trading:
   min_edge_threshold: 0.05
   max_edge_threshold: 0.40
-  position_sizing_method: tiered_kelly
+  # Fractional Kelly: bet size proportional to edge AND bankroll.
+  # kelly_fraction 0.25 = quarter-Kelly — deliberately conservative because
+  # the probability estimates are noisy and full Kelly on an overestimated
+  # edge is ruinous. "tiered_kelly" (flat $ tiers) remains available.
+  position_sizing_method: kelly
   fixed_fraction: 0.15
-  kelly_fraction: 0.5
+  kelly_fraction: 0.25
   max_position_size_usd: 50.0
   max_daily_trades: 5
   min_position_size_usd: 5.0
@@ -35,14 +42,34 @@ trading:
   daily_loss_limit_usd: 75.0
   max_open_positions: 5
   paper_trading: true
+  # --- Cost-aware edge accounting ---
+  # US fee schedule (effective 2026-07-01): fee = coef * contracts * p * (1-p)
+  # Takers pay 0.06 (peaks at 3% of notional at 50c, shrinks toward extremes).
+  taker_fee_coefficient: 0.06
+  taker_fee_rate: 0.02        # DEPRECATED (flat model) — no longer read
+  min_net_edge: 0.02          # min edge AFTER fees + crossing the spread
+  # --- Market-quality gates (previously hardcoded in trade_filter.py) ---
+  min_price: 0.15             # skip extreme longshots
+  max_price: 0.85             # skip extreme favorites
+  min_book_liquidity_usd: 1000.0
+  max_spread: 0.10            # widest book we can exit cleanly
 signals:
   odds_value_weight: 0.4
   sports_context_weight: 0.15
   line_movement_weight: 0.2
   order_book_imbalance_weight: 0.15
   liquidity_imbalance_weight: 0.1
+  # How signals are pooled into one probability estimate:
+  #   linear  — confidence-weighted arithmetic mean (DEFAULT). All edge
+  #             thresholds and benchmarks were calibrated against this pool.
+  #   logodds — Bayesian log-odds update anchored on the market price.
+  #             EXPERIMENTAL: shrinks combined edge by overall confidence,
+  #             so the current 4-7% edge thresholds almost never fire.
+  #             Recalibrate thresholds before switching this on.
+  combination_method: linear
   # Per-market-type weights used by ProbabilityEstimator.
   # These values exactly match the hardcoded defaults — edit here to tune behavior.
+  # onchain_flow is a no-op unless onchain.enabled is true.
   weights:
     sports:
       odds_value: 0.40
@@ -50,26 +77,34 @@ signals:
       line_movement: 0.20
       order_book_imbalance: 0.15
       liquidity_imbalance: 0.10
+      onchain_flow: 0.10
+      live_win_prob: 0.55   # ESPN in-game model; no-op pregame
     crypto:
       crypto_model: 0.45
       cross_market: 0.25
       order_book_imbalance: 0.20
       liquidity_imbalance: 0.10
+      onchain_flow: 0.10
     politics:
       cross_market: 0.45
       order_book_imbalance: 0.25
       line_movement: 0.15
       liquidity_imbalance: 0.15
+      onchain_flow: 0.10
     other:
       cross_market: 0.40
       order_book_imbalance: 0.25
       line_movement: 0.20
       liquidity_imbalance: 0.15
+      onchain_flow: 0.10
 filters:
   min_daily_volume_usd: 500.0
   min_liquidity_usd: 200.0
   min_hours_to_expiry: 1
-  max_hours_to_expiry: 48
+  max_hours_to_expiry: 48   # legacy; superseded by the two windows below
+  # Time-to-resolution windows enforced by the market scanner:
+  sports_window_hours: 24     # only scan games starting within 24h
+  nonsports_window_days: 14   # only scan non-sports markets resolving within 14d
   min_price_history_length: 10
   include_categories: []
   exclude_categories: []
@@ -77,7 +112,13 @@ backtest:
   data_dir: ./data/historical
   start_date: '2024-01-01'
   end_date: '2024-12-31'
-  initial_bankroll_usd: 200.0
+  # Quarter-Kelly on a 5% edge sizes ~2% of bankroll; below ~$600 that lands
+  # under min_position_size_usd ($5) and every trade is skipped as too small.
+  initial_bankroll_usd: 1000.0
+  # Replay-scoped history requirement (live scanning uses
+  # filters.min_price_history_length=10; recorded game markets only have a
+  # few daily candles)
+  min_price_history_length: 1
   slippage_model: depth_based
   fixed_slippage_bps: 50
   depth_slippage_multiplier: 0.001

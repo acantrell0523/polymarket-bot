@@ -54,6 +54,7 @@ def init_tables(db_path: Optional[str] = None) -> None:
             market_type     TEXT    DEFAULT '',
             token_id_0      TEXT    DEFAULT '',
             token_id_1      TEXT    DEFAULT '',
+            token0_side     TEXT    DEFAULT '',
             ingest_time     TEXT    DEFAULT (datetime('now')),
             UNIQUE(slug)
         );
@@ -83,6 +84,20 @@ def init_tables(db_path: Optional[str] = None) -> None:
             ON historical_snapshots(slug, timestamp);
     """)
     conn.commit()
+
+    # Migration guard: token0_side was added after the first deployments.
+    # Game markets on Polymarket aren't Yes/No — outcomes are
+    # ["Away Team", "Home Team"] and token 0 prices outcomes[0]. This column
+    # records which side ("home"/"away") token 0 refers to, read directly
+    # from the market object at ingest time.
+    try:
+        conn.execute(
+            "ALTER TABLE historical_markets ADD COLUMN token0_side TEXT DEFAULT ''"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists — nothing to do.
+
     conn.close()
 
 
@@ -96,8 +111,8 @@ def upsert_historical_market(
             (slug, market_id, condition_id, league, sport, question,
              home_team, away_team, home_abbr, away_abbr,
              game_start_time, espn_game_id, home_score, away_score,
-             settled_outcome, market_type, token_id_0, token_id_1)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             settled_outcome, market_type, token_id_0, token_id_1, token0_side)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             m.get("slug", ""),
@@ -118,6 +133,7 @@ def upsert_historical_market(
             m.get("market_type", ""),
             m.get("token_id_0", ""),
             m.get("token_id_1", ""),
+            m.get("token0_side", ""),
         ),
     )
 
@@ -148,6 +164,58 @@ def upsert_snapshots(
         )
         inserted += cur.rowcount                          # 1 if inserted, 0 if ignored
     return inserted
+
+
+def update_snapshot_consensus(
+    conn: sqlite3.Connection,
+    slug: str,
+    consensus_prob: float,
+    num_books: int,
+    start_ts: Optional[int] = None,
+    end_ts: Optional[int] = None,
+) -> int:
+    """Set espn_consensus_prob / num_books on existing snapshot rows.
+
+    Only touches rows whose timestamp falls in [start_ts, end_ts] when a
+    window is given — used to restrict a closing-line consensus value to the
+    days immediately around the game, limiting lookahead into earlier
+    snapshots. UPDATE is naturally idempotent, so re-running a backfill is
+    safe. Returns the number of rows updated.
+    """
+    query = (
+        "UPDATE historical_snapshots "
+        "SET espn_consensus_prob = ?, num_books = ? "
+        "WHERE slug = ?"
+    )
+    params: List[Any] = [float(consensus_prob), int(num_books), slug]
+    if start_ts is not None:
+        query += " AND timestamp >= ?"
+        params.append(int(start_ts))
+    if end_ts is not None:
+        query += " AND timestamp <= ?"
+        params.append(int(end_ts))
+    cur = conn.execute(query, params)
+    return cur.rowcount
+
+
+def get_consensus_coverage(db_path: Optional[str] = None) -> Dict[str, int]:
+    """How many snapshots have a real consensus value (backtest-gate ready)."""
+    conn = get_conn(db_path)
+    row = conn.execute(
+        """
+        SELECT
+            COUNT(*)                                            AS total,
+            SUM(CASE WHEN espn_consensus_prob > 0 THEN 1 ELSE 0 END) AS with_consensus,
+            COUNT(DISTINCT CASE WHEN espn_consensus_prob > 0 THEN slug END) AS slugs_with_consensus
+        FROM historical_snapshots
+        """
+    ).fetchone()
+    conn.close()
+    return {
+        "total": row["total"] or 0,
+        "with_consensus": row["with_consensus"] or 0,
+        "slugs_with_consensus": row["slugs_with_consensus"] or 0,
+    }
 
 
 # ── Read helpers (used by inspect_historical.py and tests) ────────────────────

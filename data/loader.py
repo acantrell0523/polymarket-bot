@@ -102,6 +102,11 @@ def generate_synthetic_markets(
         market_id = f"market_{m:03d}"
         token_id = f"token_{m:03d}"
         category = categories[m % len(categories)]
+        # Sports-style slug so synthetic markets route through the odds_value
+        # signal path (the one the live bot actually trades). Paired with a
+        # HistoricalOddsCache.synthetic_from_market_data() consensus source,
+        # this exercises the full external-validation pipeline in backtests.
+        slug = f"aec-nba-syn{m:03d}-opp{m:03d}-2024-01-01"
 
         snapshots = []
         for i in range(num_snapshots):
@@ -129,6 +134,7 @@ def generate_synthetic_markets(
                 price_history=history,
                 timestamp=timestamp,
                 category=category,
+                slug=slug,
                 hours_to_expiry=max(6, 720 - i),
             )
             snapshots.append(snapshot)

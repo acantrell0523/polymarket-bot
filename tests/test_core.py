@@ -2189,3 +2189,1865 @@ class TestSupervisorExitInsights:
         assert "reasonable" in result, (
             f"Expected 'reasonable' in clean-path oneliner, got: {result!r}"
         )
+
+
+# ============================================================================
+# Net-edge accounting (bot/strategies/edge.py)
+# ============================================================================
+
+from bot.strategies.edge import (
+    compute_edge_breakdown, executable_price, book_spread,
+)
+
+
+class TestEdgeBreakdown:
+    def _snapshot(self, price=0.50, bids=None, asks=None):
+        ob = OrderBook(
+            bids=[OrderBookLevel(price=p, size=s) for p, s in (bids or [(0.48, 500)])],
+            asks=[OrderBookLevel(price=p, size=s) for p, s in (asks or [(0.52, 500)])],
+        )
+        return MarketSnapshot(
+            market_id="m", token_id="t", question="q", price=price,
+            volume_24h=1000, liquidity=1000, order_book=ob,
+            price_history=[price], timestamp=datetime.now(timezone.utc),
+            slug="aec-nba-aaa-bbb-2026-01-01",
+        )
+
+    def test_buy_uses_ask_price(self):
+        snap = self._snapshot()
+        assert executable_price(snap, "buy") == pytest.approx(0.52)
+
+    def test_sell_uses_bid_price(self):
+        snap = self._snapshot()
+        assert executable_price(snap, "sell") == pytest.approx(0.48)
+
+    def test_empty_book_falls_back_to_snapshot_price(self):
+        snap = self._snapshot()
+        snap.order_book = OrderBook()
+        assert executable_price(snap, "buy") == pytest.approx(0.50)
+        assert book_spread(snap) == 0.0
+
+    def test_spread(self):
+        snap = self._snapshot()
+        assert book_spread(snap) == pytest.approx(0.04)
+
+    def test_buy_net_edge_charges_spread_and_fee(self):
+        # p=0.60, mid=0.50 -> gross edge 0.10
+        # exec at ask 0.52; quadratic fee/share = 0.06*0.52*0.48 = 0.014976
+        # net = 0.60 - (0.52 + 0.014976) = 0.065024
+        snap = self._snapshot()
+        bd = compute_edge_breakdown(0.60, snap, "buy", fee_coefficient=0.06)
+        assert bd.gross_edge == pytest.approx(0.10)
+        assert bd.exec_price == pytest.approx(0.52)
+        assert bd.net_edge == pytest.approx(0.60 - 0.52 - 0.06 * 0.52 * 0.48)
+        assert bd.net_edge < bd.gross_edge
+
+    def test_sell_net_edge(self):
+        # p=0.40, sell at bid 0.48; fee/share = 0.06*0.48*0.52 = 0.014976
+        # net = (0.48 - 0.014976) - 0.40 = 0.065024
+        snap = self._snapshot()
+        bd = compute_edge_breakdown(0.40, snap, "sell", fee_coefficient=0.06)
+        assert bd.net_edge == pytest.approx(0.48 - 0.06 * 0.48 * 0.52 - 0.40)
+
+    def test_marginal_gross_edge_goes_negative_net(self):
+        # 3% gross edge on a 4-cent-wide book with the quadratic fee is NOT
+        # tradeable: net = 0.53 - 0.52 - 0.06*0.52*0.48 = -0.005
+        snap = self._snapshot()
+        bd = compute_edge_breakdown(0.53, snap, "buy", fee_coefficient=0.06)
+        assert bd.gross_edge == pytest.approx(0.03)
+        assert bd.net_edge < 0
+
+
+# ============================================================================
+# Bayesian log-odds pooling
+# ============================================================================
+
+class TestLogOddsPooling:
+    def _estimator(self):
+        cfg = SignalConfig()
+        cfg.combination_method = "logodds"
+        return ProbabilityEstimator(cfg)
+
+    def test_no_evidence_returns_market_price(self):
+        """With zero-confidence signals the posterior must equal the prior
+        (the market price) — no manufactured edge."""
+        est = self._estimator()
+        signals = [Signal(name="odds_value", value=0.9, confidence=0.0)]
+        prob, conf = est.estimate_probability_logodds(
+            signals, {"odds_value": 0.4}, market_price=0.30
+        )
+        assert prob == pytest.approx(0.30)
+        assert conf == 0.0
+
+    def test_full_confidence_moves_toward_signal(self):
+        est = self._estimator()
+        signals = [Signal(name="odds_value", value=0.60, confidence=1.0)]
+        prob, _ = est.estimate_probability_logodds(
+            signals, {"odds_value": 1.0}, market_price=0.40
+        )
+        # Single signal with full normalized weight -> posterior == signal view
+        assert prob == pytest.approx(0.60, abs=0.01)
+
+    def test_low_confidence_barely_moves_estimate(self):
+        est = self._estimator()
+        signals = [Signal(name="odds_value", value=0.90, confidence=0.05)]
+        prob, _ = est.estimate_probability_logodds(
+            signals, {"odds_value": 0.4, "line_movement": 0.6}, market_price=0.40
+        )
+        assert abs(prob - 0.40) < 0.05
+
+    def test_posterior_bounded(self):
+        est = self._estimator()
+        signals = [Signal(name="odds_value", value=0.99, confidence=1.0)]
+        prob, _ = est.estimate_probability_logodds(
+            signals, {"odds_value": 1.0}, market_price=0.99
+        )
+        assert 0.01 <= prob <= 0.99
+
+    def test_detect_edge_uses_configured_method(self):
+        """combination_method='linear' must route through the legacy pool."""
+        cfg = SignalConfig()
+        cfg.combination_method = "linear"
+        est = ProbabilityEstimator(cfg)
+        signals = [Signal(name="odds_value", value=0.60, confidence=1.0)]
+        lin, _ = est._combine(signals, {"odds_value": 1.0}, market_price=0.40)
+        assert lin == pytest.approx(0.60)
+
+
+# ============================================================================
+# Fee-aware Kelly sizing
+# ============================================================================
+
+class TestFeeAwareKelly:
+    def test_fee_reduces_kelly_size(self):
+        cfg_free = TradingConfig(position_sizing_method="kelly", taker_fee_coefficient=0.0,
+                                 max_position_size_usd=10000, max_portfolio_exposure_usd=10000)
+        cfg_fee = TradingConfig(position_sizing_method="kelly", taker_fee_coefficient=0.20,
+                                max_position_size_usd=10000, max_portfolio_exposure_usd=10000)
+        signal = TradeSignal(
+            market_id="m", token_id="t", side="buy",
+            estimated_prob=0.60, market_price=0.50,
+            edge=0.10, position_size_usd=0,
+        )
+        size_free = PositionSizer(cfg_free).size_position(signal, 1000, 0)
+        size_fee = PositionSizer(cfg_fee).size_position(signal, 1000, 0)
+        assert size_fee < size_free
+
+    def test_kelly_uses_exec_price_when_set(self):
+        cfg = TradingConfig(position_sizing_method="kelly", taker_fee_coefficient=0.0,
+                            max_position_size_usd=10000, max_portfolio_exposure_usd=10000)
+        cheap = TradeSignal(market_id="m", token_id="t", side="buy",
+                            estimated_prob=0.60, market_price=0.50,
+                            edge=0.10, position_size_usd=0, exec_price=0.50)
+        expensive = TradeSignal(market_id="m", token_id="t", side="buy",
+                                estimated_prob=0.60, market_price=0.50,
+                                edge=0.10, position_size_usd=0, exec_price=0.58)
+        sizer = PositionSizer(cfg)
+        assert sizer.size_position(expensive, 1000, 0) < sizer.size_position(cheap, 1000, 0)
+
+    def test_negative_net_edge_sizes_zero(self):
+        """A trade whose costs exceed the edge must get zero Kelly size.
+        coef 0.10 at price 0.50 -> fee/share 0.025 > the 0.02 edge."""
+        cfg = TradingConfig(position_sizing_method="kelly", taker_fee_coefficient=0.10,
+                            max_position_size_usd=10000, max_portfolio_exposure_usd=10000)
+        signal = TradeSignal(market_id="m", token_id="t", side="buy",
+                             estimated_prob=0.52, market_price=0.50,
+                             edge=0.02, position_size_usd=0)
+        assert PositionSizer(cfg).size_position(signal, 1000, 0) == 0.0
+
+    def test_sell_side_kelly_positive_for_overpriced_market(self):
+        cfg = TradingConfig(position_sizing_method="kelly", taker_fee_coefficient=0.06,
+                            max_position_size_usd=10000, max_portfolio_exposure_usd=10000)
+        signal = TradeSignal(market_id="m", token_id="t", side="sell",
+                             estimated_prob=0.40, market_price=0.55,
+                             edge=-0.15, position_size_usd=0)
+        assert PositionSizer(cfg).size_position(signal, 1000, 0) > 0
+
+
+# ============================================================================
+# New trade filter checks: spread + net edge
+# ============================================================================
+
+class TestFilterSpreadAndNetEdge:
+    def _snapshot(self):
+        ob = OrderBook(
+            bids=[OrderBookLevel(price=0.48, size=800)],
+            asks=[OrderBookLevel(price=0.52, size=800)],
+        )
+        return MarketSnapshot(
+            market_id="m", token_id="t", question="q", price=0.50,
+            volume_24h=5000, liquidity=2000, order_book=ob,
+            price_history=[0.5], timestamp=datetime.now(timezone.utc),
+            slug="aec-nba-aaa-bbb-2026-01-01",
+        )
+
+    def _signal(self, **kw):
+        base = dict(market_id="m", token_id="t", side="buy",
+                    estimated_prob=0.62, market_price=0.50, edge=0.12,
+                    position_size_usd=0, slug="aec-nba-aaa-bbb-2026-01-01")
+        base.update(kw)
+        return TradeSignal(**base)
+
+    def _validate(self, signal, **kw):
+        return validate_trade(
+            signal=signal, snapshot=self._snapshot(), num_books=4,
+            open_game_ids=set(), game_id="g1", daily_trades=0,
+            max_daily_trades=5, **kw,
+        )
+
+    def test_wide_spread_rejected(self):
+        sig = self._signal(spread=0.15, exec_price=0.52, net_edge=0.08)
+        reason = self._validate(sig, max_spread=0.10)
+        assert reason is not None and "spread" in reason
+
+    def test_tight_spread_passes(self):
+        sig = self._signal(spread=0.04, exec_price=0.52, net_edge=0.08)
+        assert self._validate(sig, max_spread=0.10, min_net_edge=0.02) is None
+
+    def test_net_edge_below_min_rejected(self):
+        sig = self._signal(spread=0.04, exec_price=0.52, net_edge=0.01)
+        reason = self._validate(sig, min_net_edge=0.02)
+        assert reason is not None and "net_edge" in reason
+
+    def test_net_edge_check_skipped_when_not_computed(self):
+        """Direct callers that never computed exec_price keep old behavior."""
+        sig = self._signal()  # exec_price defaults to 0.0
+        assert self._validate(sig, min_net_edge=0.02) is None
+
+
+# ============================================================================
+# On-chain flow signal
+# ============================================================================
+
+from bot.signals.signals import onchain_flow_signal
+
+
+class _FakeOnchainClient:
+    def __init__(self, enrichment):
+        self._enrichment = enrichment
+
+    def get_enrichment_for_market(self, snapshot):
+        return self._enrichment
+
+
+class TestOnchainFlowSignal:
+    def _snapshot(self, price=0.50):
+        return MarketSnapshot(
+            market_id="m", token_id="t", question="q", price=price,
+            volume_24h=1000, liquidity=1000, order_book=OrderBook(),
+            price_history=[price], timestamp=datetime.now(timezone.utc),
+            slug="aec-nba-aaa-bbb-2026-01-01",
+        )
+
+    def test_no_client_is_noop(self, signal_config):
+        sig = onchain_flow_signal(self._snapshot(), signal_config, None)
+        assert sig.confidence == 0.0
+
+    def test_whale_buying_tilts_bullish(self, signal_config):
+        client = _FakeOnchainClient({
+            "market_detail": {"data": {"smart_money_sentiment": 0.8}},
+            "whale_data": {"data": [{"direction": "buy", "amount": 3000, "whale_count": 5}]},
+        })
+        sig = onchain_flow_signal(self._snapshot(0.50), signal_config, client)
+        assert sig.value > 0.50
+        assert 0 < sig.confidence <= 0.5
+        assert sig.direction == "bullish"
+
+    def test_no_activity_is_noop(self, signal_config):
+        client = _FakeOnchainClient({
+            "market_detail": {"data": {"smart_money_sentiment": 0.0}},
+            "whale_data": {"data": []},
+        })
+        sig = onchain_flow_signal(self._snapshot(), signal_config, client)
+        assert sig.confidence == 0.0
+
+    def test_client_exception_is_noop(self, signal_config):
+        class Exploder:
+            def get_enrichment_for_market(self, snapshot):
+                raise RuntimeError("api down")
+        sig = onchain_flow_signal(self._snapshot(), signal_config, Exploder())
+        assert sig.confidence == 0.0
+
+    def test_estimator_includes_onchain_signal_when_client_present(self, signal_config):
+        client = _FakeOnchainClient({
+            "market_detail": {"data": {"smart_money_sentiment": 0.5}},
+            "whale_data": {"data": [{"direction": "buy", "amount": 1000, "whale_count": 2}]},
+        })
+        est = ProbabilityEstimator(signal_config, onchain_client=client)
+        signals = est.compute_signals(self._snapshot(), "sports")
+        assert any(s.name == "onchain_flow" for s in signals)
+
+
+# ============================================================================
+# Env-var config overrides
+# ============================================================================
+
+from utils.config import _apply_env_overrides, _coerce_env_value
+
+
+class TestEnvOverrides:
+    def test_override_float_bool_int(self):
+        cfg = BotConfig()
+        _apply_env_overrides(cfg, {
+            "POLYBOT_TRADING__MIN_EDGE_THRESHOLD": "0.08",
+            "POLYBOT_TRADING__PAPER_TRADING": "false",
+            "POLYBOT_TRADING__MAX_OPEN_POSITIONS": "3",
+            "POLYBOT_ALERTS__ENABLED": "true",
+        })
+        assert cfg.trading.min_edge_threshold == pytest.approx(0.08)
+        assert cfg.trading.paper_trading is False
+        assert cfg.trading.max_open_positions == 3
+        assert cfg.alerts.enabled is True
+
+    def test_unknown_keys_ignored(self):
+        cfg = BotConfig()
+        before = cfg.trading.min_edge_threshold
+        _apply_env_overrides(cfg, {
+            "POLYBOT_NOPE__FIELD": "1",
+            "POLYBOT_TRADING__NOT_A_FIELD": "1",
+            "UNRELATED_VAR": "x",
+        })
+        assert cfg.trading.min_edge_threshold == before
+
+    def test_malformed_value_keeps_default(self):
+        cfg = BotConfig()
+        before = cfg.trading.min_edge_threshold
+        _apply_env_overrides(cfg, {"POLYBOT_TRADING__MIN_EDGE_THRESHOLD": "banana"})
+        assert cfg.trading.min_edge_threshold == before
+
+    def test_coerce_bool_variants(self):
+        assert _coerce_env_value("YES", True) is True
+        assert _coerce_env_value("0", True) is False
+
+
+# ============================================================================
+# Health monitor
+# ============================================================================
+
+from bot.health import HealthMonitor
+
+
+class TestHealthMonitor:
+    def test_beat_and_read(self, tmp_path):
+        hm = HealthMonitor(data_dir=str(tmp_path))
+        hm.beat({"cycle": 7, "mode": "PAPER"})
+        hb = HealthMonitor.read_heartbeat(str(tmp_path))
+        assert hb["cycle"] == 7
+        age = HealthMonitor.heartbeat_age_seconds(str(tmp_path))
+        assert age is not None and age < 5
+
+    def test_missing_heartbeat_is_stale(self, tmp_path):
+        assert HealthMonitor.is_heartbeat_stale(str(tmp_path)) is True
+
+    def test_fresh_heartbeat_not_stale(self, tmp_path):
+        HealthMonitor(data_dir=str(tmp_path)).beat()
+        assert HealthMonitor.is_heartbeat_stale(str(tmp_path)) is False
+
+    def test_backoff_kicks_in_after_threshold(self, tmp_path):
+        hm = HealthMonitor(data_dir=str(tmp_path), failure_threshold=3,
+                           base_backoff_seconds=10, max_backoff_seconds=100)
+        assert hm.record_failure("api") == 0.0
+        assert hm.record_failure("api") == 0.0
+        b3 = hm.record_failure("api")   # threshold reached
+        b4 = hm.record_failure("api")
+        b5 = hm.record_failure("api")
+        assert b3 == 10 and b4 == 20 and b5 == 40
+        assert hm.is_degraded("api")
+
+    def test_backoff_capped(self, tmp_path):
+        hm = HealthMonitor(data_dir=str(tmp_path), failure_threshold=1,
+                           base_backoff_seconds=10, max_backoff_seconds=50)
+        for _ in range(20):
+            backoff = hm.record_failure("api")
+        assert backoff == 50
+
+    def test_success_resets(self, tmp_path):
+        hm = HealthMonitor(data_dir=str(tmp_path), failure_threshold=2)
+        hm.record_failure("api")
+        hm.record_failure("api")
+        assert hm.is_degraded("api")
+        hm.record_success("api")
+        assert not hm.is_degraded("api")
+        assert hm.record_failure("api") == 0.0  # counter restarted
+
+
+# ============================================================================
+# Decision log
+# ============================================================================
+
+class TestDecisionLog:
+    def test_insert_and_read_roundtrip(self, tmp_path, monkeypatch):
+        import bot.trade_db as tdb
+        monkeypatch.setattr(tdb, "DB_PATH", str(tmp_path / "test.db"))
+        tdb.init_db()
+        tdb.insert_decision(
+            slug="aec-nba-aaa-bbb-2026-01-01",
+            decision="rejected",
+            reason="net_edge_1.0pct_below_2.0pct_min_after_costs",
+            market_type="sports",
+            side="buy",
+            polymarket_price=0.50,
+            exec_price=0.52,
+            estimated_prob=0.55,
+            gross_edge=0.05,
+            net_edge=0.01,
+            spread=0.04,
+            fee_rate=0.02,
+        )
+        tdb.insert_decision(slug="x", decision="executed", position_size_usd=25.0)
+
+        rows = tdb.get_recent_decisions()
+        assert len(rows) == 2
+        rejected = tdb.get_recent_decisions(decision="rejected")
+        assert len(rejected) == 1
+        r = rejected[0]
+        assert r["slug"] == "aec-nba-aaa-bbb-2026-01-01"
+        assert r["net_edge"] == pytest.approx(0.01)
+        assert "net_edge" in r["reason"]
+
+
+# ============================================================================
+# Historical odds cache + backtest integration
+# ============================================================================
+
+from backtest.historical_odds import HistoricalOddsCache
+from backtest.engine import BacktestEngine
+
+
+class TestHistoricalOddsCache:
+    def test_time_aware_lookup_no_lookahead(self):
+        cache = HistoricalOddsCache({
+            "slug-a": [(100.0, 0.40, 3), (200.0, 0.60, 4)],
+        })
+        cache.set_time(datetime.fromtimestamp(150, tz=timezone.utc))
+        prob, books = cache.get_probability_for_slug("slug-a")
+        assert prob == pytest.approx(0.40)   # the 0.60 point is in the future
+        assert books == 3
+
+        cache.set_time(datetime.fromtimestamp(250, tz=timezone.utc))
+        prob, _ = cache.get_probability_for_slug("slug-a")
+        assert prob == pytest.approx(0.60)
+
+    def test_before_first_point_returns_none(self):
+        cache = HistoricalOddsCache({"slug-a": [(100.0, 0.40, 3)]})
+        cache.set_time(datetime.fromtimestamp(50, tz=timezone.utc))
+        assert cache.get_probability_for_slug("slug-a") is None
+
+    def test_unknown_slug_returns_none(self):
+        cache = HistoricalOddsCache({})
+        assert cache.get_probability_for_slug("nope") is None
+        assert cache.get_consensus_odds("nope") is None
+
+    def test_is_historical_flag_set(self):
+        assert HistoricalOddsCache({}).is_historical is True
+
+    def test_from_db_missing_file_gives_empty_cache(self, tmp_path):
+        cache = HistoricalOddsCache.from_db(str(tmp_path / "absent.db"))
+        assert len(cache) == 0
+
+    def test_synthetic_consensus_covers_all_markets(self):
+        markets = generate_synthetic_markets(num_markets=3, num_snapshots=20, seed=7)
+        cache = HistoricalOddsCache.synthetic_from_market_data(markets, seed=7)
+        for m in markets:
+            slug = m[0].slug
+            cache.set_time(m[-1].timestamp)
+            result = cache.get_probability_for_slug(slug)
+            assert result is not None
+            prob, books = result
+            assert 0.02 <= prob <= 0.98
+            assert books >= 2
+
+    def test_synthetic_slugs_route_to_sports(self):
+        markets = generate_synthetic_markets(num_markets=1, num_snapshots=5, seed=1)
+        assert detect_market_type(markets[0][0]) == "sports"
+
+
+class TestBacktestWithHistoricalOdds:
+    def test_backtest_fires_trades_with_synthetic_consensus(self, config):
+        """The 0-trades gap: with a consensus source the external validation
+        gate opens and the full pipeline places trades."""
+        # Same scale + seed as backtest.runner's synthetic fallback, which is
+        # known to produce trades with the default config.
+        markets = generate_synthetic_markets(num_markets=20, num_snapshots=500, seed=42)
+        cache = HistoricalOddsCache.synthetic_from_market_data(markets, seed=42)
+        engine = BacktestEngine(config, odds_cache=cache)
+        result = engine.run(markets)
+        assert result.total_trades > 0
+
+    def test_backtest_zero_trades_without_odds_cache(self, config):
+        """Without external validation the gate still blocks everything —
+        the guardrail is intact."""
+        markets = generate_synthetic_markets(num_markets=5, num_snapshots=60, seed=42)
+        engine = BacktestEngine(config, odds_cache=None)
+        result = engine.run(markets)
+        assert result.total_trades == 0
+
+
+# ============================================================================
+# Historical consensus backfill (scripts/ingest_historical.py Phase 3)
+# ============================================================================
+
+from data.historical_db import (
+    init_tables as _hist_init_tables,
+    get_conn as _hist_get_conn,
+    upsert_historical_market as _hist_upsert_market,
+    upsert_snapshots as _hist_upsert_snapshots,
+    update_snapshot_consensus,
+    get_consensus_coverage,
+)
+from scripts.ingest_historical import (
+    compute_consensus_from_pickcenter,
+    infer_yes_team,
+    backfill_consensus_for_market,
+    _parse_game_start_ts,
+)
+
+
+class TestConsensusComputation:
+    def test_moneyline_devig(self):
+        """Home -200 / away +170: raw implied probs sum > 1; devig must
+        normalize them so p_home + p_away == 1."""
+        pickcenter = [{
+            "provider": {"name": "Book A"},
+            "homeTeamOdds": {"moneyLine": -200},
+            "awayTeamOdds": {"moneyLine": 170},
+        }]
+        result = compute_consensus_from_pickcenter(pickcenter)
+        assert result is not None
+        p_home, p_away, books = result
+        # raw: home 0.6667, away 0.3704 -> devig home = 0.6667/1.0371 = 0.6429
+        assert p_home == pytest.approx(0.6429, abs=0.001)
+        assert p_home + p_away == pytest.approx(1.0)
+        assert books == 1
+
+    def test_multiple_providers_averaged(self):
+        pickcenter = [
+            {"homeTeamOdds": {"moneyLine": -110}, "awayTeamOdds": {"moneyLine": -110}},
+            {"homeTeamOdds": {"moneyLine": -200}, "awayTeamOdds": {"moneyLine": 170}},
+        ]
+        result = compute_consensus_from_pickcenter(pickcenter)
+        p_home, _, books = result
+        assert books == 2
+        # provider 1 devigs to exactly 0.50; provider 2 to ~0.643 -> mean ~0.571
+        assert p_home == pytest.approx((0.5 + 0.6429) / 2, abs=0.002)
+
+    def test_spread_fallback_sign_convention(self):
+        """ESPN spread is the HOME spread (negative = home favored) — a
+        home-favored -7.5 line must give p_home > 0.5."""
+        pickcenter = [{"spread": -7.5}]
+        p_home, p_away, books = compute_consensus_from_pickcenter(pickcenter)
+        assert p_home > 0.6
+        assert books == 1
+
+    def test_moneyline_preferred_over_spread(self):
+        """When a provider has both, the moneyline must win (spread would
+        give a very different number here)."""
+        pickcenter = [{
+            "homeTeamOdds": {"moneyLine": -110},
+            "awayTeamOdds": {"moneyLine": -110},
+            "spread": -12.5,
+        }]
+        p_home, _, _ = compute_consensus_from_pickcenter(pickcenter)
+        assert p_home == pytest.approx(0.50, abs=0.001)
+
+    def test_empty_or_junk_returns_none(self):
+        assert compute_consensus_from_pickcenter([]) is None
+        assert compute_consensus_from_pickcenter([{"provider": {"name": "x"}}]) is None
+        assert compute_consensus_from_pickcenter(["not-a-dict"]) is None
+
+
+class TestInferYesTeam:
+    def test_decisive_price_and_winner_agree(self):
+        # Home won, final price ~1 -> YES was the home team
+        assert infer_yes_team("", "Houston Rockets", "Atlanta Hawks",
+                              settled_outcome="home", last_price=0.97) == "home"
+
+    def test_decisive_price_and_winner_disagree(self):
+        # Home won but the market resolved to ~0 -> YES was the away team
+        assert infer_yes_team("", "Houston Rockets", "Atlanta Hawks",
+                              settled_outcome="home", last_price=0.03) == "away"
+
+    def test_indecisive_price_falls_through_to_question(self):
+        # last price 0.5 tells us nothing; question subject must decide
+        assert infer_yes_team("Will the Atlanta Hawks beat the Houston Rockets?",
+                              "Houston Rockets", "Atlanta Hawks",
+                              settled_outcome="home", last_price=0.50) == "away"
+
+    def test_question_first_mention_home(self):
+        assert infer_yes_team("Will the Rockets beat the Hawks?",
+                              "Houston Rockets", "Atlanta Hawks") == "home"
+
+    def test_default_is_away(self):
+        # No scores, no matching names in question -> slug convention (away first)
+        assert infer_yes_team("", "Houston Rockets", "Atlanta Hawks") == "away"
+
+    def test_parse_game_start_ts(self):
+        ts = _parse_game_start_ts("2025-01-16T00:30Z")
+        assert ts == int(datetime(2025, 1, 16, 0, 30, tzinfo=timezone.utc).timestamp())
+        assert _parse_game_start_ts("") is None
+        assert _parse_game_start_ts("garbage") is None
+
+
+class TestUpdateSnapshotConsensus:
+    def _make_db(self, tmp_path):
+        db = str(tmp_path / "hist.db")
+        _hist_init_tables(db)
+        conn = _hist_get_conn(db)
+        # 5 daily snapshots: days 0..4 (86400s apart)
+        history = [{"t": day * 86400, "p": 0.5 + day * 0.01} for day in range(5)]
+        _hist_upsert_snapshots(conn, "aec-nba-atl-hou-2025-01-05", history)
+        conn.commit()
+        return db, conn
+
+    def test_windowed_update_only_touches_window(self, tmp_path):
+        db, conn = self._make_db(tmp_path)
+        n = update_snapshot_consensus(
+            conn, "aec-nba-atl-hou-2025-01-05", 0.62, 3,
+            start_ts=2 * 86400, end_ts=3 * 86400,
+        )
+        conn.commit()
+        assert n == 2  # days 2 and 3 only
+        rows = conn.execute(
+            "SELECT timestamp, espn_consensus_prob, num_books "
+            "FROM historical_snapshots ORDER BY timestamp"
+        ).fetchall()
+        by_day = {r["timestamp"] // 86400: r for r in rows}
+        assert by_day[1]["espn_consensus_prob"] == 0
+        assert by_day[2]["espn_consensus_prob"] == pytest.approx(0.62)
+        assert by_day[3]["num_books"] == 3
+        assert by_day[4]["espn_consensus_prob"] == 0
+        conn.close()
+
+    def test_rerun_is_idempotent(self, tmp_path):
+        db, conn = self._make_db(tmp_path)
+        for _ in range(2):
+            n = update_snapshot_consensus(conn, "aec-nba-atl-hou-2025-01-05", 0.62, 3)
+            conn.commit()
+            assert n == 5  # UPDATE touches the same rows, never duplicates
+        total = conn.execute("SELECT COUNT(*) FROM historical_snapshots").fetchone()[0]
+        assert total == 5
+        conn.close()
+
+    def test_coverage_helper(self, tmp_path):
+        db, conn = self._make_db(tmp_path)
+        update_snapshot_consensus(conn, "aec-nba-atl-hou-2025-01-05", 0.62, 3,
+                                  start_ts=3 * 86400)
+        conn.commit()
+        conn.close()
+        cov = get_consensus_coverage(db)
+        assert cov["total"] == 5
+        assert cov["with_consensus"] == 2   # days 3 and 4
+        assert cov["slugs_with_consensus"] == 1
+
+
+class TestConsensusBackfillEndToEnd:
+    GAME_DAY = 4 * 86400  # game starts on day 4
+
+    def _seed_market(self, tmp_path):
+        """Temp DB with one game market + 5 daily snapshots ending at ~0.95
+        (home team won and YES resolved toward 1 -> YES = home)."""
+        db = str(tmp_path / "hist.db")
+        _hist_init_tables(db)
+        conn = _hist_get_conn(db)
+        _hist_upsert_market(conn, {
+            "slug": "aec-nba-atl-hou-2025-01-05",
+            "market_id": "123",
+            "question": "",                      # force data-driven inference
+            "home_team": "Houston Rockets",
+            "away_team": "Atlanta Hawks",
+            "espn_game_id": "401", 
+            "settled_outcome": "home",
+            "market_type": "moneyline_game",
+            "game_start_time": datetime.fromtimestamp(
+                self.GAME_DAY, tz=timezone.utc).isoformat(),
+            "token_id_0": "t0",
+        })
+        history = [{"t": day * 86400, "p": p}
+                   for day, p in enumerate([0.55, 0.58, 0.60, 0.70, 0.95])]
+        _hist_upsert_snapshots(conn, "aec-nba-atl-hou-2025-01-05", history)
+        conn.commit()
+        return db, conn
+
+    def test_backfill_writes_consensus_and_feeds_odds_cache(self, tmp_path, monkeypatch):
+        db, conn = self._seed_market(tmp_path)
+
+        # Fake ESPN summary: home favored -150/+130
+        import scripts.ingest_historical as ih
+        monkeypatch.setattr(
+            ih, "fetch_espn_pickcenter",
+            lambda session, espn_id, last_call, league="nba": (
+                [{"homeTeamOdds": {"moneyLine": -150},
+                  "awayTeamOdds": {"moneyLine": 130}}],
+                last_call,
+            ),
+        )
+
+        market_row = dict(conn.execute(
+            "SELECT * FROM historical_markets").fetchone())
+        n, _ = backfill_consensus_for_market(
+            None, conn, market_row, window_days=3, last_call=0.0)
+
+        # window = [day1 .. day5]; day0 snapshot stays untouched (lookahead guard)
+        assert n == 4
+        rows = conn.execute(
+            "SELECT timestamp, espn_consensus_prob FROM historical_snapshots "
+            "ORDER BY timestamp").fetchall()
+        assert rows[0]["espn_consensus_prob"] == 0
+        # YES inferred as HOME (settled home + final price 0.95),
+        # devig(-150/+130): p_home = 0.6/(0.6+0.4348) = 0.5798
+        assert rows[-1]["espn_consensus_prob"] == pytest.approx(0.5798, abs=0.001)
+        conn.close()
+
+        # The consensus must now flow into the backtest's odds cache
+        cache = HistoricalOddsCache.from_db(db)
+        assert len(cache) == 4
+        cache.set_time(datetime.fromtimestamp(self.GAME_DAY, tz=timezone.utc))
+        prob, books = cache.get_probability_for_slug("aec-nba-atl-hou-2025-01-05")
+        assert prob == pytest.approx(0.5798, abs=0.001)
+        assert books >= 2
+
+    def test_backfill_no_pickcenter_leaves_zero(self, tmp_path, monkeypatch):
+        db, conn = self._seed_market(tmp_path)
+        import scripts.ingest_historical as ih
+        monkeypatch.setattr(
+            ih, "fetch_espn_pickcenter",
+            lambda session, espn_id, last_call, league="nba": ([], last_call),
+        )
+        market_row = dict(conn.execute(
+            "SELECT * FROM historical_markets").fetchone())
+        n, _ = backfill_consensus_for_market(
+            None, conn, market_row, window_days=3, last_call=0.0)
+        conn.close()
+        assert n == 0
+        assert get_consensus_coverage(db)["with_consensus"] == 0
+
+
+# ============================================================================
+# Current-sports focus: league registry, schedule coverage, multi-league ingest
+# ============================================================================
+
+from bot.leagues import (
+    LEAGUES, all_league_codes, scoreboard_url, summary_url,
+    game_seconds_remaining,
+)
+from scripts.ingest_historical import candidate_slugs, prune_leagues
+
+
+class TestLeagueRegistry:
+    def test_summer_sports_registered(self):
+        """The bot must track sports in season NOW (July): MLB, WNBA, MLS."""
+        for league in ("mlb", "wnba", "mls"):
+            assert league in LEAGUES
+            assert scoreboard_url(league).startswith("https://site.api.espn.com/")
+            assert summary_url(league).endswith("/summary")
+
+    def test_winter_sports_still_registered_for_when_seasons_return(self):
+        # Auto-reactivation: ESPN returns games again when seasons start,
+        # so these stay registered — off-season they return zero games.
+        for league in ("nba", "nhl", "nfl", "cbb", "epl"):
+            assert league in LEAGUES
+
+    def test_every_league_has_odds_api_key(self):
+        from bot.signals.odds_api import SPORT_MAP, ESPN_ODDS_ENDPOINTS
+        for code, info in LEAGUES.items():
+            assert SPORT_MAP.get(code) == info["odds_api_key"]
+            assert info["odds_api_key"] in ESPN_ODDS_ENDPOINTS
+
+    def test_game_clock_wnba(self):
+        # WNBA: 4x10min. In Q2 with 5:00 left: 2 future quarters + 300s
+        assert game_seconds_remaining("wnba", period=2, clock_seconds=300) == \
+            2 * 600 + 300
+
+    def test_game_clock_soccer_counts_up(self):
+        # MLS: 90 min total, clock counts up. 80 minutes elapsed -> 600s left
+        assert game_seconds_remaining("mls", period=2, clock_seconds=80 * 60) == 600
+
+    def test_game_clock_baseball_is_none(self):
+        # No clock in baseball — last-5-minutes block must not apply
+        assert game_seconds_remaining("mlb", period=7, clock_seconds=0) is None
+
+    def test_game_clock_unknown_league_is_none(self):
+        assert game_seconds_remaining("cricket", period=1, clock_seconds=0) is None
+
+    def test_game_schedule_watches_all_registered_leagues(self):
+        """Regression: GameSchedule previously watched only NBA/NCAA/NHL —
+        all off-season in July — so the live bot slept all summer."""
+        from bot.game_schedule import ESPN_ENDPOINTS
+        for league in LEAGUES:
+            assert league in ESPN_ENDPOINTS
+            assert ESPN_ENDPOINTS[league]
+
+
+class TestMultiLeagueIngest:
+    def test_candidate_slugs_mlb_bare_first(self):
+        """Verified live against Gamma 2026-07-11: game markets use BARE
+        {league}-{away}-{home}-{date} slugs (e.g. mlb-mil-pit-2026-07-10);
+        the aec- prefix is the polymarket.us convention, kept as fallback."""
+        game = {"league": "mlb", "away_abbr": "nyy", "home_abbr": "bos",
+                "date": "20260705"}
+        slugs = candidate_slugs(game)
+        assert slugs[0] == "mlb-nyy-bos-2026-07-05"
+        assert "aec-mlb-nyy-bos-2026-07-05" in slugs  # legacy fallback
+
+    def test_candidate_slugs_nba_abbr_map_applied(self):
+        game = {"league": "nba", "away_abbr": "gs", "home_abbr": "ny",
+                "date": "20261101"}
+        slugs = candidate_slugs(game)
+        assert slugs[0] == "nba-gsw-nyk-2026-11-01"
+        assert "nba-gs-ny-2026-11-01" in slugs      # raw-abbr fallback
+        assert "aec-nba-gsw-nyk-2026-11-01" in slugs  # legacy fallback
+
+    def test_candidate_slugs_wnba_abbr_map(self):
+        # Verified live: Valkyries/Sun slugs use gsv/conn, not ESPN's gs/con
+        game = {"league": "wnba", "away_abbr": "gs", "home_abbr": "con",
+                "date": "20260710"}
+        slugs = candidate_slugs(game)
+        assert slugs[0] == "wnba-gsv-conn-2026-07-10"
+
+    def test_candidate_slugs_soccer_bare_then_atc(self):
+        game = {"league": "mls", "away_abbr": "lafc", "home_abbr": "sea",
+                "date": "20260705"}
+        slugs = candidate_slugs(game)
+        assert slugs[0] == "mls-lafc-sea-2026-07-05"
+        assert "atc-mls-lafc-sea-2026-07-05-lafc" in slugs
+        assert "atc-mls-lafc-sea-2026-07-05-sea" in slugs
+
+    def test_prune_leagues_removes_only_targeted_league(self, tmp_path):
+        db = str(tmp_path / "hist.db")
+        _hist_init_tables(db)
+        conn = _hist_get_conn(db)
+        _hist_upsert_market(conn, {"slug": "aec-nba-atl-hou-2025-01-05",
+                                   "league": "nba", "market_type": "moneyline_game"})
+        _hist_upsert_market(conn, {"slug": "will-the-celtics-win-the-2026-nba-finals",
+                                   "league": "NBA", "market_type": "nba_outright"})
+        _hist_upsert_market(conn, {"slug": "aec-mlb-nyy-bos-2026-07-04",
+                                   "league": "mlb", "market_type": "moneyline_game"})
+        _hist_upsert_snapshots(conn, "aec-nba-atl-hou-2025-01-05", [{"t": 0, "p": 0.5}])
+        _hist_upsert_snapshots(conn, "aec-mlb-nyy-bos-2026-07-04", [{"t": 0, "p": 0.6}])
+        conn.commit()
+
+        m_del, s_del = prune_leagues(conn, ["nba"])
+        assert m_del == 2   # game market + outright
+        assert s_del == 1   # only the NBA snapshot
+
+        remaining = [r[0] for r in conn.execute(
+            "SELECT slug FROM historical_markets").fetchall()]
+        assert remaining == ["aec-mlb-nyy-bos-2026-07-04"]
+        snaps = conn.execute("SELECT COUNT(*) FROM historical_snapshots").fetchone()[0]
+        assert snaps == 1
+        conn.close()
+
+    def test_run_ingest_importable_by_supervisor(self):
+        """The supervisor's daily recorder job imports these at call time."""
+        from scripts.ingest_historical import run_ingest, DEFAULT_DAYS_BACK
+        assert callable(run_ingest)
+        assert DEFAULT_DAYS_BACK >= 1
+
+
+# ============================================================================
+# Polymarket US fee schedule (bot/strategies/fees.py)
+# ============================================================================
+
+from bot.strategies.fees import (
+    fee_per_contract, fee_usd, booked_fee_usd,
+    TAKER_FEE_COEFFICIENT, MAKER_REBATE_COEFFICIENT,
+)
+
+
+class TestFeeSchedule:
+    def test_documented_taker_cap(self):
+        """docs.polymarket.us/fees: taker fee tops out at $1.50 per 100
+        contracts at p=$0.50."""
+        assert fee_usd(100, 0.50) == pytest.approx(1.50)
+
+    def test_documented_maker_rebate_cap(self):
+        """Maker rebate tops out at ~$0.31 per 100 contracts at p=$0.50."""
+        rebate = fee_usd(100, 0.50, MAKER_REBATE_COEFFICIENT)
+        assert rebate == pytest.approx(-0.3125)
+
+    def test_symmetric_around_half(self):
+        assert fee_per_contract(0.30) == pytest.approx(fee_per_contract(0.70))
+        assert fee_per_contract(0.10) == pytest.approx(fee_per_contract(0.90))
+
+    def test_shrinks_toward_extremes(self):
+        assert fee_per_contract(0.90) < fee_per_contract(0.70) < fee_per_contract(0.50)
+
+    def test_much_cheaper_than_flat_2pct_for_favorites(self):
+        """The old flat 2%-of-notional model overcharged favorites: at p=0.90
+        the real fee is 0.0054/share (0.6% of notional), not 1.8c."""
+        real = fee_per_contract(0.90)
+        flat = 0.02 * 0.90
+        assert real == pytest.approx(0.06 * 0.90 * 0.10)
+        assert real < flat / 3
+
+    def test_price_clamped(self):
+        assert fee_per_contract(0.0) == fee_per_contract(0.01)
+        assert fee_per_contract(1.0) == fee_per_contract(0.99)
+
+    def test_booked_fee_rounds_to_whole_cents(self):
+        """Booked fees land on whole cents, within half a cent of raw."""
+        assert booked_fee_usd(10, 0.50) == pytest.approx(0.15)
+        for contracts, price in ((7, 0.37), (23.5, 0.61), (2.5, 0.44)):
+            raw = fee_usd(contracts, price)
+            booked = booked_fee_usd(contracts, price)
+            assert abs(booked - raw) <= 0.005 + 1e-9
+            assert booked == pytest.approx(round(booked * 100) / 100)
+
+    def test_tiny_trade_rounds_to_zero(self):
+        """Docs: small trades can round to $0.00."""
+        assert booked_fee_usd(0.3, 0.50) == 0.0
+
+    def test_defaults_match_exchange(self):
+        assert TAKER_FEE_COEFFICIENT == 0.06
+        assert MAKER_REBATE_COEFFICIENT == -0.0125
+
+
+# ============================================================================
+# Market discovery pagination (audit blocker #1)
+# ============================================================================
+
+from bot.market_data import MarketDataClient
+from utils.config import APIConfig
+
+
+def _future_iso(hours):
+    return (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+
+
+class TestMarketPagination:
+    """Measured live 2026-07-11: 6,000+ active markets on the US gateway;
+    WNBA games first appear at offset ~2,500. A single 500-limit request
+    never saw a single tradeable game — discovery MUST paginate."""
+
+    def _client(self, pages_by_offset, page_size=2):
+        client = MarketDataClient(APIConfig(), logger=None)
+        calls = []
+
+        def fake_get(url, params=None):
+            calls.append(dict(params or {}))
+            offset = (params or {}).get("offset", 0)
+            return {"markets": pages_by_offset.get(offset, [])}
+
+        client._get = fake_get
+        client._calls = calls
+        return client
+
+    @staticmethod
+    def _mk(slug, hours_out=5):
+        # Sports market with a gameStartTime inside the scan window
+        return {"slug": slug, "gameStartTime": _future_iso(hours_out),
+                "endDate": _future_iso(hours_out + 4)}
+
+    def test_paginates_until_short_page(self):
+        pages = {
+            0: [self._mk("aec-mlb-a-b-2026-07-11"), self._mk("aec-mlb-c-d-2026-07-11")],
+            2: [self._mk("aec-wnba-e-f-2026-07-11"), self._mk("aec-wnba-g-h-2026-07-11")],
+            4: [self._mk("aec-mls-i-j-2026-07-11")],   # short page ends the walk
+        }
+        client = self._client(pages)
+        markets = client.get_active_markets(page_size=2)
+        slugs = {m["slug"] for m in markets}
+        # The deep-offset WNBA/MLS markets are the whole point of the fix
+        assert "aec-wnba-e-f-2026-07-11" in slugs
+        assert "aec-mls-i-j-2026-07-11" in slugs
+        assert len(client._calls) == 3
+        assert [c["offset"] for c in client._calls] == [0, 2, 4]
+
+    def test_first_page_failure_returns_empty(self):
+        client = self._client({})
+        client._get = lambda url, params=None: None
+        assert client.get_active_markets(page_size=2) == []
+
+    def test_later_page_failure_keeps_partial_results(self):
+        pages = {0: [self._mk("aec-mlb-a-b-2026-07-11"), self._mk("aec-mlb-c-d-2026-07-11")]}
+        client = self._client(pages)
+        orig = client._get
+
+        def flaky(url, params=None):
+            if (params or {}).get("offset", 0) >= 2:
+                return None  # API blip mid-scan
+            return orig(url, params)
+
+        client._get = flaky
+        markets = client.get_active_markets(page_size=2)
+        assert len(markets) == 2  # page 0 kept, scan degraded not blanked
+
+    def test_safety_cap_stops_runaway(self):
+        # Every page full -> walk must stop at max_markets
+        full_page = [self._mk(f"aec-mlb-x{i}-y-2026-07-11") for i in range(2)]
+        client = self._client({o: full_page for o in range(0, 100, 2)})
+        client.get_active_markets(page_size=2, max_markets=6)
+        assert [c["offset"] for c in client._calls] == [0, 2, 4]
+
+
+# ============================================================================
+# Live fill reconciliation (audit blocker #3)
+# ============================================================================
+
+from bot.execution import ExecutionEngine
+
+
+class _FakeOrders:
+    def __init__(self, response=None, error=None):
+        self.response = response
+        self.error = error
+        self.created = []
+
+    def create(self, payload):
+        self.created.append(payload)
+        if self.error:
+            raise self.error
+        return self.response
+
+
+class _FakePortfolioAPI:
+    def __init__(self, positions=None, error=None):
+        self._positions = positions
+        self._error = error
+
+    def positions(self):
+        if self._error:
+            raise self._error
+        return {"positions": self._positions or {}}
+
+
+class _FakeClient:
+    def __init__(self, orders=None, portfolio=None):
+        self.orders = orders or _FakeOrders(response={"id": "o1", "executions": []})
+        self.portfolio = portfolio or _FakePortfolioAPI()
+
+
+def _live_engine(client, **cfg_overrides):
+    cfg = TradingConfig(paper_trading=False, **cfg_overrides)
+    engine = ExecutionEngine(cfg)
+    engine._client = client
+    engine.CLOSE_VERIFY_DELAY_SECONDS = 0  # no real sleeps in tests
+    return engine
+
+
+def _live_signal(**kw):
+    base = dict(market_id="m1", token_id="t1", side="buy",
+                estimated_prob=0.60, market_price=0.50, edge=0.10,
+                position_size_usd=10.0, slug="aec-mlb-nyy-bos-2026-07-11",
+                exec_price=0.52)
+    base.update(kw)
+    return TradeSignal(**base)
+
+
+class TestFillReconciliation:
+    def test_reconcile_parses_float_quantities(self):
+        """A 2.5-share fill is 2.5 shares — the old int() made it 2."""
+        qty, vwap = ExecutionEngine.reconcile_executions(
+            [{"quantity": "2.5", "price": {"value": "0.52"}}], limit_price=0.52)
+        assert qty == pytest.approx(2.5)
+        assert vwap == pytest.approx(0.52)
+
+    def test_reconcile_unknown_fields_is_zero_not_full(self):
+        """Unparseable executions must yield ZERO fills. The old code fell
+        back to the FULL requested quantity (2.5-share partial -> 20-share
+        phantom trade)."""
+        qty, _ = ExecutionEngine.reconcile_executions(
+            [{"mystery_field": 20}], limit_price=0.52)
+        assert qty == 0.0
+
+    def test_reconcile_vwap_across_executions(self):
+        qty, vwap = ExecutionEngine.reconcile_executions(
+            [{"quantity": 10, "price": 0.50}, {"quantity": 5, "price": 0.56}],
+            limit_price=0.52)
+        assert qty == 15
+        assert vwap == pytest.approx((10 * 0.50 + 5 * 0.56) / 15)
+
+    def test_reconcile_alternate_field_names(self):
+        qty, vwap = ExecutionEngine.reconcile_executions(
+            [{"filledQuantity": "3", "executionPrice": "0.40"}], limit_price=0.52)
+        assert qty == 3
+        assert vwap == pytest.approx(0.40)
+
+    def test_zero_fill_creates_no_trade(self):
+        client = _FakeClient(_FakeOrders(response={"id": "o1", "executions": []}))
+        engine = _live_engine(client)
+        assert engine.execute_trade(_live_signal()) is None
+
+    def test_unparseable_fill_creates_no_trade(self):
+        client = _FakeClient(_FakeOrders(response={
+            "id": "o1", "executions": [{"weird": 20}]}))
+        engine = _live_engine(client)
+        assert engine.execute_trade(_live_signal()) is None
+
+    def test_partial_fill_books_partial_trade(self):
+        client = _FakeClient(_FakeOrders(response={
+            "id": "o1",
+            "executions": [{"quantity": "2.5", "price": {"value": "0.52"}}]}))
+        engine = _live_engine(client)
+        trade = engine.execute_trade(_live_signal(position_size_usd=10.0))
+        assert trade is not None
+        assert trade.quantity == pytest.approx(2.5)      # NOT the 19 requested
+        assert trade.size_usd == pytest.approx(2.5 * 0.52)
+        # fee on ACTUAL fill: 0.06 * 2.5 * 0.52 * 0.48, banker's-rounded
+        assert trade.fees == pytest.approx(0.04, abs=0.005)
+
+    def test_order_submitted_at_exec_price_with_automatic_flag(self):
+        orders = _FakeOrders(response={"id": "o1", "executions": [
+            {"quantity": 19, "price": 0.52}]})
+        engine = _live_engine(_FakeClient(orders))
+        engine.execute_trade(_live_signal(market_price=0.50, exec_price=0.52))
+        payload = orders.created[0]
+        assert payload["price"]["value"] == "0.52"        # executable, not mid
+        assert payload["automaticOrder"] is True
+        assert payload["tif"] == "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL"
+
+    def test_missing_exec_price_refuses_to_submit(self):
+        orders = _FakeOrders(response={"id": "o1", "executions": []})
+        engine = _live_engine(_FakeClient(orders))
+        assert engine.execute_trade(_live_signal(exec_price=0.0)) is None
+        assert orders.created == []                       # never reached the API
+
+    def test_fill_price_uses_execution_vwap_not_limit(self):
+        client = _FakeClient(_FakeOrders(response={
+            "id": "o1", "executions": [{"quantity": 10, "price": 0.49}]}))
+        engine = _live_engine(client)
+        trade = engine.execute_trade(_live_signal(exec_price=0.52))
+        assert trade.price == pytest.approx(0.49)         # price improvement kept
+
+
+# ============================================================================
+# Position closing (audit blocker #4)
+# ============================================================================
+
+def _open_position(side="buy", slug="aec-mlb-nyy-bos-2026-07-11"):
+    return Position(
+        market_id="m1", token_id="t1", side=side, entry_price=0.52,
+        size_usd=10.0, quantity=19, estimated_prob=0.60,
+        entry_time=datetime.now(timezone.utc), slug=slug,
+    )
+
+
+class TestPositionClosing:
+    def test_api_error_is_not_success(self):
+        """The killer bug: fetch failure used to look like 'position absent'
+        and the bot stopped managing a REAL open position."""
+        client = _FakeClient(portfolio=_FakePortfolioAPI(error=RuntimeError("503")))
+        engine = _live_engine(client)
+        assert engine.close_position(_open_position()) is False
+
+    def test_confirmed_absent_is_success(self):
+        client = _FakeClient(portfolio=_FakePortfolioAPI(positions={}))
+        engine = _live_engine(client)
+        assert engine.close_position(_open_position()) is True
+
+    def test_long_closes_with_sell_at_floor(self):
+        slug = "aec-mlb-nyy-bos-2026-07-11"
+        orders = _FakeOrders(response={"id": "o1", "executions": [{"quantity": 19}]})
+        # position present before close; gone after (two fetches)
+        portfolio = _FakePortfolioAPI(positions={slug: {"netPosition": "19",
+                                                        "qtyAvailable": "19"}})
+        client = _FakeClient(orders, portfolio)
+        engine = _live_engine(client)
+        fetches = iter([{slug: {"netPosition": "19", "qtyAvailable": "19"}}, {}])
+        engine.get_exchange_positions = lambda: next(fetches)
+        assert engine.close_position(_open_position()) is True
+        payload = orders.created[0]
+        assert payload["intent"] == "ORDER_INTENT_SELL_LONG"
+        assert payload["price"]["value"] == "0.01"
+
+    def test_short_closes_with_buy_at_ceiling(self):
+        """Shorts were sent BUY_SHORT @ $0.01 — a buy limit that can never
+        take the ask. Closing a short is a BUY at an aggressive HIGH price."""
+        slug = "aec-mlb-nyy-bos-2026-07-11"
+        orders = _FakeOrders(response={"id": "o1", "executions": [{"quantity": 19}]})
+        client = _FakeClient(orders, _FakePortfolioAPI())
+        engine = _live_engine(client)
+        fetches = iter([{slug: {"netPosition": "-19", "qtyAvailable": "19"}}, {}])
+        engine.get_exchange_positions = lambda: next(fetches)
+        assert engine.close_position(_open_position(side="sell")) is True
+        payload = orders.created[0]
+        assert payload["intent"] == "ORDER_INTENT_BUY_LONG"
+        assert payload["price"]["value"] == "0.99"
+
+    def test_order_error_without_resolution_is_failure(self):
+        slug = "aec-mlb-nyy-bos-2026-07-11"
+        orders = _FakeOrders(error=RuntimeError("market closed for trading"))
+        client = _FakeClient(orders, _FakePortfolioAPI(
+            positions={slug: {"netPosition": "19", "qtyAvailable": "19"}}))
+        engine = _live_engine(client)
+        engine._is_market_resolved = lambda s: False     # NOT resolved
+        assert engine.close_position(_open_position()) is False
+
+    def test_order_error_with_confirmed_resolution_auto_settles(self):
+        slug = "aec-mlb-nyy-bos-2026-07-11"
+        orders = _FakeOrders(error=RuntimeError("market closed for trading"))
+        client = _FakeClient(orders, _FakePortfolioAPI(
+            positions={slug: {"netPosition": "19", "qtyAvailable": "19"}}))
+        engine = _live_engine(client)
+        engine._is_market_resolved = lambda s: True      # exchange confirms
+        assert engine.close_position(_open_position()) is True
+        assert engine._last_close_was_auto_settle is True
+
+    def test_three_nofill_closes_do_not_settle_active_market(self):
+        """3 unfilled attempts used to become 'auto-settling' with no proof.
+        On an ACTIVE market that must stay False forever."""
+        slug = "aec-mlb-nyy-bos-2026-07-11"
+        orders = _FakeOrders(response={"id": "o1", "executions": []})
+        client = _FakeClient(orders, _FakePortfolioAPI())
+        engine = _live_engine(client)
+        engine._is_market_resolved = lambda s: False
+        pos_state = {slug: {"netPosition": "19", "qtyAvailable": "19"}}
+        engine.get_exchange_positions = lambda: pos_state
+        for _ in range(4):
+            assert engine.close_position(_open_position()) is False
+
+    def test_verification_fetch_failure_is_not_success(self):
+        slug = "aec-mlb-nyy-bos-2026-07-11"
+        orders = _FakeOrders(response={"id": "o1", "executions": [{"quantity": 19}]})
+        client = _FakeClient(orders, _FakePortfolioAPI())
+        engine = _live_engine(client)
+        fetches = iter([{slug: {"netPosition": "19", "qtyAvailable": "19"}}, None])
+        engine.get_exchange_positions = lambda: next(fetches)
+        assert engine.close_position(_open_position()) is False
+
+
+# ============================================================================
+# Signal direction guard (audit blocker #5)
+# ============================================================================
+
+class TestDirectionGuard:
+    def _reversal_snapshot(self):
+        """Audit scenario: market at 0.25, books say 0.20 (SELL), but the
+        order book is massively bid-heavy so aux signals scream BUY."""
+        ob = OrderBook(
+            bids=[OrderBookLevel(price=0.24, size=5000),
+                  OrderBookLevel(price=0.23, size=5000)],
+            asks=[OrderBookLevel(price=0.26, size=100)],
+        )
+        return MarketSnapshot(
+            market_id="m", token_id="t", question="q", price=0.25,
+            volume_24h=5000, liquidity=5000, order_book=ob,
+            price_history=[0.25] * 30, timestamp=datetime.now(timezone.utc),
+            slug="aec-nba-aaa-bbb-2026-11-01",
+        )
+
+    def test_reversal_helper(self):
+        primary = Signal(name="odds_value", value=0.20, confidence=0.2,
+                         metadata={"edge": -0.05})
+        assert ProbabilityEstimator._direction_reversed(+0.06, primary, 0.25) is True
+        assert ProbabilityEstimator._direction_reversed(-0.04, primary, 0.25) is False
+
+    def test_reversal_helper_falls_back_to_value(self):
+        primary = Signal(name="cross_market", value=0.20, confidence=0.5, metadata={})
+        assert ProbabilityEstimator._direction_reversed(+0.06, primary, 0.25) is True
+
+    def test_no_external_direction_is_not_reversal(self):
+        primary = Signal(name="odds_value", value=0.25, confidence=0.2,
+                         metadata={"edge": 0.0})
+        assert ProbabilityEstimator._direction_reversed(+0.005, primary, 0.25) is False
+
+    def test_audit_scenario_buy_against_consensus_blocked(self):
+        """Books at 0.20 vs market 0.25: the only permitted trade is a SELL.
+        Bid-heavy aux signals used to flip the blend to ~0.31 -> BUY."""
+        cache = HistoricalOddsCache({
+            "aec-nba-aaa-bbb-2026-11-01": [(0.0, 0.20, 4)],
+        })
+        cfg = SignalConfig()
+        cfg.combination_method = "linear"
+        est = ProbabilityEstimator(cfg, odds_cache=cache)
+        snap = self._reversal_snapshot()
+
+        # Sanity: without the guard this configuration produced a BUY —
+        # prove the raw blend really does cross the price.
+        mt = detect_market_type(snap)
+        signals = est.compute_signals(snap, mt)
+        weights = est._effective_weights(mt)
+        raw_prob, _ = est._combine(signals, weights, snap.price)
+        assert raw_prob > snap.price, "scenario no longer reproduces the reversal"
+
+        result = est.detect_edge(snap, min_edge=0.05, max_edge=0.40)
+        assert result is None or result.side == "sell"
+        if result is not None:
+            assert result.edge < 0
+
+    def test_aligned_aux_signals_still_trade(self):
+        """Guard must not block trades where aux signals AGREE with books:
+        consensus 0.32 vs price 0.25 -> BUY passes."""
+        cache = HistoricalOddsCache({
+            "aec-nba-aaa-bbb-2026-11-01": [(0.0, 0.32, 4)],
+        })
+        cfg = SignalConfig()
+        cfg.combination_method = "linear"
+        est = ProbabilityEstimator(cfg, odds_cache=cache)
+        snap = self._reversal_snapshot()  # bid-heavy book agrees with buy
+        result = est.detect_edge(snap, min_edge=0.05, max_edge=0.40)
+        assert result is not None
+        assert result.side == "buy"
+
+
+# ============================================================================
+# Position state persistence (audit item #6)
+# ============================================================================
+
+class TestPositionStatePersistence:
+    def _tmp_db(self, tmp_path, monkeypatch):
+        import bot.trade_db as tdb
+        monkeypatch.setattr(tdb, "DB_PATH", str(tmp_path / "state.db"))
+        tdb.init_db()
+        return tdb
+
+    def _position(self, slug="aec-mlb-nyy-bos-2026-07-11", minutes_ago=45):
+        pos = Position(
+            market_id="m1", token_id="t1", side="buy", entry_price=0.52,
+            size_usd=10.0, quantity=19.0, estimated_prob=0.61,
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=minutes_ago),
+            slug=slug,
+        )
+        pos.peak_price = 0.60
+        pos.max_favorable_pnl_usd = 1.52
+        pos.max_adverse_pnl_usd = -0.40
+        pos.let_it_ride_count = 3
+        return pos
+
+    def test_roundtrip(self, tmp_path, monkeypatch):
+        tdb = self._tmp_db(tmp_path, monkeypatch)
+        pos = self._position()
+        tdb.upsert_position_state(pos)
+        states = tdb.get_position_states()
+        s = states[pos.slug]
+        assert s["estimated_prob"] == pytest.approx(0.61)
+        assert s["peak_price"] == pytest.approx(0.60)
+        assert s["let_it_ride_count"] == 3
+        restored_entry = datetime.fromisoformat(s["entry_time"])
+        assert abs((restored_entry - pos.entry_time).total_seconds()) < 1
+        tdb.delete_position_state(pos.slug)
+        assert tdb.get_position_states() == {}
+
+    def test_upsert_is_idempotent(self, tmp_path, monkeypatch):
+        tdb = self._tmp_db(tmp_path, monkeypatch)
+        pos = self._position()
+        tdb.upsert_position_state(pos)
+        pos.let_it_ride_count = 7
+        tdb.upsert_position_state(pos)
+        states = tdb.get_position_states()
+        assert len(states) == 1
+        assert states[pos.slug]["let_it_ride_count"] == 7
+
+    def test_paper_restore_survives_restart(self, tmp_path, monkeypatch):
+        """Restarted paper bot must keep managing its open positions with the
+        ORIGINAL entry_time — otherwise the 10-min hold gate re-arms forever."""
+        tdb = self._tmp_db(tmp_path, monkeypatch)
+        tdb.upsert_position_state(self._position(minutes_ago=45))
+
+        portfolio = Portfolio(paper_mode=True, initial_bankroll=1000,
+                              restore_state=True)
+        restored = portfolio.get_open_positions()
+        assert len(restored) == 1
+        pos = restored[0]
+        assert pos.slug == "aec-mlb-nyy-bos-2026-07-11"
+        assert pos.estimated_prob == pytest.approx(0.61)
+        assert pos.peak_price == pytest.approx(0.60)
+        held = (datetime.now(timezone.utc) - pos.entry_time).total_seconds()
+        assert held > 600  # min-hold gate already elapsed — exits can fire
+
+    def test_no_restore_by_default_keeps_tests_hermetic(self, tmp_path, monkeypatch):
+        tdb = self._tmp_db(tmp_path, monkeypatch)
+        tdb.upsert_position_state(self._position())
+        portfolio = Portfolio(paper_mode=True, initial_bankroll=1000)
+        assert portfolio.get_open_positions() == []
+
+    def test_live_reconstruction_overlays_persisted_state(self, tmp_path, monkeypatch):
+        """The audit bug: every scan rebuilt live positions with
+        entry_time=now and estimated_prob=0.5. The overlay must restore the
+        persisted values while the EXCHANGE stays authoritative for qty/cost."""
+        tdb = self._tmp_db(tmp_path, monkeypatch)
+        slug = "aec-mlb-nyy-bos-2026-07-11"
+        tdb.upsert_position_state(self._position(slug=slug, minutes_ago=45))
+
+        class _Client:
+            class account:
+                @staticmethod
+                def balances():
+                    return {"buyingPower": {"value": "500"}}
+
+            class portfolio:
+                @staticmethod
+                def positions():
+                    return {"positions": {slug: {
+                        "netPosition": "19",
+                        "cost": {"value": "9.88"},
+                        "cashValue": {"value": "11.40"},
+                    }}}
+
+        portfolio = Portfolio(exchange_client=_Client(), paper_mode=False)
+        positions = portfolio.get_open_positions()
+        assert len(positions) == 1
+        pos = positions[0]
+        # Bot-owned state restored:
+        assert pos.estimated_prob == pytest.approx(0.61)      # not 0.5
+        held = (datetime.now(timezone.utc) - pos.entry_time).total_seconds()
+        assert held > 600                                     # not "now"
+        assert pos.peak_price == pytest.approx(0.60)
+        assert pos.let_it_ride_count == 3
+        # Exchange stays authoritative for size:
+        assert pos.quantity == 19
+        assert pos.size_usd == pytest.approx(9.88)
+
+    def test_live_position_without_state_gets_safe_defaults(self, tmp_path, monkeypatch):
+        self._tmp_db(tmp_path, monkeypatch)
+
+        class _Client:
+            class account:
+                @staticmethod
+                def balances():
+                    return {"buyingPower": {"value": "500"}}
+
+            class portfolio:
+                @staticmethod
+                def positions():
+                    return {"positions": {"mystery-slug": {
+                        "netPosition": "5",
+                        "cost": {"value": "2.50"},
+                        "cashValue": {"value": "2.60"},
+                    }}}
+
+        portfolio = Portfolio(exchange_client=_Client(), paper_mode=False)
+        positions = portfolio.get_open_positions()
+        assert len(positions) == 1
+        assert positions[0].estimated_prob == pytest.approx(0.5)
+
+    def test_close_deletes_state(self, tmp_path, monkeypatch):
+        tdb = self._tmp_db(tmp_path, monkeypatch)
+        portfolio = Portfolio(paper_mode=True, initial_bankroll=1000)
+        signal = TradeSignal(market_id="m1", token_id="t1", side="buy",
+                             estimated_prob=0.61, market_price=0.52, edge=0.09,
+                             position_size_usd=10, slug="close-state-test")
+        trade = Trade(market_id="m1", token_id="t1", side="buy", price=0.52,
+                      quantity=19, size_usd=10,
+                      timestamp=datetime.now(timezone.utc) - timedelta(minutes=20))
+        pos = portfolio.open_position(signal, trade)
+        assert "close-state-test" in tdb.get_position_states()
+
+        with patch("bot.trade_db.insert_exit_log"), \
+             patch("bot.trade_db.insert_trade"), \
+             patch("bot.edge_log.update_edge_log_outcome"):
+            portfolio.close_position(pos, current_price=0.58, reason="take_profit")
+        assert "close-state-test" not in tdb.get_position_states()
+
+
+# ============================================================================
+# Multi-book consensus for current sports (FanDuel + Pinnacle + ESPN/DK)
+# ============================================================================
+
+from bot.signals.book_scrapers import (
+    _match_abbr, FANDUEL_SPORTS, PINNACLE_LEAGUES, LEAGUE_TEAM_FRAGMENTS,
+)
+from scripts.ingest_historical import (
+    multi_book_home_prob, existing_num_books,
+)
+
+
+class TestLeagueAwareTeamMatching:
+    def test_mlb_nicknames_beat_city_collisions(self):
+        # "Chicago Cubs" used to match NBA's chi:"chicago" first
+        assert _match_abbr("Chicago Cubs", "baseball_mlb") == "chc"
+        assert _match_abbr("Chicago White Sox", "baseball_mlb") == "cws"
+        assert _match_abbr("Washington Nationals", "baseball_mlb") == "wsh"
+        assert _match_abbr("New York Yankees", "baseball_mlb") == "nyy"
+        assert _match_abbr("Los Angeles Dodgers", "baseball_mlb") == "lad"
+
+    def test_wnba_nicknames_beat_cross_league_collisions(self):
+        # "Las Vegas Aces" used to match NHL's vgk:"vegas";
+        # "Golden State Valkyries" matched NBA's gs:"golden state"
+        assert _match_abbr("Las Vegas Aces", "basketball_wnba") == "las"
+        assert _match_abbr("Golden State Valkyries", "basketball_wnba") == "gsv"
+        assert _match_abbr("Los Angeles Sparks", "basketball_wnba") == "la"
+        assert _match_abbr("Connecticut Sun", "basketball_wnba") == "conn"
+
+    def test_legacy_leagues_fall_back_to_flat_dict(self):
+        assert _match_abbr("Golden State Warriors", "basketball_nba") == "gs"
+        assert _match_abbr("Golden State Warriors") == "gs"  # no sport hint
+
+    def test_summer_sports_registered_with_books(self):
+        for sport in ("baseball_mlb", "basketball_wnba"):
+            assert sport in FANDUEL_SPORTS
+            assert sport in PINNACLE_LEAGUES
+        assert "soccer_usa_mls" in PINNACLE_LEAGUES   # FD has no MLS page
+        # Pinnacle league ids discovered live 2026-07-11
+        assert PINNACLE_LEAGUES["baseball_mlb"] == 246
+        assert PINNACLE_LEAGUES["basketball_wnba"] == 578
+        assert PINNACLE_LEAGUES["soccer_usa_mls"] == 2663
+
+    def test_fragment_abbrs_match_recorder_abbr_space(self):
+        """Fragment keys must equal what the recorder passes to find_game:
+        ABBR_MAP-normalized ESPN abbrs (gs->gsv, chw->cws, lv->las...)."""
+        from scripts.ingest_historical import ABBR_MAP
+        for lg, sport in (("mlb", "baseball_mlb"), ("wnba", "basketball_wnba")):
+            for pm_abbr in ABBR_MAP.get(lg, {}).values():
+                assert pm_abbr in LEAGUE_TEAM_FRAGMENTS[sport], (
+                    f"{pm_abbr} missing from {sport} fragments")
+
+
+class _FakeAggregator:
+    def __init__(self, game=None):
+        self.game = game
+        self.calls = []
+
+    def find_game(self, sport_key, home_abbr, away_abbr):
+        self.calls.append((sport_key, home_abbr, away_abbr))
+        return self.game
+
+
+class TestMultiBookRecorder:
+    def test_lookup_normalizes_abbrs_through_abbr_map(self):
+        agg = _FakeAggregator(game={"home_prob": 0.62, "num_books": 2})
+        result = multi_book_home_prob(agg, "wnba", "con", "gs")
+        assert result == (0.62, 2)
+        # ESPN abbrs con/gs must be normalized to conn/gsv before matching
+        assert agg.calls == [("basketball_wnba", "conn", "gsv")]
+
+    def test_no_aggregator_or_no_game_is_none(self):
+        assert multi_book_home_prob(None, "mlb", "nyy", "bos") is None
+        assert multi_book_home_prob(_FakeAggregator(None), "mlb", "nyy", "bos") is None
+
+    def _seed(self, tmp_path):
+        db = str(tmp_path / "hist.db")
+        _hist_init_tables(db)
+        conn = _hist_get_conn(db)
+        _hist_upsert_market(conn, {
+            "slug": "mlb-nyy-bos-2026-07-11", "market_id": "1",
+            "league": "mlb", "home_team": "Boston Red Sox",
+            "away_team": "New York Yankees", "home_abbr": "bos",
+            "away_abbr": "nyy", "espn_game_id": "401",
+            "market_type": "moneyline_game", "token0_side": "away",
+            "game_start_time": datetime.now(timezone.utc).isoformat(),
+        })
+        _hist_upsert_snapshots(conn, "mlb-nyy-bos-2026-07-11",
+                               [{"t": int(datetime.now(timezone.utc).timestamp()) // 86400 * 86400,
+                                 "p": 0.55}])
+        conn.commit()
+        return db, conn
+
+    def test_pregame_blend_combines_dk_fanduel_pinnacle(self, tmp_path, monkeypatch):
+        db, conn = self._seed(tmp_path)
+        import scripts.ingest_historical as ih
+        # ESPN pickcenter: DK home ML -150/+130 -> p_home ~0.5798 (1 book)
+        monkeypatch.setattr(ih, "fetch_espn_pickcenter",
+            lambda session, espn_id, last_call, league="nba": (
+                [{"homeTeamOdds": {"moneyLine": -150},
+                  "awayTeamOdds": {"moneyLine": 130}}], last_call))
+        agg = _FakeAggregator(game={"home_prob": 0.62, "num_books": 2})
+
+        market_row = dict(conn.execute("SELECT * FROM historical_markets").fetchone())
+        n, _ = ih.backfill_consensus_for_market(
+            None, conn, market_row, window_days=3, last_call=0.0, aggregator=agg)
+        assert n == 1
+
+        row = conn.execute(
+            "SELECT espn_consensus_prob, num_books FROM historical_snapshots").fetchone()
+        assert row["num_books"] == 3          # DK + FanDuel + Pinnacle
+        # book-count-weighted blend of P(home), stored for YES team = away
+        dk_home = 0.6 / (0.6 + 100 / 230)
+        expected_home = (dk_home * 1 + 0.62 * 2) / 3
+        assert row["espn_consensus_prob"] == pytest.approx(1 - expected_home, abs=1e-6)
+        conn.close()
+
+    def test_no_downgrade_after_game_finishes(self, tmp_path, monkeypatch):
+        """Post-game reruns see only the 1-book pickcenter line; they must
+        NOT overwrite the richer pre-game 3-book consensus."""
+        db, conn = self._seed(tmp_path)
+        import scripts.ingest_historical as ih
+        monkeypatch.setattr(ih, "fetch_espn_pickcenter",
+            lambda session, espn_id, last_call, league="nba": (
+                [{"homeTeamOdds": {"moneyLine": -150},
+                  "awayTeamOdds": {"moneyLine": 130}}], last_call))
+        market_row = dict(conn.execute("SELECT * FROM historical_markets").fetchone())
+
+        # Pre-game pass: 3 books
+        agg = _FakeAggregator(game={"home_prob": 0.62, "num_books": 2})
+        ih.backfill_consensus_for_market(None, conn, market_row, 3, 0.0, aggregator=agg)
+        rich = conn.execute(
+            "SELECT espn_consensus_prob, num_books FROM historical_snapshots").fetchone()
+        assert rich["num_books"] == 3
+
+        # Post-game rerun: books dropped the game -> only DK (1 book)
+        n, _ = ih.backfill_consensus_for_market(
+            None, conn, market_row, 3, 0.0, aggregator=_FakeAggregator(None))
+        assert n == 0  # guard refused the downgrade
+        after = conn.execute(
+            "SELECT espn_consensus_prob, num_books FROM historical_snapshots").fetchone()
+        assert after["num_books"] == 3
+        assert after["espn_consensus_prob"] == pytest.approx(
+            rich["espn_consensus_prob"])
+        assert existing_num_books(conn, "mlb-nyy-bos-2026-07-11") == 3
+        conn.close()
+
+
+# ============================================================================
+# Live in-game edge engine (live win prob), clock fix (audit #7), book dedup
+# ============================================================================
+
+from bot.signals.live_win_prob import LiveWinProbCache, slug_game_teams
+from bot.signals.signals import live_win_prob_signal
+from bot.game_schedule import GameSchedule
+
+
+class TestSlugGameTeams:
+    def test_prefixed_and_bare_families(self):
+        assert slug_game_teams("aec-mlb-nyy-bos-2026-07-11") == ("mlb", "nyy", "bos")
+        assert slug_game_teams("mlb-nyy-bos-2026-07-11") == ("mlb", "nyy", "bos")
+        assert slug_game_teams("aec-wnba-gsv-conn-2026-07-10") == ("wnba", "gsv", "conn")
+
+    def test_non_game_slugs_are_none(self):
+        assert slug_game_teams("will-the-celtics-win-the-2026-nba-finals") is None
+        assert slug_game_teams("bitcoin-100k-2026") is None
+
+
+class _StubLiveCache(LiveWinProbCache):
+    """LiveWinProbCache with canned payloads (no network)."""
+
+    def __init__(self, scoreboard=None, summary=None, **kw):
+        super().__init__(**kw)
+        self._scoreboard_payload = scoreboard
+        self._summary_payload = summary
+
+    def _fetch_json(self, url, params=None):
+        if "scoreboard" in url:
+            return self._scoreboard_payload
+        return self._summary_payload
+
+
+def _espn_live_scoreboard(away="TOR", home="SD", game_id="401696001"):
+    return {"events": [{
+        "id": game_id,
+        "status": {"type": {"state": "in"}},
+        "competitions": [{"competitors": [
+            {"homeAway": "home", "team": {"abbreviation": home}},
+            {"homeAway": "away", "team": {"abbreviation": away}},
+        ]}],
+    }]}
+
+
+class TestLiveWinProbCache:
+    def test_maps_slug_to_away_team_probability(self):
+        cache = _StubLiveCache(
+            scoreboard=_espn_live_scoreboard(),
+            summary={"winprobability": [
+                {"homeWinPercentage": 0.5, "playId": "1"},
+                {"homeWinPercentage": 0.835, "playId": "2"},   # latest point wins
+            ]},
+        )
+        result = cache.get_live_prob("aec-mlb-tor-sd-2026-07-11")
+        assert result is not None
+        prob, age = result
+        assert prob == pytest.approx(1 - 0.835)   # away = YES side
+        assert age < 5
+
+    def test_abbr_normalization_applies(self):
+        # ESPN says CHW; slugs say cws — normalize_abbr must bridge them
+        cache = _StubLiveCache(
+            scoreboard=_espn_live_scoreboard(away="CHW", home="DET"),
+            summary={"winprobability": [{"homeWinPercentage": 0.40}]},
+        )
+        assert cache.get_live_prob("aec-mlb-cws-det-2026-07-11") is not None
+
+    def test_no_live_game_returns_none(self):
+        cache = _StubLiveCache(
+            scoreboard={"events": [{"id": "1",
+                                    "status": {"type": {"state": "pre"}},
+                                    "competitions": [{"competitors": []}]}]},
+            summary=None,
+        )
+        assert cache.get_live_prob("aec-mlb-tor-sd-2026-07-11") is None
+
+    def test_missing_model_output_returns_none(self):
+        cache = _StubLiveCache(scoreboard=_espn_live_scoreboard(),
+                               summary={"winprobability": []})
+        assert cache.get_live_prob("aec-mlb-tor-sd-2026-07-11") is None
+
+    def test_network_failure_returns_none(self):
+        cache = _StubLiveCache(scoreboard=None, summary=None)
+        assert cache.get_live_prob("aec-mlb-tor-sd-2026-07-11") is None
+
+
+class _FixedProbCache:
+    def __init__(self, prob, age):
+        self.prob, self.age = prob, age
+
+    def get_live_prob(self, slug):
+        return (self.prob, self.age)
+
+
+class TestLiveWinProbSignal:
+    def _live_snapshot(self, price=0.40):
+        snap = MarketSnapshot(
+            market_id="m", token_id="t", question="q", price=price,
+            volume_24h=5000, liquidity=5000, order_book=OrderBook(
+                bids=[OrderBookLevel(price=price - 0.02, size=800)],
+                asks=[OrderBookLevel(price=price + 0.02, size=800)]),
+            price_history=[price] * 20, timestamp=datetime.now(timezone.utc),
+            slug="aec-mlb-tor-sd-2026-07-11",
+        )
+        snap.is_live = True
+        return snap
+
+    def test_fresh_data_high_confidence_signed_edge(self, signal_config):
+        sig = live_win_prob_signal(self._live_snapshot(0.40), signal_config,
+                                   _FixedProbCache(0.55, age=10))
+        assert sig.confidence == pytest.approx(0.90)
+        assert sig.value == pytest.approx(0.55)
+        assert sig.metadata["edge"] == pytest.approx(0.15)
+
+    def test_stale_data_gets_zero_confidence(self, signal_config):
+        sig = live_win_prob_signal(self._live_snapshot(), signal_config,
+                                   _FixedProbCache(0.55, age=200))
+        assert sig.confidence == 0.0
+
+    def test_confidence_decays_between_30_and_150s(self, signal_config):
+        c90 = live_win_prob_signal(self._live_snapshot(), signal_config,
+                                   _FixedProbCache(0.55, age=90)).confidence
+        assert 0 < c90 < 0.90
+
+    def test_pregame_snapshot_is_noop(self, signal_config):
+        snap = self._live_snapshot()
+        snap.is_live = False
+        sig = live_win_prob_signal(snap, signal_config, _FixedProbCache(0.55, 10))
+        assert sig.confidence == 0.0
+
+    def test_estimator_uses_live_model_as_primary_in_game(self, signal_config):
+        """The heart of the live-edge feature: in a live game, ESPN's model
+        (not the stale pregame line) is the primary external signal, and its
+        divergence from the Polymarket price becomes the trade edge."""
+        est = ProbabilityEstimator(signal_config, odds_cache=None,
+                                   live_cache=_FixedProbCache(0.55, age=10))
+        snap = self._live_snapshot(price=0.40)
+        result = est.detect_edge(snap, min_edge=0.05, max_edge=0.40)
+        assert result is not None
+        assert result.side == "buy"
+        assert result.edge > 0.05
+        # And the direction guard operates on the LIVE signal now:
+        est2 = ProbabilityEstimator(signal_config, odds_cache=None,
+                                    live_cache=_FixedProbCache(0.36, age=10))
+        r2 = est2.detect_edge(snap, min_edge=0.03, max_edge=0.40)
+        assert r2 is None or r2.side == "sell"
+
+    def test_pregame_still_requires_odds_value(self, signal_config):
+        """No live data + no odds cache => external gate blocks, unchanged."""
+        est = ProbabilityEstimator(signal_config, odds_cache=None,
+                                   live_cache=_FixedProbCache(0.55, age=10))
+        snap = self._live_snapshot(price=0.40)
+        snap.is_live = False
+        assert est.detect_edge(snap, min_edge=0.05, max_edge=0.40) is None
+
+
+class TestClockParsingFix:
+    """Audit #7: displayClock/period live on event['status'], NOT on
+    status['type'] — reading the type object defaulted to full-game time
+    remaining and defeated the last-5-minutes gate."""
+
+    def _schedule_with_event(self, event):
+        gs = GameSchedule(cache_ttl=999)
+        gs._get_events = lambda sport: [event]
+        return gs
+
+    @staticmethod
+    def _event(display_clock, period, away="PHX", home="LV"):
+        return {
+            "status": {"type": {"name": "STATUS_IN_PROGRESS"},
+                       "displayClock": display_clock, "period": period},
+            "competitions": [{"competitors": [
+                {"homeAway": "home", "team": {"abbreviation": home,
+                                              "displayName": home}},
+                {"homeAway": "away", "team": {"abbreviation": away,
+                                              "displayName": away}},
+            ]}],
+        }
+
+    def test_reads_clock_from_status_object(self):
+        # WNBA Q2 with 3:07 left: 2 future quarters (1200s) + 187s = 1387s —
+        # NOT 2400 (the audit's full-game misread)
+        gs = self._schedule_with_event(self._event("3:07", 2))
+        remaining = gs.get_game_time_remaining("wnba", "phx", "lv")
+        assert remaining == pytest.approx(2 * 600 + 187)
+
+    def test_last_five_minutes_detectable(self):
+        gs = self._schedule_with_event(self._event("2:30", 4))
+        remaining = gs.get_game_time_remaining("wnba", "phx", "lv")
+        assert remaining == pytest.approx(150)
+        assert remaining < 300  # the safety gate can actually fire now
+
+    def test_unreadable_clock_fails_closed(self):
+        # Live clocked game, no parseable clock -> 0 remaining (BLOCKS entry),
+        # never "full game left"
+        ev = self._event(None, 0)
+        del ev["status"]["displayClock"]
+        gs = self._schedule_with_event(ev)
+        assert gs.get_game_time_remaining("wnba", "phx", "lv") == 0.0
+
+    def test_clockless_sport_returns_none(self):
+        gs = self._schedule_with_event(self._event("0:00", 7, away="TOR", home="SD"))
+        assert gs.get_game_time_remaining("mlb", "tor", "sd") is None
+
+
+class TestBookDedup:
+    def test_duplicate_book_entries_counted_once(self):
+        from bot.signals.book_scrapers import MultiBookAggregator
+        agg = MultiBookAggregator(cache_ttl=999)
+        # FanDuel double-lists the game; Pinnacle lists once
+        events = [
+            {"book": "fanduel", "home_team": "Boston Red Sox",
+             "away_team": "New York Yankees", "home_prob": 0.60, "away_prob": 0.40},
+            {"book": "fanduel", "home_team": "Boston Red Sox",
+             "away_team": "New York Yankees", "home_prob": 0.61, "away_prob": 0.39},
+            {"book": "pinnacle", "home_team": "Boston Red Sox",
+             "away_team": "New York Yankees", "home_prob": 0.58, "away_prob": 0.42},
+        ]
+        agg.fanduel.get_odds = lambda sk: events[:2]
+        agg.pinnacle.get_odds = lambda sk: events[2:]
+        consensus = agg.get_consensus("baseball_mlb")
+        assert len(consensus) == 1
+        assert consensus[0]["num_books"] == 2          # not 3
+        assert sorted(consensus[0]["books"]) == ["fanduel", "pinnacle"]
+
+
+# ============================================================================
+# UFC support: registry, fighter-code matching, Pinnacle live lines
+# ============================================================================
+
+from bot.signals.book_scrapers import fighter_code
+
+
+class TestUFCSupport:
+    def test_fighter_codes_match_polymarket_slugs(self):
+        # Verified against tonight's card: aec-ufc-maxhol-conmcg-2026-07-11
+        assert fighter_code("Max Holloway") == "maxhol"
+        assert fighter_code("Conor McGregor") == "conmcg"
+        assert fighter_code("Ilia Topuria") == "ilitop"
+
+    def test_fighter_code_edge_cases(self):
+        assert fighter_code("BJ Penn") == "bjpen"          # short first name
+        assert fighter_code("Cub") == "cub"                # single name
+        assert fighter_code("") == ""
+
+    def test_match_abbr_routes_mma_to_fighter_code(self):
+        assert _match_abbr("Max Holloway", "mma_mixed_martial_arts") == "maxhol"
+
+    def test_ufc_registered(self):
+        assert "ufc" in LEAGUES
+        assert LEAGUES["ufc"]["clock"] is None       # fights end without warning
+        assert PINNACLE_LEAGUES["mma_mixed_martial_arts"] == 1624
+        from bot.signals.odds_api import SPORT_MAP
+        assert SPORT_MAP["ufc"] == "mma_mixed_martial_arts"
+
+    def test_ufc_slug_routes_to_sports_with_ufc_min_edge(self):
+        from bot.strategies.trade_filter import get_league_from_slug, get_league_min_edge
+        slug = "aec-ufc-maxhol-conmcg-2026-07-11"
+        assert get_league_from_slug(slug) == "ufc"
+        assert get_league_min_edge(slug) == pytest.approx(0.06)
+
+    def test_aggregator_matches_fight_by_codes(self):
+        from bot.signals.book_scrapers import MultiBookAggregator
+        agg = MultiBookAggregator(cache_ttl=999)
+        agg.fanduel.get_odds = lambda sk: []
+        agg.pinnacle.get_odds = lambda sk: [{
+            "book": "pinnacle", "home_team": "Max Holloway",
+            "away_team": "Conor McGregor", "home_prob": 0.70, "away_prob": 0.30,
+        }]
+        game = agg.find_game("mma_mixed_martial_arts", "conmcg", "maxhol")
+        assert game is not None
+        assert game["home_prob"] == pytest.approx(0.70)

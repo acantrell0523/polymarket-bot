@@ -57,8 +57,18 @@ class MarketDataClient:
                     self.logger.error("api_request_failed", {"url": url, "error": err_str})
             return None
 
-    def get_active_markets(self, limit: int = 500) -> List[Dict]:
-        """Fetch active markets from Polymarket US API, filtered by time window.
+    def get_active_markets(self, page_size: int = 500, max_markets: int = 20000) -> List[Dict]:
+        """Fetch ALL active markets from Polymarket US API, filtered by time window.
+
+        PAGINATED: the gateway lists thousands of active markets (measured
+        live 2026-07-11: 6,000+, with WNBA game markets first appearing at
+        offset ~2,500 and MLB at ~3,500). A single limit=500 request never
+        sees a single tradeable game, so we page with limit+offset until a
+        short page or the max_markets safety cap.
+
+        Failure semantics: if the FIRST page fails we return [] (degraded
+        mode handles it); if a later page fails we keep what we have and log,
+        so a mid-scan blip degrades coverage instead of blanking the scan.
 
         Sports markets (with gameStartTime):
           - Upcoming: included if game starts within 24 hours
@@ -68,21 +78,53 @@ class MarketDataClient:
         Both types (upcoming only): excluded if resolving in under min_hours_to_expiry.
         """
         url = f"{self.us_api_url}/v1/markets"
-        params = {"active": "true", "closed": "false", "limit": limit}
-        data = self._get(url, params)
+        markets: List[Dict] = []
+        offset = 0
+        pages = 0
 
-        if isinstance(data, dict):
-            markets = data.get("markets", [])
-        elif isinstance(data, list):
-            markets = data
-        else:
-            return []
+        while offset < max_markets:
+            params = {"active": "true", "closed": "false",
+                      "limit": page_size, "offset": offset}
+            data = self._get(url, params)
+
+            if isinstance(data, dict):
+                page = data.get("markets", [])
+            elif isinstance(data, list):
+                page = data
+            else:
+                if offset == 0:
+                    return []  # total failure — nothing to scan
+                if self.logger:
+                    self.logger.warning("market_pagination_partial_failure", {
+                        "offset": offset, "markets_so_far": len(markets),
+                    })
+                break
+
+            markets.extend(page)
+            pages += 1
+            if len(page) < page_size:
+                break  # last page
+            offset += page_size
+
+        if offset >= max_markets:
+            if self.logger:
+                self.logger.warning("market_pagination_cap_reached", {
+                    "max_markets": max_markets,
+                    "message": "active market list larger than scan cap; raise max_markets",
+                })
+        if self.logger:
+            self.logger.info("markets_paginated", {"pages": pages, "raw_markets": len(markets)})
 
         now = datetime.now(timezone.utc)
         min_expiry = now + timedelta(hours=self.filters.min_hours_to_expiry)
-        sports_cutoff = now + timedelta(hours=24)
+        # Windows are config-driven (filters.sports_window_hours /
+        # filters.nonsports_window_days) so deployments can widen or narrow
+        # the scan universe without code changes.
+        sports_window_hours = getattr(self.filters, "sports_window_hours", 24.0)
+        nonsports_window_days = getattr(self.filters, "nonsports_window_days", 14.0)
+        sports_cutoff = now + timedelta(hours=sports_window_hours)
         max_live_age = timedelta(hours=4)
-        nonsports_cutoff = now + timedelta(days=14)
+        nonsports_cutoff = now + timedelta(days=nonsports_window_days)
 
         filtered = []
         live_count = 0
@@ -120,8 +162,8 @@ class MarketDataClient:
                 "total": len(markets),
                 "after_time_filter": len(filtered),
                 "live_games": live_count,
-                "sports_window_hours": 24,
-                "nonsports_window_days": 14,
+                "sports_window_hours": sports_window_hours,
+                "nonsports_window_days": nonsports_window_days,
             })
 
         return filtered

@@ -10,12 +10,14 @@ from typing import Dict, Optional, List, Tuple
 ESPN_ENDPOINTS = {
     "basketball_nba": "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
     "basketball_ncaab": "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard",
+    "basketball_wnba": "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard",
 }
 
 # Map from the-odds-api sport keys to ESPN keys
 ODDS_TO_ESPN = {
     "basketball_nba": "basketball_nba",
     "basketball_ncaab": "basketball_ncaab",
+    "basketball_wnba": "basketball_wnba",
 }
 
 
@@ -161,6 +163,8 @@ class GameContextAnalyzer:
                 result["home_advantage"] = 0.03  # ~60% home win rate
             elif sport_key == "basketball_ncaab":
                 result["home_advantage"] = 0.05  # ~65% home win rate
+            elif sport_key == "basketball_wnba":
+                result["home_advantage"] = 0.03  # comparable to NBA (~58-60%)
         else:
             result["home_advantage"] = 0.0
 
@@ -178,8 +182,8 @@ class GameContextAnalyzer:
         if season_type == 3 or "tournament" in event_name or "conference" in event_name:
             result["is_conference_tourney"] = True
 
-        # Back-to-back detection (NBA only — NCAA rarely plays B2B)
-        if sport_key == "basketball_nba":
+        # Back-to-back detection (NBA/WNBA — NCAA rarely plays B2B)
+        if sport_key in ("basketball_nba", "basketball_wnba"):
             result["fatigue_home"] = self._check_back_to_back(sport_key, home_abbr)
             result["fatigue_away"] = self._check_back_to_back(sport_key, away_abbr)
 

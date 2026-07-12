@@ -45,35 +45,61 @@ class PositionSizer:
 
     def _kelly_size(self, signal: TradeSignal, bankroll: float) -> float:
         """
-        Kelly Criterion position sizing.
+        Fractional Kelly position sizing, fee- and spread-aware.
 
-        f* = kelly_fraction * (p * b - q) / b
+        Kelly for a binary bet:  f* = (p*b - q) / b
+        where p = win probability, q = 1-p, and b = net odds per $1 staked.
 
-        where:
-            p = estimated win probability
-            q = 1 - p
-            b = net odds = (1 - price) / price for binary markets
+        The cost basis is the EXECUTABLE price (best ask for buys, best bid for
+        sells — set on the signal by compute_edge_breakdown) grossed up by the
+        taker fee. Using the mid price and ignoring fees systematically
+        oversizes: Kelly is very sensitive to edge, and fees+spread eat 2-4
+        points of it.
+
+        Fees use the US quadratic schedule: fee/share = Θ·price·(1−price)
+        (bot/strategies/fees.py). For a BUY of YES at cost c = ask + fee:
+            win  -> receive $1, profit (1-c) per share  =>  b = (1-c)/c
+        For a SELL (short YES) with proceeds c = bid - fee, the bet risks
+        (1-c) per share to win c, and wins with probability q = 1-p:
+            b = c/(1-c), win probability = 1-p
+
+        kelly_fraction (default 0.5 = half-Kelly, 0.25 recommended for live)
+        scales down f* because our p estimate is noisy — full Kelly on an
+        overestimated edge is how bankrolls die.
         """
-        p = signal.estimated_prob
-        q = 1 - p
-        price = signal.market_price
+        from bot.strategies.fees import fee_per_contract
 
-        if price <= 0 or price >= 1:
+        p = signal.estimated_prob
+        # signal.fee_rate carries the quadratic fee COEFFICIENT (Θ),
+        # set by compute_edge_breakdown.
+        coef = signal.fee_rate if signal.fee_rate > 0 else getattr(
+            self.config, "taker_fee_coefficient", 0.06)
+        exec_price = signal.exec_price if signal.exec_price > 0 else signal.market_price
+
+        if exec_price <= 0 or exec_price >= 1:
             return 0.0
 
-        # Net odds (payout ratio)
+        fee_share = fee_per_contract(exec_price, coef)
         if signal.side == "buy":
-            b = (1 - price) / price
+            cost = min(exec_price + fee_share, 0.999)  # $ per share incl. fee
+            win_prob = p
         else:
-            b = price / (1 - price)
+            # Short YES: proceeds per share after fee; risk is (1-cost) to win cost.
+            cost = max(exec_price - fee_share, 0.001)
+            win_prob = 1 - p
+
+        if signal.side == "buy":
+            b = (1 - cost) / cost
+        else:
+            b = cost / (1 - cost)
 
         if b <= 0:
             return 0.0
 
-        kelly_f = (p * b - q) / b
+        kelly_f = (win_prob * b - (1 - win_prob)) / b
         kelly_f = max(0, kelly_f)
 
-        # Apply Kelly fraction (e.g., half-Kelly)
+        # Fractional Kelly: shrink toward zero to pay for estimation error.
         kelly_f *= self.config.kelly_fraction
 
         return kelly_f * bankroll

@@ -1,0 +1,41 @@
+# Two-process deployment: trading loop + read-only supervisor.
+# Both share the data/ volume (SQLite DB, kill switch, pause file, heartbeat)
+# and read configuration from .env / configs/config.yaml.
+#
+#   docker compose up -d --build
+#   docker compose logs -f bot
+#
+# All config values can be overridden per-environment without editing YAML:
+#   POLYBOT_TRADING__PAPER_TRADING=false
+#   POLYBOT_TRADING__MIN_EDGE_THRESHOLD=0.07
+services:
+  bot:
+    build: .
+    command: ["python", "-m", "bot.trading_loop"]
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - bot-data:/app/data
+      - bot-reports:/app/reports
+    # Liveness: heartbeat.json is written every scan cycle; stale = unhealthy.
+    healthcheck:
+      test: ["CMD", "python", "-c", "from bot.health import HealthMonitor; import sys; sys.exit(1 if HealthMonitor.is_heartbeat_stale('/app/data') else 0)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  supervisor:
+    build: .
+    command: ["python", "-m", "bot.supervisor"]
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - bot-data:/app/data
+      - bot-reports:/app/reports
+    depends_on:
+      - bot
+
+volumes:
+  bot-data:
+  bot-reports:

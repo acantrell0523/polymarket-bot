@@ -24,7 +24,7 @@ class Portfolio:
 
     def __init__(self, exchange_client=None, logger: Optional[TradingLogger] = None,
                  alerter=None, alert_config=None, paper_mode: bool = True,
-                 initial_bankroll: float = 0.0):
+                 initial_bankroll: float = 0.0, restore_state: bool = False):
         self._client = exchange_client
         self.logger = logger
         self.alerter = alerter
@@ -51,6 +51,80 @@ class Portfolio:
         self._paper_positions: List[Position] = []
         self.trades: List[Trade] = []
         self.initial_bankroll: float = initial_bankroll
+
+        # Restore bot-owned position state from SQLite so restarts don't
+        # reset entry_time / estimated_prob / peak / telemetry (which would
+        # break min-hold, take-profit, trailing stops, and let-it-ride).
+        # Opt-in so unit tests stay hermetic; the trading loop passes True.
+        if restore_state:
+            self._restore_position_state()
+
+    def _restore_position_state(self):
+        """Reload persisted bot-owned positions (see trade_db.live_position_state)."""
+        try:
+            from bot.trade_db import get_position_states
+            states = get_position_states()
+        except Exception as e:
+            if self.logger:
+                self.logger.error("position_state_restore_failed", {"error": str(e)})
+            return
+
+        # Drop obviously-invalid rows (empty slug = pre-isolation test residue)
+        states = {slug: st for slug, st in states.items() if slug}
+
+        self._bot_positions.update(states.keys())
+
+        if self.paper_mode:
+            # Paper positions live only in this process — rebuild them fully.
+            for slug, s in states.items():
+                self._paper_positions.append(self._position_from_state(s))
+
+        if states and self.logger:
+            self.logger.info("position_state_restored", {
+                "count": len(states),
+                "slugs": sorted(states.keys()),
+                "mode": "paper" if self.paper_mode else "live",
+            })
+
+    @staticmethod
+    def _position_from_state(s: Dict) -> Position:
+        entry_time = s.get("entry_time")
+        try:
+            entry_dt = datetime.fromisoformat(entry_time)
+        except (ValueError, TypeError):
+            entry_dt = datetime.now(timezone.utc)
+        pos = Position(
+            market_id=s.get("market_id") or s["slug"],
+            token_id=s.get("token_id") or s["slug"],
+            side=s["side"],
+            entry_price=float(s["entry_price"]),
+            size_usd=float(s["size_usd"]),
+            quantity=float(s["quantity"]),
+            estimated_prob=float(s["estimated_prob"]),
+            entry_time=entry_dt,
+            current_price=float(s["entry_price"]),
+            slug=s["slug"],
+        )
+        pos.peak_price = float(s.get("peak_price") or 0.0)
+        pos.max_favorable_pnl_usd = float(s.get("max_favorable_pnl_usd") or 0.0)
+        pos.max_adverse_pnl_usd = float(s.get("max_adverse_pnl_usd") or 0.0)
+        pos.let_it_ride_count = int(s.get("let_it_ride_count") or 0)
+        return pos
+
+    def persist_position_state(self, position: Position):
+        """Write a position's current bot-owned state to SQLite.
+
+        Called after each telemetry update cycle so peak/extremes/let-it-ride
+        counters survive scan reconstruction and restarts. Never fatal.
+        """
+        try:
+            from bot.trade_db import upsert_position_state
+            upsert_position_state(position)
+        except Exception as e:
+            if self.logger:
+                self.logger.warning("position_state_persist_failed", {
+                    "slug": position.slug, "error": str(e),
+                })
 
     # ------------------------------------------------------------------
     # Exchange API calls (source of truth)
@@ -115,6 +189,18 @@ class Portfolio:
             return self._get_paper_positions()
 
         self._refresh_cache()
+
+        # Persisted bot-owned state: entry time, believed probability,
+        # peak/telemetry. The exchange stays authoritative for quantity and
+        # cost; without the overlay every scan rebuilt positions with
+        # entry_time=now and estimated_prob=0.5, so the 10-minute hold gate
+        # never elapsed and take-profit/trailing/let-it-ride ran on garbage.
+        try:
+            from bot.trade_db import get_position_states
+            states = get_position_states()
+        except Exception:
+            states = {}
+
         positions = []
         for slug, p_data in (self._positions_cache or {}).items():
             net = int(p_data.get("netPosition", "0"))
@@ -127,6 +213,25 @@ class Portfolio:
             entry_price = cost_val / qty if qty > 0 else 0
             side = "buy" if net > 0 else "sell"
 
+            state = states.get(slug)
+            if state:
+                try:
+                    entry_time = datetime.fromisoformat(state["entry_time"])
+                except (ValueError, TypeError, KeyError):
+                    entry_time = datetime.now(timezone.utc)
+                estimated_prob = float(state.get("estimated_prob") or 0.5)
+            else:
+                # Position on the exchange with no recorded state: either not
+                # bot-opened or state was lost. Defaults keep it managed, but
+                # flag it — exits will behave conservatively (fresh clock).
+                entry_time = datetime.now(timezone.utc)
+                estimated_prob = 0.5
+                if self.logger:
+                    self.logger.warning("position_without_state", {
+                        "slug": slug,
+                        "message": "exchange position has no persisted bot state",
+                    })
+
             pos = Position(
                 market_id=slug,
                 token_id=slug,
@@ -134,11 +239,16 @@ class Portfolio:
                 entry_price=entry_price,
                 size_usd=cost_val,
                 quantity=qty,
-                estimated_prob=0.5,
-                entry_time=datetime.now(timezone.utc),
+                estimated_prob=estimated_prob,
+                entry_time=entry_time,
                 current_price=cash_val / qty if qty > 0 else entry_price,
                 slug=slug,
             )
+            if state:
+                pos.peak_price = float(state.get("peak_price") or 0.0)
+                pos.max_favorable_pnl_usd = float(state.get("max_favorable_pnl_usd") or 0.0)
+                pos.max_adverse_pnl_usd = float(state.get("max_adverse_pnl_usd") or 0.0)
+                pos.let_it_ride_count = int(state.get("let_it_ride_count") or 0)
             pos.unrealized_pnl = cash_val - cost_val
             positions.append(pos)
 
@@ -202,6 +312,9 @@ class Portfolio:
 
         self._bot_positions.add(signal.slug)
         self.invalidate_cache()
+        # Durable from birth: risk logic depends on entry_time/estimated_prob
+        # surviving scan reconstruction and restarts.
+        self.persist_position_state(position)
 
         if self.paper_mode:
             self._paper_positions.append(position)
@@ -266,6 +379,14 @@ class Portfolio:
         position.close_price = current_price
         position.close_time = close_time
         position.realized_pnl = realized_pnl
+
+        # State row is only for OPEN positions — drop it so a future market
+        # reusing the slug (or a restart) can't resurrect stale state.
+        try:
+            from bot.trade_db import delete_position_state
+            delete_position_state(getattr(position, "slug", "") or position.market_id)
+        except Exception:
+            pass
 
         if self.paper_mode:
             self._paper_bankroll += realized_pnl

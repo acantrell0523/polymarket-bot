@@ -11,15 +11,22 @@ from utils.config import BotConfig, BacktestConfig, TradingConfig, SignalConfig
 from bot.signals.estimator import ProbabilityEstimator
 from bot.strategies.sizing import PositionSizer
 from bot.strategies.risk import RiskManager
+from bot.strategies.edge import compute_edge_breakdown
 from backtest.portfolio import BacktestPortfolio
 
 
 class BacktestEngine:
-    """Replays historical market data through the trading pipeline."""
+    """Replays historical market data through the trading pipeline.
 
-    def __init__(self, config: BotConfig):
+    Pass a HistoricalOddsCache as odds_cache to give the external validation
+    gate something to validate against — without it, sports markets are
+    blocked exactly as they would be live without odds data (0 trades).
+    """
+
+    def __init__(self, config: BotConfig, odds_cache=None):
         self.config = config
-        self.estimator = ProbabilityEstimator(config.signals)
+        self.odds_cache = odds_cache
+        self.estimator = ProbabilityEstimator(config.signals, odds_cache=odds_cache)
         self.sizer = PositionSizer(config.trading)
         self.risk = RiskManager(config.trading)
 
@@ -42,11 +49,18 @@ class BacktestEngine:
         else:
             return max(price * (1 - slippage), 0.01)
 
-    def apply_fees(self, size_usd: float, is_taker: bool = True) -> float:
-        """Calculate fees for a trade."""
-        if is_taker:
-            return size_usd * self.config.backtest.taker_fee_bps / 10000
-        return size_usd * self.config.backtest.maker_fee_bps / 10000
+    def apply_fees(self, size_usd: float, price: float, is_taker: bool = True) -> float:
+        """Fees on the US quadratic schedule: Θ·contracts·price·(1−price).
+
+        Banker's-rounded like the exchange books them. Same single source
+        (bot/strategies/fees.py + trading.taker_fee_coefficient) as the live
+        loop, so backtest P&L and live P&L use identical fee math.
+        """
+        from bot.strategies.fees import booked_fee_usd, MAKER_REBATE_COEFFICIENT
+        contracts = size_usd / price if price > 0 else 0.0
+        coef = (self.config.trading.taker_fee_coefficient
+                if is_taker else MAKER_REBATE_COEFFICIENT)
+        return booked_fee_usd(contracts, price, coef)
 
     def run(self, market_data: List[List[MarketSnapshot]]) -> BacktestResult:
         """
@@ -76,8 +90,15 @@ class BacktestEngine:
         for snapshot in all_snapshots:
             latest_by_market[snapshot.market_id] = snapshot
 
-            # Skip if insufficient history
-            if len(snapshot.price_history) < 10:
+            # Advance the odds cache's replay clock so consensus lookups can
+            # never see data from the future (no lookahead bias).
+            if self.odds_cache is not None and hasattr(self.odds_cache, "set_time"):
+                self.odds_cache.set_time(snapshot.timestamp)
+
+            # Skip if insufficient history. Backtest-scoped knob: recorded game
+            # markets carry only a few daily candles, so the live filter value
+            # (10) would silently skip every real snapshot.
+            if len(snapshot.price_history) < self.config.backtest.min_price_history_length:
                 continue
 
             # Check existing positions for this market
@@ -116,6 +137,21 @@ class BacktestEngine:
             if not self.risk.can_open_position(portfolio.get_open_positions()):
                 continue
 
+            # Cost-aware edge (same math as the live loop): executable price
+            # plus taker fee, so Kelly sizing sees net numbers here too.
+            breakdown = compute_edge_breakdown(
+                trade_signal.estimated_prob, snapshot, trade_signal.side,
+                fee_coefficient=self.config.trading.taker_fee_coefficient,
+            )
+            trade_signal.net_edge = breakdown.net_edge
+            trade_signal.exec_price = breakdown.exec_price
+            trade_signal.spread = breakdown.spread
+            trade_signal.fee_rate = breakdown.fee_rate
+
+            # Net-edge gate (mirrors trade_filter check #9)
+            if trade_signal.net_edge < self.config.trading.min_net_edge:
+                continue
+
             # Position sizing
             exposure = portfolio.get_total_exposure()
             size = self.sizer.size_position(trade_signal, portfolio.bankroll, exposure)
@@ -126,7 +162,7 @@ class BacktestEngine:
 
             # Apply slippage
             exec_price = self.apply_slippage(snapshot.price, trade_signal.side, snapshot)
-            fees = self.apply_fees(size)
+            fees = self.apply_fees(size, exec_price)
 
             quantity = size / exec_price if exec_price > 0 else 0
 

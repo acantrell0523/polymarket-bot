@@ -10,12 +10,14 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional, Tuple
 
 from bot.signals.odds_api import TEAM_ABBREVS
+from bot.leagues import LEAGUES, scoreboard_url, game_seconds_remaining
 
 
+# All registered leagues. Off-season leagues return zero games from ESPN and
+# cost one cached call each — this is what keeps the bot focused on whatever
+# sports are ACTUALLY happening today, year-round, with no seasonal edits.
 ESPN_ENDPOINTS = {
-    "nba": "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
-    "cbb": "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard",
-    "nhl": "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard",
+    league: scoreboard_url(league) for league in LEAGUES
 }
 
 
@@ -181,35 +183,46 @@ class GameSchedule:
             if not matched:
                 continue
 
-            # Parse clock and period to estimate time remaining
-            clock = status.get("displayClock", "0:00")
-            period = status.get("period", 0)
+            # AUDIT #7 FIX: displayClock and period live on event["status"],
+            # NOT on status["type"] (verified against a live payload
+            # 2026-07-11). Reading them off the type object always defaulted
+            # to "0:00"/period 0, which computed FULL-GAME time remaining
+            # (e.g. 3:07 left in Q2 read as 2,400s) and silently defeated the
+            # last-5-minutes safety gate.
+            status_obj = event.get("status", {})
+            clock_raw = status_obj.get("displayClock")
+            period = int(status_obj.get("period") or 0)
 
-            try:
-                parts = clock.split(":")
-                if len(parts) == 2:
-                    clock_seconds = int(parts[0]) * 60 + int(float(parts[1]))
-                else:
-                    clock_seconds = int(float(parts[0]))
-            except (ValueError, TypeError):
-                clock_seconds = 0
+            clock_seconds: Optional[float] = None
+            if clock_raw is not None:
+                try:
+                    # Soccer clocks render as "67'" (minutes elapsed, counting
+                    # up); stoppage time as "90'+". Strip markers before parsing.
+                    clock = str(clock_raw)
+                    clean = clock.replace("'", "").replace("+", "").strip()
+                    parts = clean.split(":")
+                    if len(parts) == 2:
+                        clock_seconds = int(parts[0]) * 60 + int(float(parts[1]))
+                    elif "'" in clock:
+                        clock_seconds = int(float(parts[0])) * 60  # minutes elapsed
+                    else:
+                        clock_seconds = float(parts[0])
+                except (ValueError, TypeError):
+                    clock_seconds = None
 
-            # Calculate total remaining based on sport
-            if sport == "nba":
-                # 4 quarters, 12 min each = 48 min total
-                quarters_left = max(0, 4 - period)
-                remaining = quarters_left * 12 * 60 + clock_seconds
-            elif sport == "cbb":
-                # 2 halves, 20 min each = 40 min total
-                halves_left = max(0, 2 - period)
-                remaining = halves_left * 20 * 60 + clock_seconds
-            elif sport == "nhl":
-                # 3 periods, 20 min each = 60 min total
-                periods_left = max(0, 3 - period)
-                remaining = periods_left * 20 * 60 + clock_seconds
-            else:
-                remaining = clock_seconds
+            # Clockless sport (baseball)? The registry says so — no block.
+            if game_seconds_remaining(sport, 1, 0) is None:
+                return None
 
+            # FAIL-CLOSED: a clocked sport that is LIVE but whose clock we
+            # cannot read gets 0 seconds remaining, which BLOCKS new entries.
+            # The old behavior (default to full game) failed open.
+            if clock_seconds is None or (clock_seconds == 0 and period == 0):
+                return 0.0
+
+            remaining = game_seconds_remaining(sport, period, clock_seconds)
+            if remaining is None:
+                return None
             return float(remaining)
 
         return None
@@ -221,7 +234,8 @@ class GameSchedule:
             return "No games scheduled today."
 
         lines = []
-        for sport in ("cbb", "nhl", "nba"):
+        # Only leagues that actually have games today show up
+        for sport in sorted({g["sport"] for g in games}):
             sport_games = [g for g in games if g["sport"] == sport]
             if not sport_games:
                 continue

@@ -1,203 +1,142 @@
 # Polymarket Trading Bot
 
-A modular Python bot for detecting pricing inefficiencies on [Polymarket US](https://polymarket.us) prediction markets, with backtesting, parameter sweeps, live in-game sports betting, and Slack alerts.
+An autonomous Python bot for detecting and trading pricing inefficiencies on
+[Polymarket US](https://polymarket.us) prediction markets — with cost-aware
+edge detection, fractional Kelly sizing, layered risk controls, full decision
+auditability, backtesting, and Slack observability.
 
-> **Disclaimer:** This is for educational purposes only. Trading prediction markets involves risk of loss. This is not financial advice. Use at your own risk.
+**Strictly focused on current sports.** A central league registry
+(`bot/leagues.py`) covers MLB, WNBA, MLS, NBA, NHL, NFL, NCAA basketball, and
+EPL; off-season leagues return zero games from ESPN and reactivate
+automatically when their seasons start — the bot always follows whatever is
+being played today. A daily recorder (supervisor job at 05:30 ET, or
+`python scripts/ingest_historical.py`) builds the backtest dataset forward
+from today: game prices plus de-vigged sportsbook consensus per game.
 
-## Features
+> **Disclaimer:** This is for educational purposes only. Trading prediction
+> markets involves risk of loss. This is not financial advice. Use at your own
+> risk.
 
-- **8 trading signals** from free public data (momentum, volume, order book imbalance, mean reversion, volatility, smart money, whale flow, sentiment)
-- **Live sports betting** with aggressive in-game parameters (3s scan, tighter thresholds)
-- **Paper trading mode** for risk-free testing
-- **Live trading** via the official [polymarket-us](https://pypi.org/project/polymarket-us/) SDK
-- **Backtesting engine** with slippage/fee simulation and benchmark comparison
-- **Parameter sweeps** to find optimal settings across edge thresholds, sizing methods, and stop-loss levels
-- **Slack alerts** for trade opens, closes, daily summaries, and errors
-- **Risk controls** — per-position stop-loss, portfolio exposure cap, daily loss limit
+## How It Makes Decisions
 
-## Architecture
+1. **Estimate probability.** External sources (sportsbook consensus via
+   the-odds-api / ESPN / FanDuel / Pinnacle, PredictIt cross-market prices, a
+   log-normal crypto model) plus market microstructure signals (order-book and
+   liquidity imbalance, on-chain whale/smart-money flow) are pooled with a
+   **Bayesian log-odds update anchored on the market price as the prior**.
+   With no external evidence the estimate *is* the market price — the bot
+   cannot manufacture edge from nothing (the "external validation gate").
 
-```
-polymarket-bot/
-├── bot/
-│   ├── signals/
-│   │   ├── signals.py          # 5 core signals
-│   │   ├── unusual_whales.py   # 3 on-chain enrichment signals
-│   │   └── estimator.py        # Combines signals, detects edge
-│   ├── strategies/
-│   │   ├── sizing.py           # Kelly Criterion & fixed fractional sizing
-│   │   └── risk.py             # Stop-loss, take-profit, daily loss limit
-│   ├── market_data.py          # Polymarket US API + CLOB client
-│   ├── execution.py            # Order execution via polymarket-us SDK
-│   ├── portfolio.py            # Position tracking, P&L accounting
-│   ├── alerts.py               # Slack webhook alerts
-│   └── trading_loop.py         # Main orchestrator loop
-├── backtest/
-│   ├── engine.py               # Replay engine with slippage & fee simulation
-│   ├── sweep.py                # Parameter sensitivity analysis
-│   ├── reporting.py            # Charts, JSON/CSV exports
-│   └── runner.py               # CLI entry point
-├── data/
-│   └── loader.py               # Historical data loader + synthetic generator
-├── utils/
-│   ├── config.py               # YAML + .env config loader
-│   ├── logger.py               # Structured JSON logging
-│   └── models.py               # Shared data models
-├── tests/
-│   └── test_core.py            # Unit tests (44 tests)
-├── configs/
-│   └── config.yaml             # Master configuration
-├── .env.example                # Environment variable template
-└── requirements.txt            # Python dependencies
-```
+2. **Compute NET edge.** Gross edge (estimate − price) is re-priced at the
+   **executable** price (best ask for buys, best bid for sells) minus the
+   taker fee. A 5% gross edge across a 4-cent spread with a 2% fee is a ~1%
+   real edge — the bot gates on the real number (`trading.min_net_edge`).
+
+3. **Filter.** Seven-plus-two checks: ≥2 sportsbooks agree, per-league minimum
+   edge, tradeable price band (15–85¢), ≥$1k book depth, no correlated
+   position on the same game, daily trade limit, no entries in the last 5
+   minutes of a game, spread narrow enough to exit (`max_spread`), and the
+   net-edge gate.
+
+4. **Size with fractional Kelly.** `f* = (p·b − q)/b`, computed on the
+   fee-grossed executable cost, scaled by `kelly_fraction` (default 0.25 =
+   quarter-Kelly) — bet size proportional to edge *and* bankroll, shrunk for
+   estimation error. Hard caps: per-trade max, portfolio exposure max, never
+   >50% of cash.
+
+5. **Manage the position.** Estimates are refreshed every scan as new
+   information arrives. Exits: stop-loss (25%), aggressive take (up 30%),
+   trailing stop, edge-convergence take-profit, and "let it ride" (hold to
+   resolution when ≥70% in your favor).
+
+6. **Log everything.** Every opportunity that reaches validation — executed
+   or rejected — lands in the `decision_log` SQLite table with the estimated
+   probability, market/executable price, gross and net edge, spread, fee,
+   size, and the exact reason. Closed positions get full exit telemetry.
+
+## Safety & Autonomy
+
+- **Daily loss limit** — trading pauses durably (survives restarts) until the
+  next UTC day after losing `daily_loss_limit_usd`.
+- **Kill switch** — supervisor halts the bot if account value drops below 50%
+  of start; remove `data/kill_switch` to resume.
+- **Heartbeat monitoring** — the loop writes `data/heartbeat.json` every
+  cycle; the supervisor Slack-alerts if it goes stale.
+- **Degraded mode** — repeated market-data failures back off exponentially
+  (up to 5 min) with a single alert per outage, instead of hammering a dead API.
+- **Paper mode** — full pipeline with simulated fills; no credentials needed.
 
 ## Setup
 
-### 1. Prerequisites
-
-- **Python 3.10+** (the `polymarket-us` SDK requires it)
-- A [Polymarket US](https://polymarket.us) account with identity verification
-
-### 2. Install dependencies
-
 ```bash
-python -m venv venv
-source venv/bin/activate
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-pip install polymarket-us
+pip install polymarket-us          # live trading only; paper mode works without it
+
+cp .env.example .env               # then fill in your keys
+python -m pytest tests/ -q         # 152 tests
 ```
 
-### 3. Get API keys
+Required keys in `.env`:
 
-1. Go to [polymarket.us/developer](https://polymarket.us/developer)
-2. Sign in and generate a new API key
-3. Copy both the **Key ID** and **Secret Key** (the secret is only shown once)
-
-### 4. Configure environment
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` with your credentials:
-```
-POLYMARKET_KEY_ID=your_key_id_here
-POLYMARKET_SECRET_KEY=your_secret_key_here
-```
-
-### 5. Run tests
-
-```bash
-python -m pytest tests/ -v
-```
+| Variable | Needed for |
+|----------|-----------|
+| `THE_ODDS_API_KEY` | Sports trading (≥2 books required; free tier at the-odds-api.com) |
+| `POLYMARKET_KEY_ID` / `POLYMARKET_SECRET_KEY` | Live trading (polymarket.us/developer) |
+| `SLACK_WEBHOOK_URL` | Alerts (optional) |
 
 ## Usage
 
-### Paper Trading (no API keys needed)
-
-Set `paper_trading: true` in `configs/config.yaml`, then:
-
 ```bash
+# Paper trading (default; no credentials needed)
 python -m bot.trading_loop
-```
 
-The bot will scan markets, detect mispricings, and simulate trades without placing real orders.
+# Live trading + supervisor
+bash run.sh
 
-### Live Trading
+# Docker (bot + supervisor, shared data volume, heartbeat healthcheck)
+docker compose up -d --build
 
-1. Ensure your `.env` has valid API keys and your account is funded
-2. Set `paper_trading: false` in `configs/config.yaml`
-3. Start conservatively — set `max_position_size_usd: 20.0`
-
-```bash
-python -m bot.trading_loop
-```
-
-The bot uses the official `polymarket-us` SDK to place limit orders on the Polymarket US exchange.
-
-**WARNING:** Live trading uses real funds. Start with small position sizes and monitor closely.
-
-### Backtesting
-
-```bash
-# Run a single backtest with current config
+# Backtest (SQLite historical data → JSON → synthetic fallback)
 python -m backtest.runner
+python -m backtest.runner --sweep    # parameter sensitivity sweep
 
-# Run a parameter sweep to find optimal settings
-python -m backtest.runner --sweep
+# Post-hoc analysis
+python scripts/analyze_exits.py --days 30
+python scripts/inspect_historical.py
 ```
 
-Output goes to `reports/`.
+### Configuration
 
-## Slack Alerts (Optional)
+Everything lives in `configs/config.yaml`. Any scalar value can be overridden
+per-environment without editing files:
 
-Get real-time notifications for trades, daily summaries, and errors.
+```bash
+POLYBOT_TRADING__PAPER_TRADING=false \
+POLYBOT_TRADING__KELLY_FRACTION=0.25 \
+POLYBOT_TRADING__DAILY_LOSS_LIMIT_USD=50 \
+python -m bot.trading_loop
+```
 
-### Setup
-
-1. Create a [Slack Incoming Webhook](https://api.slack.com/messaging/webhooks) for your workspace
-2. Add the webhook URL to `.env`:
-   ```
-   SLACK_WEBHOOK_URL=https://hooks.slack.com/services/YOUR/WEBHOOK/URL
-   ```
-3. Enable alerts in `configs/config.yaml`:
-   ```yaml
-   alerts:
-     enabled: true
-     on_trade_open: true
-     on_trade_close: true
-     on_daily_summary: true
-     on_error: true
-   ```
-
-### Alert types
-
-- **Trade Opened** — market, side, price, size, edge
-- **Trade Closed** — market, entry/exit price, P&L, close reason
-- **Daily Summary** — trades, win rate, P&L, bankroll
-- **Bot Started** — mode, bankroll, markets in scope
-- **Error** — scan cycle failures
-
-## How Edge Detection Works
-
-Each market passes through 8 independent signals combined via confidence-weighted averaging:
-
-| Signal | Weight | Source |
-|--------|--------|--------|
-| Order Book Imbalance | 25% | US API `/markets/{slug}/book` |
-| Price Momentum | 20% | CLOB `/prices-history` |
-| Volume | 15% | US API `/v1/markets` |
-| Mean Reversion | 10% | CLOB `/prices-history` |
-| Volatility | 5% | CLOB `/prices-history` |
-| Smart Money | 10% | CLOB `/trades` |
-| Whale Flow | 10% | CLOB `/trades` |
-| Market Sentiment | 5% | US API `/v1/markets` |
-
-**Edge** = estimated probability − market price. If this exceeds the configured threshold (default 2%), a trade signal is generated.
-
-### Live Game Mode
-
-For sports markets currently in progress (`gameStartTime` in the past):
-- Scan interval drops to **3 seconds**
-- Order book imbalance weight increases to **35%**, momentum to **30%**
-- Edge threshold lowers to **1.5%**
-- Take-profit tightens to **0.5%**
-- Games older than 4 hours are automatically skipped
-
-## Configuration
-
-All parameters are in `configs/config.yaml`. Key settings:
+Key parameters:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `paper_trading` | `true` | Simulate trades without real orders |
-| `min_edge_threshold` | `0.02` | Minimum edge to trigger a trade (2%) |
-| `max_position_size_usd` | `20.0` | Max USD per trade |
-| `position_sizing_method` | `fixed_fractional` | `kelly` or `fixed_fractional` |
-| `stop_loss_threshold` | `0.20` | Close at 20% loss |
-| `take_profit_threshold` | `0.01` | Close when edge narrows to 1% |
-| `daily_loss_limit_usd` | `200.0` | Halt trading after this daily loss |
-| `max_open_positions` | `40` | Max concurrent positions |
+| `trading.paper_trading` | `true` | Simulate trades without real orders |
+| `trading.min_edge_threshold` | `0.05` | Minimum gross edge (per-league minimums may be higher) |
+| `trading.min_net_edge` | `0.02` | Minimum edge after fees + spread |
+| `trading.taker_fee_rate` | `0.02` | Exchange taker fee used everywhere |
+| `trading.position_sizing_method` | `kelly` | `kelly`, `tiered_kelly`, or `fixed_fractional` |
+| `trading.kelly_fraction` | `0.25` | Fraction of full Kelly |
+| `trading.max_position_size_usd` | `50` | Hard cap per trade |
+| `trading.max_portfolio_exposure_usd` | `500` | Total exposure cap |
+| `trading.stop_loss_threshold` | `0.25` | Close at 25% loss |
+| `trading.daily_loss_limit_usd` | `75` | Durable pause after this daily loss |
+| `trading.max_spread` | `0.10` | Widest book the bot will enter |
+| `signals.combination_method` | `logodds` | Bayesian log-odds pooling (`linear` = legacy) |
+
+See `CLAUDE.md` for the full architecture reference, database schema, and the
+current state of every subsystem.
 
 ## License
 

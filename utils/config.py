@@ -49,9 +49,33 @@ class TradingConfig:
     max_open_positions: int = 5
     max_daily_trades: int = 15
     paper_trading: bool = True
+    # --- Cost-aware edge accounting ---
+    # Polymarket US fee schedule (effective 2026-07-01, docs.polymarket.us/fees):
+    #   fee = coefficient * contracts * price * (1 - price)
+    # Takers pay 0.06; see bot/strategies/fees.py. Edge math, Kelly sizing,
+    # paper fills, live fills, and the backtest all read this ONE value.
+    taker_fee_coefficient: float = 0.06
+    # DEPRECATED: legacy flat fee-on-notional model. No longer read by edge,
+    # sizing, execution, or backtest. Kept so old env overrides don't crash.
+    taker_fee_rate: float = 0.02
+    # Minimum edge AFTER subtracting fees and the cost of crossing the spread.
+    # Gross edge thresholds alone overstate profitability: a 5% gross edge with
+    # a 2% fee and a 2% half-spread is only a 1% real edge.
+    min_net_edge: float = 0.02
+    # Tradeable price band (avoid extreme longshots/favorites where resolution
+    # risk dominates) and order-book quality gates. Previously hardcoded in
+    # trade_filter.py; now configurable per deployment.
+    min_price: float = 0.15
+    max_price: float = 0.85
+    min_book_liquidity_usd: float = 1000.0
+    # Widest acceptable bid-ask spread (absolute, in price units). A book wider
+    # than this cannot be exited cleanly, so we never enter it.
+    max_spread: float = 0.10
 
 
 # Default per-market-type weights — must stay in sync with WEIGHTS in estimator.py
+# onchain_flow has weight everywhere but returns confidence=0 unless an
+# OnChainEnrichmentClient is wired in, so it is a strict no-op when disabled.
 _DEFAULT_SIGNAL_WEIGHTS: Dict[str, Dict[str, float]] = {
     "sports": {
         "odds_value": 0.40,
@@ -59,24 +83,29 @@ _DEFAULT_SIGNAL_WEIGHTS: Dict[str, Dict[str, float]] = {
         "line_movement": 0.20,
         "order_book_imbalance": 0.15,
         "liquidity_imbalance": 0.10,
+        "onchain_flow": 0.10,
+        "live_win_prob": 0.55,   # in-game only (confidence 0 pregame)
     },
     "crypto": {
         "crypto_model": 0.45,
         "cross_market": 0.25,
         "order_book_imbalance": 0.20,
         "liquidity_imbalance": 0.10,
+        "onchain_flow": 0.10,
     },
     "politics": {
         "cross_market": 0.45,
         "order_book_imbalance": 0.25,
         "line_movement": 0.15,
         "liquidity_imbalance": 0.15,
+        "onchain_flow": 0.10,
     },
     "other": {
         "cross_market": 0.40,
         "order_book_imbalance": 0.25,
         "line_movement": 0.20,
         "liquidity_imbalance": 0.15,
+        "onchain_flow": 0.10,
     },
 }
 
@@ -88,6 +117,20 @@ class SignalConfig:
     odds_value_weight: float = 0.40
     liquidity_imbalance_weight: float = 0.10
     sports_context_weight: float = 0.15
+    # How signals are pooled into one probability:
+    #   "linear"  — confidence-weighted arithmetic mean (DEFAULT). The edge
+    #               thresholds (league 4-7% minimums), benchmark win rates,
+    #               and exit tuning were all calibrated against this pool,
+    #               where a lone external signal passes its consensus through
+    #               at full strength.
+    #   "logodds" — Bayesian update in log-odds space anchored on the market
+    #               price as the prior. Better multi-signal math, but it
+    #               shrinks the combined edge by overall confidence — with
+    #               the odds_value confidence formula (min(books/5)*min(edge*5))
+    #               a 6% single-book edge collapses to <1% combined and
+    #               nothing ever clears min_edge_threshold. EXPERIMENTAL:
+    #               requires recalibrating every edge threshold before use.
+    combination_method: str = "linear"
     weights: Dict[str, Dict[str, float]] = field(
         default_factory=lambda: {
             market: dict(signal_weights)
@@ -103,6 +146,12 @@ class FilterConfig:
     min_hours_to_expiry: float = 1.0
     max_hours_to_expiry: float = 48.0
     min_price_history_length: int = 10
+    # Time-to-resolution windows actually enforced by MarketDataClient.
+    # Sports markets: only scan games starting within this many hours.
+    # Non-sports markets: only scan markets resolving within this many days.
+    # (max_hours_to_expiry above is legacy and superseded by these two.)
+    sports_window_hours: float = 24.0
+    nonsports_window_days: float = 14.0
     include_categories: List[str] = field(default_factory=list)
     exclude_categories: List[str] = field(default_factory=list)
 
@@ -121,6 +170,11 @@ class BacktestConfig:
     latency_ms: int = 500
     benchmark_win_rate: float = 0.62
     benchmark_trade_count: int = 366
+    # Minimum prior price points before a replayed snapshot is tradeable.
+    # Separate from filters.min_price_history_length (live scanning, 10):
+    # recorded game markets carry only a few daily candles, so the live value
+    # would silently skip every real snapshot.
+    min_price_history_length: int = 1
 
 
 @dataclass
@@ -267,4 +321,65 @@ def load_config(config_path: str = "configs/config.yaml", env_path: str = ".env"
     # Load The Odds API key from environment
     config.odds_api_key = os.environ.get("THE_ODDS_API_KEY", "")
 
+    # Generic env-var override layer — applied LAST so it wins over YAML.
+    # Any scalar config field can be overridden without editing files:
+    #   POLYBOT_TRADING__MIN_EDGE_THRESHOLD=0.07
+    #   POLYBOT_TRADING__PAPER_TRADING=false
+    #   POLYBOT_ALERTS__ENABLED=true
+    # Format: POLYBOT_<SECTION>__<FIELD> (double underscore between section
+    # and field). Nested dicts (signals.weights) are YAML-only.
+    _apply_env_overrides(config)
+
     return config
+
+
+def _coerce_env_value(raw: str, current):
+    """Coerce an env-var string to the type of the existing config value."""
+    if isinstance(current, bool):
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    if isinstance(current, int) and not isinstance(current, bool):
+        return int(float(raw))
+    if isinstance(current, float):
+        return float(raw)
+    return raw
+
+
+def _apply_env_overrides(config: "BotConfig", environ: Optional[Dict[str, str]] = None):
+    """Apply POLYBOT_<SECTION>__<FIELD> environment overrides to config.
+
+    Only overrides fields that already exist on the section dataclass, and
+    coerces the string to the field's current type. Unknown sections/fields
+    are ignored silently so stray env vars can't crash startup.
+    """
+    env = environ if environ is not None else os.environ
+    sections = {
+        "api": config.api,
+        "onchain": config.onchain,
+        "wallet": config.wallet,
+        "trading": config.trading,
+        "signals": config.signals,
+        "filters": config.filters,
+        "backtest": config.backtest,
+        "sweep": config.sweep,
+        "logging": config.logging,
+        "reporting": config.reporting,
+        "alerts": config.alerts,
+    }
+    prefix = "POLYBOT_"
+    for key, raw in env.items():
+        if not key.startswith(prefix) or "__" not in key:
+            continue
+        section_name, _, field_name = key[len(prefix):].partition("__")
+        section = sections.get(section_name.lower())
+        if section is None:
+            continue
+        attr = field_name.lower()
+        if not hasattr(section, attr):
+            continue
+        current = getattr(section, attr)
+        if isinstance(current, (dict, list)):
+            continue  # complex structures stay YAML-only
+        try:
+            setattr(section, attr, _coerce_env_value(raw, current))
+        except (ValueError, TypeError):
+            continue  # malformed value — keep the YAML/default value

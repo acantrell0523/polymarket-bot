@@ -5,7 +5,7 @@ import sys
 import time
 import signal
 import copy
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict
 from dateutil import parser as dateutil_parser
 
@@ -19,6 +19,8 @@ from bot.market_data import MarketDataClient
 from bot.execution import ExecutionEngine
 from bot.portfolio import Portfolio
 from bot.alerts import SlackAlerter
+from bot.health import HealthMonitor
+from bot.strategies.edge import compute_edge_breakdown
 
 
 def compute_exit_proximity(position, current_price: float, estimated_prob: float, config) -> dict:
@@ -161,6 +163,31 @@ class TradingBot:
         from bot.game_schedule import GameSchedule
         self.game_schedule = GameSchedule(cache_ttl=120)
 
+        # On-chain enrichment (free CLOB/Gamma whale + smart-money data).
+        # Feeds the supplementary onchain_flow signal; disabled via config.
+        self.onchain_client = None
+        if getattr(config, "onchain", None) and config.onchain.enabled:
+            from bot.signals.onchain import OnChainEnrichmentClient
+            self.onchain_client = OnChainEnrichmentClient(
+                clob_url=config.api.clob_url,
+                gamma_url=config.api.gamma_url,
+                logger=self.logger,
+                max_rps=config.onchain.max_requests_per_second,
+                cache_ttl=config.onchain.cache_ttl_seconds,
+            )
+
+        # Live in-game win probabilities (ESPN model) — the live-edge engine
+        from bot.signals.live_win_prob import LiveWinProbCache
+        self.live_cache = LiveWinProbCache()
+
+        # Liveness + API health tracking (heartbeat file read by supervisor)
+        self._data_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+        self.health = HealthMonitor(
+            data_dir=self._data_dir,
+            logger=self.logger,
+            alerter=self.alerter,
+        )
+
         if not self.odds_cache.enabled:
             self.logger.warning("odds_api_disabled", {
                 "message": "THE_ODDS_API_KEY not set — sports markets will not trade"
@@ -175,7 +202,8 @@ class TradingBot:
         # Estimator with all caches
         self.estimator = ProbabilityEstimator(
             config.signals, self.odds_cache, self.predictit_cache, self.crypto_cache,
-            self.espn_cache, self.game_context,
+            self.espn_cache, self.game_context, onchain_client=self.onchain_client,
+            live_cache=self.live_cache,
         )
 
         self.portfolio = Portfolio(
@@ -185,6 +213,7 @@ class TradingBot:
             alert_config=config.alerts,
             paper_mode=config.trading.paper_trading,
             initial_bankroll=config.backtest.initial_bankroll_usd,
+            restore_state=True,  # survive restarts: entry_time/prob/telemetry
         )
         self.logger.info("portfolio_initialized", {
             "paper_mode": config.trading.paper_trading,
@@ -210,7 +239,8 @@ class TradingBot:
         live_signal_config.liquidity_imbalance_weight = 0.20
         self.live_estimator = ProbabilityEstimator(
             live_signal_config, self.odds_cache, self.predictit_cache, self.crypto_cache,
-            self.espn_cache, self.game_context,
+            self.espn_cache, self.game_context, onchain_client=self.onchain_client,
+            live_cache=self.live_cache,
         )
 
         # Live-game trading overrides — use same edge threshold as config
@@ -333,6 +363,8 @@ class TradingBot:
 
         games_opening = set()
 
+        tcfg = self.config.trading
+
         for trade_signal, snapshot in opportunities:
             if not self.risk.can_open_position(self.portfolio.get_open_positions()):
                 break
@@ -352,7 +384,19 @@ class TradingBot:
                     league, parts[2], parts[3]
                 )
 
-            # Full validation checklist
+            # Cost-aware edge: what the edge is worth at the executable price
+            # (ask for buys, bid for sells) after the taker fee. Attached to
+            # the signal so the trade filter and Kelly sizing use net numbers.
+            breakdown = compute_edge_breakdown(
+                trade_signal.estimated_prob, snapshot, trade_signal.side,
+                fee_coefficient=tcfg.taker_fee_coefficient,
+            )
+            trade_signal.net_edge = breakdown.net_edge
+            trade_signal.exec_price = breakdown.exec_price
+            trade_signal.spread = breakdown.spread
+            trade_signal.fee_rate = breakdown.fee_rate
+
+            # Full validation checklist (thresholds config-driven)
             rejection = validate_trade(
                 signal=trade_signal,
                 snapshot=snapshot,
@@ -360,22 +404,31 @@ class TradingBot:
                 open_game_ids=open_games | games_opening,
                 game_id=game_id,
                 daily_trades=self.risk.daily_trade_count,
-                max_daily_trades=self.config.trading.max_daily_trades,
+                max_daily_trades=tcfg.max_daily_trades,
                 game_time_remaining=game_time_remaining,
+                min_price=tcfg.min_price,
+                max_price=tcfg.max_price,
+                min_liquidity_usd=tcfg.min_book_liquidity_usd,
+                max_spread=tcfg.max_spread,
+                min_net_edge=tcfg.min_net_edge,
             )
 
             if rejection:
                 self.logger.info("trade_rejected", {
                     "slug": trade_signal.slug,
                     "edge": round(trade_signal.edge * 100, 1),
+                    "net_edge": round(trade_signal.net_edge * 100, 1),
                     "side": trade_signal.side,
                     "reason": rejection,
                 })
+                self._log_decision(trade_signal, snapshot, "rejected", rejection)
                 continue
 
             exposure = self.portfolio.get_total_exposure()
             size = self.sizer.size_position(trade_signal, self.portfolio.bankroll, exposure)
             if size <= 0:
+                self._log_decision(trade_signal, snapshot, "skipped_sizing",
+                                   "size_below_minimum_or_no_exposure_room")
                 continue
 
             trade_signal.position_size_usd = size
@@ -388,16 +441,114 @@ class TradingBot:
                 self.risk.record_trade_opened()
                 games_opening.add(game_id)
                 self._log_edge_entry(trade_signal, snapshot)
+                self._log_decision(trade_signal, snapshot, "executed", "all_checks_passed")
 
                 self.logger.info("sniper_trade_executed", {
                     "slug": trade_signal.slug,
                     "side": trade_signal.side,
                     "edge": round(trade_signal.edge * 100, 1),
+                    "net_edge": round(trade_signal.net_edge * 100, 1),
                     "size": size,
                     "league": league,
                     "books": num_books,
                     "daily_trade": self.risk.daily_trade_count,
                 })
+            else:
+                self._log_decision(trade_signal, snapshot, "execution_failed",
+                                   "order_not_filled_or_error")
+
+    def _log_decision(self, trade_signal, snapshot, decision: str, reason: str):
+        """Write one decision audit row. Never allowed to break trading."""
+        try:
+            import json as _json
+            from bot.trade_db import insert_decision
+            from bot.signals.estimator import detect_market_type
+            insert_decision(
+                slug=trade_signal.slug,
+                decision=decision,
+                reason=reason,
+                market_type=detect_market_type(snapshot),
+                side=trade_signal.side,
+                polymarket_price=trade_signal.market_price,
+                exec_price=trade_signal.exec_price,
+                estimated_prob=trade_signal.estimated_prob,
+                gross_edge=trade_signal.edge,
+                net_edge=trade_signal.net_edge,
+                spread=trade_signal.spread,
+                fee_rate=trade_signal.fee_rate,
+                position_size_usd=trade_signal.position_size_usd,
+                metadata_json=_json.dumps({
+                    "is_live": bool(getattr(snapshot, "is_live", False)),
+                    "paper_mode": self.config.trading.paper_trading,
+                }),
+            )
+        except Exception:
+            pass  # audit logging must never block trading
+
+    def _refresh_position_estimates(self, snapshots: list):
+        """Re-estimate probability for open positions as new information arrives.
+
+        Position.estimated_prob drives the take-profit ("edge converged") exit.
+        Without refreshing it, exits are judged against the entry-time belief,
+        which goes stale the moment the game starts or the line moves. We only
+        overwrite when the estimator has live external validation (returns
+        non-None); otherwise the last good estimate stands.
+        """
+        open_positions = self.portfolio.get_open_positions()
+        if not open_positions:
+            return
+        by_slug = {s.slug: s for s in snapshots if s}
+        for pos in open_positions:
+            snap = by_slug.get(pos.slug)
+            if snap is None:
+                continue
+            estimator = self.live_estimator if snap.is_live else self.estimator
+            try:
+                new_prob = estimator.estimate_for_snapshot(snap)
+            except Exception:
+                continue  # estimation failure keeps the previous belief
+            if new_prob is None:
+                continue
+            if abs(new_prob - pos.estimated_prob) >= 0.01:
+                self.logger.info("position_estimate_refreshed", {
+                    "slug": pos.slug,
+                    "old_prob": round(pos.estimated_prob, 3),
+                    "new_prob": round(new_prob, 3),
+                })
+            pos.estimated_prob = new_prob
+
+    def _enforce_daily_loss_pause(self):
+        """When the daily loss limit is breached, pause durably until next UTC day.
+
+        The in-memory RiskManager check already blocks new entries, but it
+        resets on restart. Writing data/pause_until makes the halt survive
+        crashes/redeploys — the loop's supervisor-flag check enforces it.
+        """
+        if not self.risk.is_daily_limit_breached():
+            return
+        pause_path = os.path.join(self._data_dir, "pause_until")
+        if os.path.exists(pause_path):
+            return  # already paused
+        now = datetime.now(timezone.utc)
+        resume_at = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        try:
+            with open(pause_path, "w") as f:
+                f.write(resume_at.isoformat())
+        except OSError:
+            return
+        self.logger.error("daily_loss_limit_breached", {
+            "daily_pnl": round(self.risk.daily_pnl, 2),
+            "limit": self.config.trading.daily_loss_limit_usd,
+            "paused_until": resume_at.isoformat(),
+        })
+        if self.alerter:
+            try:
+                self.alerter._post("#ff0000",
+                    f":octagonal_sign: *Daily loss limit hit* "
+                    f"(${self.risk.daily_pnl:.2f} ≤ -${self.config.trading.daily_loss_limit_usd:.2f})\n"
+                    f"Trading paused until `{resume_at.isoformat()}`")
+            except Exception:
+                pass
 
     def _load_settled_slugs(self) -> set:
         try:
@@ -566,10 +717,13 @@ class TradingBot:
             # --- Exit telemetry: update running P&L extremes each cycle ---
             # unrealized_usd is positive when we're winning, negative when losing
             unrealized_usd = pnl_per_unit * position.quantity
+            telemetry_changed = False
             if unrealized_usd > position.max_favorable_pnl_usd:
                 position.max_favorable_pnl_usd = unrealized_usd
+                telemetry_changed = True
             if unrealized_usd < position.max_adverse_pnl_usd:
                 position.max_adverse_pnl_usd = unrealized_usd
+                telemetry_changed = True
 
             # Log diagnostics every 10th cycle
             if log_diagnostics:
@@ -588,10 +742,16 @@ class TradingBot:
                     "would_take_profit": would_tp,
                 })
 
-            # Check risk thresholds
+            # Check risk thresholds (also updates position.peak_price)
             close_reason = self.risk.check_position(
                 position, position.current_price, position.estimated_prob
             )
+
+            # Persist bot-owned state so peak/extremes/estimated_prob survive
+            # scan reconstruction and restarts (audit: state used to reset
+            # every cycle, silently disabling min-hold/trailing/take-profit).
+            if telemetry_changed or close_reason == "let_it_ride" or position.peak_price > 0:
+                self.portfolio.persist_position_state(position)
 
             # Let winners ride — don't close, alert instead
             if close_reason == "let_it_ride":
@@ -677,6 +837,8 @@ class TradingBot:
                         exit_proximity=exit_proximity,
                     )
                     self.risk.record_pnl(position.realized_pnl)
+                    # Durable halt if this loss pushed us past the daily limit
+                    self._enforce_daily_loss_pause()
                     self.logger.info("position_exit_complete", {
                         "slug": slug,
                         "reason": close_reason,
@@ -701,8 +863,16 @@ class TradingBot:
             self.risk.config.take_profit_threshold = original_tp
 
     def _do_full_scan(self) -> List[Dict]:
-        """Full market scan — fetches all markets, processes everything."""
+        """Full market scan — fetches all markets, processes everything.
+
+        Feeds the health monitor: an empty market list (API down OR nothing
+        tradeable) counts as a market-data failure so repeated empties trigger
+        degraded-mode backoff instead of a tight retry loop. Backing off when
+        there is genuinely nothing to trade is harmless.
+        """
         markets = self.market_data.get_active_markets()
+        if markets:
+            self.health.record_success("market_data")
         self._cached_markets = markets
         self._last_full_scan = time.time()
         return markets
@@ -799,6 +969,16 @@ class TradingBot:
         while self.running:
             cycle += 1
             try:
+                # Liveness heartbeat — read by the supervisor's stale check
+                self.health.beat({
+                    "cycle": cycle,
+                    "mode": mode,
+                    "open_positions": len(self.portfolio.get_open_positions()),
+                    "degraded_sources": [
+                        s for s in ("market_data",) if self.health.is_degraded(s)
+                    ],
+                })
+
                 # Check supervisor kill switch / pause
                 if not self._check_supervisor_flags():
                     time.sleep(10)
@@ -825,8 +1005,16 @@ class TradingBot:
 
                     markets = self._do_full_scan()
                     if not markets:
-                        self.logger.warning("no_markets_found", {"cycle": cycle})
-                        time.sleep(self.live_scan_interval)
+                        # Degraded-mode backoff: repeated empty fetches slow the
+                        # loop down exponentially (up to 5 min) instead of
+                        # hammering a dead or empty API every few seconds.
+                        backoff = self.health.record_failure("market_data")
+                        self.logger.warning("no_markets_found", {
+                            "cycle": cycle,
+                            "consecutive": self.health.consecutive_failures("market_data"),
+                            "backoff_seconds": backoff,
+                        })
+                        time.sleep(max(backoff, self.live_scan_interval))
                         continue
 
                     live_markets, pregame_markets = self._split_markets(markets)
@@ -839,6 +1027,10 @@ class TradingBot:
                         snapshot = self.market_data.build_snapshot(market)
                         if snapshot:
                             snapshots.append(snapshot)
+
+                    # Refresh open positions' probability estimates BEFORE the
+                    # exit checks so take-profit sees current beliefs.
+                    self._refresh_position_estimates(snapshots)
                     self.process_markets(snapshots)
 
                     has_live = len(live_markets) > 0
