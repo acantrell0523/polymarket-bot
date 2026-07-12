@@ -461,17 +461,70 @@ def _parse_game_start_ts(game_start_time: str) -> Optional[int]:
         return None
 
 
+def multi_book_home_prob(
+    aggregator, league: str, home_abbr: str, away_abbr: str
+) -> Optional[Tuple[float, int]]:
+    """Point-in-time multi-book consensus (FanDuel + Pinnacle) for a game.
+
+    Sportsbooks only quote UPCOMING games, so this naturally applies to the
+    pre-game recorder pass and returns None for finished games — which is
+    exactly the no-lookahead property we want: consensus recorded before
+    tip-off, never reconstructed after the result is known.
+
+    Returns (p_home, num_books) or None.
+    """
+    if aggregator is None:
+        return None
+    info = LEAGUES.get(league)
+    if not info:
+        return None
+    amap = ABBR_MAP.get(league, {})
+    try:
+        game = aggregator.find_game(
+            info["odds_api_key"],
+            amap.get(home_abbr, home_abbr),
+            amap.get(away_abbr, away_abbr),
+        )
+    except Exception as exc:
+        logging.debug("multi_book_lookup_failed league=%s error=%s", league, exc)
+        return None
+    if not game:
+        return None
+    return float(game["home_prob"]), int(game.get("num_books", 1))
+
+
+def existing_num_books(conn, slug: str) -> int:
+    """Best num_books already recorded for a slug's snapshots."""
+    row = conn.execute(
+        "SELECT MAX(num_books) FROM historical_snapshots WHERE slug = ?", (slug,)
+    ).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
 def backfill_consensus_for_market(
     session: requests.Session,
     conn,
     market_row: Dict,
     window_days: int,
     last_call: float,
+    aggregator=None,
 ) -> Tuple[int, float]:
     """Populate espn_consensus_prob for one moneyline_game market's snapshots.
 
-    Returns (snapshot_rows_updated, last_call). 0 rows means either no
-    pickcenter odds exist for the game or no snapshots fall in the window.
+    Consensus sources, all de-vigged to P(home):
+      * ESPN pickcenter (DraftKings closing line) — works for past games
+      * FanDuel + Pinnacle via MultiBookAggregator — pre-game only (books
+        drop games once played), recorded point-in-time
+
+    The blend weights each source by its book count; num_books is the total
+    across DISTINCT books (DK never double-counts — the aggregator fetches
+    only FanDuel and Pinnacle).
+
+    NO-DOWNGRADE GUARD: a later run (after the game finishes) sees only the
+    1-book pickcenter line and must not overwrite a richer pre-game 3-book
+    consensus already recorded.
+
+    Returns (snapshot_rows_updated, last_call).
     """
     slug = market_row.get("slug", "")
     espn_id = market_row.get("espn_game_id", "")
@@ -482,10 +535,37 @@ def backfill_consensus_for_market(
     league = (market_row.get("league") or "nba").lower()
     pickcenter, last_call = fetch_espn_pickcenter(session, espn_id, last_call, league)
     consensus = compute_consensus_from_pickcenter(pickcenter)
-    if consensus is None:
-        logging.info("no_pickcenter_odds slug=%s espn_id=%s", slug, espn_id)
+
+    # Blend in live sportsbooks (pre-game only; None once the game is played)
+    books_result = multi_book_home_prob(
+        aggregator, league,
+        market_row.get("home_abbr", ""), market_row.get("away_abbr", ""),
+    )
+
+    if consensus is None and books_result is None:
+        logging.info("no_consensus_source slug=%s espn_id=%s", slug, espn_id)
         return 0, last_call
-    p_home, p_away, num_books = consensus
+
+    parts = []  # (p_home, num_books) per source
+    if consensus is not None:
+        parts.append((consensus[0], consensus[2]))
+    if books_result is not None:
+        parts.append(books_result)
+
+    total_books = sum(n for _, n in parts)
+    p_home = sum(p * n for p, n in parts) / total_books
+    p_home = max(0.01, min(0.99, p_home))
+    p_away = 1.0 - p_home
+    num_books = total_books
+
+    # No-downgrade guard
+    already = existing_num_books(conn, slug)
+    if already > num_books:
+        logging.info(
+            "consensus_kept_richer slug=%s existing_books=%d new_books=%d",
+            slug, already, num_books,
+        )
+        return 0, last_call
 
     # Which team does the stored price series (token 0) refer to?
     # token0_side is exact — read from the market's outcomes array at ingest.
@@ -689,15 +769,30 @@ def run_consensus_backfill(
     Sweeps all moneyline_game rows that have an ESPN game id — including ones
     ingested on previous runs — so it doubles as a standalone backfill for
     databases populated before consensus support existed (--consensus-only).
+
+    For games still listed by the sportsbooks (i.e. not yet played), a
+    MultiBookAggregator blends FanDuel + Pinnacle into the ESPN/DraftKings
+    pickcenter line — recorded point-in-time, giving real multi-book
+    num_books that unlock the ">7% edge needs 3 books" rule in backtests.
     Returns (markets_updated, snapshot_rows_updated, last_call).
     """
     rows = conn.execute(
         "SELECT slug, espn_game_id, league, question, home_team, away_team, "
-        "       settled_outcome, game_start_time, token0_side "
+        "       home_abbr, away_abbr, settled_outcome, game_start_time, "
+        "       token0_side "
         "FROM historical_markets "
         "WHERE market_type = 'moneyline_game' AND espn_game_id != '' "
         "ORDER BY slug"
     ).fetchall()
+
+    # One aggregator for the whole sweep — it caches per-sport fetches
+    # (TTL 300s), so 15 MLB games cost 2 upstream calls, not 30.
+    aggregator = None
+    try:
+        from bot.signals.book_scrapers import MultiBookAggregator
+        aggregator = MultiBookAggregator(cache_ttl=300)
+    except Exception as exc:
+        logging.warning("multi_book_aggregator_unavailable error=%s", exc)
 
     markets_updated = 0
     rows_updated = 0
@@ -705,7 +800,8 @@ def run_consensus_backfill(
         market_row = dict(r)
         try:
             n, last_call = backfill_consensus_for_market(
-                session, conn, market_row, window_days, last_call
+                session, conn, market_row, window_days, last_call,
+                aggregator=aggregator,
             )
             if n > 0:
                 markets_updated += 1

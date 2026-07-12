@@ -20,10 +20,24 @@ backtest rebuild, CI) land.
 | 4 | **False close success** — API errors read as "position absent"; 3 unfilled IOCs became "auto-settling"; shorts closed with BUY_SHORT @ $0.01 (can never fill) | `get_exchange_positions()` returns None on failure vs {} when empty; close success requires post-close verification; auto-settle requires the market-status endpoint to confirm resolution; shorts close BUY_LONG @ $0.99 |
 | 5 | **Aux signals could reverse the books** — 0.5-anchored absolute values dragged the blend across the price (BUY at 0.31 when market 0.25, consensus 0.20); the ext+1% cap clamps magnitude, not sign | `_direction_reversed()` guard in `detect_edge()`: the primary external signal defines the only permitted trade direction; aux signals may temper it, never flip it. Integration test reproduces the audit's exact scenario |
 
-Tests: 218 passing (36 new). Remaining audit items (next): persist
-bot-owned position state across restarts, ESPN clock parsing from recorded
-payloads, aux signals as deltas around the prior, point-in-time backtest
-rebuild, CI + Ruff cleanup (83 findings).
+| 6 | **Position state reset every scan/restart** — live positions rebuilt with entry_time=now, estimated_prob=0.5, peak/telemetry zeroed: the 10-min hold gate never elapsed (only stop-loss could ever fire live), take-profit/trailing/let-it-ride ran on garbage | New `live_position_state` table (slug PK); persisted at open, overlaid on reconstruction (exchange stays authoritative for qty/cost), deleted at close; paper positions restore on restart (`restore_state=True`); `tests/conftest.py` autouse fixture isolates all tests onto throwaway DBs |
+
+**Multi-book consensus (same session):** `book_scrapers.py` extended to summer
+sports — Pinnacle league ids 246/578/2663 (MLB/WNBA/MLS, discovered live),
+FanDuel mlb/wnba pages (no MLS page exists; DK direct API is bot-blocked, DK
+comes via ESPN pickcenter). New league-scoped nickname fragments fix flat-dict
+collisions ("Las Vegas Aces" matched NHL vgk:"vegas"; "Chicago Cubs" matched
+NBA chi). The recorder blends FanDuel+Pinnacle into the DK line for games the
+books still list (pre-game = point-in-time, zero lookahead) weighted by book
+count, with a NO-DOWNGRADE guard so post-game reruns (1-book) never overwrite
+richer pre-game consensus. **Verified live: upcoming games record
+num_books=3-5; the ">7% edge needs 3 books" rule is now unlockable in
+backtests.**
+
+Tests: 234 passing. Remaining audit items (next): ESPN clock parsing from
+recorded payloads (#7), aux signals as deltas around the prior (full fix
+behind the direction guard), point-in-time backtest rebuild, CI + Ruff
+cleanup (83 findings).
 
 ---
 

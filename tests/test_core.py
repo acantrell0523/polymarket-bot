@@ -3628,3 +3628,151 @@ class TestPositionStatePersistence:
              patch("bot.edge_log.update_edge_log_outcome"):
             portfolio.close_position(pos, current_price=0.58, reason="take_profit")
         assert "close-state-test" not in tdb.get_position_states()
+
+
+# ============================================================================
+# Multi-book consensus for current sports (FanDuel + Pinnacle + ESPN/DK)
+# ============================================================================
+
+from bot.signals.book_scrapers import (
+    _match_abbr, FANDUEL_SPORTS, PINNACLE_LEAGUES, LEAGUE_TEAM_FRAGMENTS,
+)
+from scripts.ingest_historical import (
+    multi_book_home_prob, existing_num_books,
+)
+
+
+class TestLeagueAwareTeamMatching:
+    def test_mlb_nicknames_beat_city_collisions(self):
+        # "Chicago Cubs" used to match NBA's chi:"chicago" first
+        assert _match_abbr("Chicago Cubs", "baseball_mlb") == "chc"
+        assert _match_abbr("Chicago White Sox", "baseball_mlb") == "cws"
+        assert _match_abbr("Washington Nationals", "baseball_mlb") == "wsh"
+        assert _match_abbr("New York Yankees", "baseball_mlb") == "nyy"
+        assert _match_abbr("Los Angeles Dodgers", "baseball_mlb") == "lad"
+
+    def test_wnba_nicknames_beat_cross_league_collisions(self):
+        # "Las Vegas Aces" used to match NHL's vgk:"vegas";
+        # "Golden State Valkyries" matched NBA's gs:"golden state"
+        assert _match_abbr("Las Vegas Aces", "basketball_wnba") == "las"
+        assert _match_abbr("Golden State Valkyries", "basketball_wnba") == "gsv"
+        assert _match_abbr("Los Angeles Sparks", "basketball_wnba") == "la"
+        assert _match_abbr("Connecticut Sun", "basketball_wnba") == "conn"
+
+    def test_legacy_leagues_fall_back_to_flat_dict(self):
+        assert _match_abbr("Golden State Warriors", "basketball_nba") == "gs"
+        assert _match_abbr("Golden State Warriors") == "gs"  # no sport hint
+
+    def test_summer_sports_registered_with_books(self):
+        for sport in ("baseball_mlb", "basketball_wnba"):
+            assert sport in FANDUEL_SPORTS
+            assert sport in PINNACLE_LEAGUES
+        assert "soccer_usa_mls" in PINNACLE_LEAGUES   # FD has no MLS page
+        # Pinnacle league ids discovered live 2026-07-11
+        assert PINNACLE_LEAGUES["baseball_mlb"] == 246
+        assert PINNACLE_LEAGUES["basketball_wnba"] == 578
+        assert PINNACLE_LEAGUES["soccer_usa_mls"] == 2663
+
+    def test_fragment_abbrs_match_recorder_abbr_space(self):
+        """Fragment keys must equal what the recorder passes to find_game:
+        ABBR_MAP-normalized ESPN abbrs (gs->gsv, chw->cws, lv->las...)."""
+        from scripts.ingest_historical import ABBR_MAP
+        for lg, sport in (("mlb", "baseball_mlb"), ("wnba", "basketball_wnba")):
+            for pm_abbr in ABBR_MAP.get(lg, {}).values():
+                assert pm_abbr in LEAGUE_TEAM_FRAGMENTS[sport], (
+                    f"{pm_abbr} missing from {sport} fragments")
+
+
+class _FakeAggregator:
+    def __init__(self, game=None):
+        self.game = game
+        self.calls = []
+
+    def find_game(self, sport_key, home_abbr, away_abbr):
+        self.calls.append((sport_key, home_abbr, away_abbr))
+        return self.game
+
+
+class TestMultiBookRecorder:
+    def test_lookup_normalizes_abbrs_through_abbr_map(self):
+        agg = _FakeAggregator(game={"home_prob": 0.62, "num_books": 2})
+        result = multi_book_home_prob(agg, "wnba", "con", "gs")
+        assert result == (0.62, 2)
+        # ESPN abbrs con/gs must be normalized to conn/gsv before matching
+        assert agg.calls == [("basketball_wnba", "conn", "gsv")]
+
+    def test_no_aggregator_or_no_game_is_none(self):
+        assert multi_book_home_prob(None, "mlb", "nyy", "bos") is None
+        assert multi_book_home_prob(_FakeAggregator(None), "mlb", "nyy", "bos") is None
+
+    def _seed(self, tmp_path):
+        db = str(tmp_path / "hist.db")
+        _hist_init_tables(db)
+        conn = _hist_get_conn(db)
+        _hist_upsert_market(conn, {
+            "slug": "mlb-nyy-bos-2026-07-11", "market_id": "1",
+            "league": "mlb", "home_team": "Boston Red Sox",
+            "away_team": "New York Yankees", "home_abbr": "bos",
+            "away_abbr": "nyy", "espn_game_id": "401",
+            "market_type": "moneyline_game", "token0_side": "away",
+            "game_start_time": datetime.now(timezone.utc).isoformat(),
+        })
+        _hist_upsert_snapshots(conn, "mlb-nyy-bos-2026-07-11",
+                               [{"t": int(datetime.now(timezone.utc).timestamp()) // 86400 * 86400,
+                                 "p": 0.55}])
+        conn.commit()
+        return db, conn
+
+    def test_pregame_blend_combines_dk_fanduel_pinnacle(self, tmp_path, monkeypatch):
+        db, conn = self._seed(tmp_path)
+        import scripts.ingest_historical as ih
+        # ESPN pickcenter: DK home ML -150/+130 -> p_home ~0.5798 (1 book)
+        monkeypatch.setattr(ih, "fetch_espn_pickcenter",
+            lambda session, espn_id, last_call, league="nba": (
+                [{"homeTeamOdds": {"moneyLine": -150},
+                  "awayTeamOdds": {"moneyLine": 130}}], last_call))
+        agg = _FakeAggregator(game={"home_prob": 0.62, "num_books": 2})
+
+        market_row = dict(conn.execute("SELECT * FROM historical_markets").fetchone())
+        n, _ = ih.backfill_consensus_for_market(
+            None, conn, market_row, window_days=3, last_call=0.0, aggregator=agg)
+        assert n == 1
+
+        row = conn.execute(
+            "SELECT espn_consensus_prob, num_books FROM historical_snapshots").fetchone()
+        assert row["num_books"] == 3          # DK + FanDuel + Pinnacle
+        # book-count-weighted blend of P(home), stored for YES team = away
+        dk_home = 0.6 / (0.6 + 100 / 230)
+        expected_home = (dk_home * 1 + 0.62 * 2) / 3
+        assert row["espn_consensus_prob"] == pytest.approx(1 - expected_home, abs=1e-6)
+        conn.close()
+
+    def test_no_downgrade_after_game_finishes(self, tmp_path, monkeypatch):
+        """Post-game reruns see only the 1-book pickcenter line; they must
+        NOT overwrite the richer pre-game 3-book consensus."""
+        db, conn = self._seed(tmp_path)
+        import scripts.ingest_historical as ih
+        monkeypatch.setattr(ih, "fetch_espn_pickcenter",
+            lambda session, espn_id, last_call, league="nba": (
+                [{"homeTeamOdds": {"moneyLine": -150},
+                  "awayTeamOdds": {"moneyLine": 130}}], last_call))
+        market_row = dict(conn.execute("SELECT * FROM historical_markets").fetchone())
+
+        # Pre-game pass: 3 books
+        agg = _FakeAggregator(game={"home_prob": 0.62, "num_books": 2})
+        ih.backfill_consensus_for_market(None, conn, market_row, 3, 0.0, aggregator=agg)
+        rich = conn.execute(
+            "SELECT espn_consensus_prob, num_books FROM historical_snapshots").fetchone()
+        assert rich["num_books"] == 3
+
+        # Post-game rerun: books dropped the game -> only DK (1 book)
+        n, _ = ih.backfill_consensus_for_market(
+            None, conn, market_row, 3, 0.0, aggregator=_FakeAggregator(None))
+        assert n == 0  # guard refused the downgrade
+        after = conn.execute(
+            "SELECT espn_consensus_prob, num_books FROM historical_snapshots").fetchone()
+        assert after["num_books"] == 3
+        assert after["espn_consensus_prob"] == pytest.approx(
+            rich["espn_consensus_prob"])
+        assert existing_num_books(conn, "mlb-nyy-bos-2026-07-11") == 3
+        conn.close()
