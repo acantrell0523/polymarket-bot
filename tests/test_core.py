@@ -4003,3 +4003,51 @@ class TestBookDedup:
         assert len(consensus) == 1
         assert consensus[0]["num_books"] == 2          # not 3
         assert sorted(consensus[0]["books"]) == ["fanduel", "pinnacle"]
+
+
+# ============================================================================
+# UFC support: registry, fighter-code matching, Pinnacle live lines
+# ============================================================================
+
+from bot.signals.book_scrapers import fighter_code
+
+
+class TestUFCSupport:
+    def test_fighter_codes_match_polymarket_slugs(self):
+        # Verified against tonight's card: aec-ufc-maxhol-conmcg-2026-07-11
+        assert fighter_code("Max Holloway") == "maxhol"
+        assert fighter_code("Conor McGregor") == "conmcg"
+        assert fighter_code("Ilia Topuria") == "ilitop"
+
+    def test_fighter_code_edge_cases(self):
+        assert fighter_code("BJ Penn") == "bjpen"          # short first name
+        assert fighter_code("Cub") == "cub"                # single name
+        assert fighter_code("") == ""
+
+    def test_match_abbr_routes_mma_to_fighter_code(self):
+        assert _match_abbr("Max Holloway", "mma_mixed_martial_arts") == "maxhol"
+
+    def test_ufc_registered(self):
+        assert "ufc" in LEAGUES
+        assert LEAGUES["ufc"]["clock"] is None       # fights end without warning
+        assert PINNACLE_LEAGUES["mma_mixed_martial_arts"] == 1624
+        from bot.signals.odds_api import SPORT_MAP
+        assert SPORT_MAP["ufc"] == "mma_mixed_martial_arts"
+
+    def test_ufc_slug_routes_to_sports_with_ufc_min_edge(self):
+        from bot.strategies.trade_filter import get_league_from_slug, get_league_min_edge
+        slug = "aec-ufc-maxhol-conmcg-2026-07-11"
+        assert get_league_from_slug(slug) == "ufc"
+        assert get_league_min_edge(slug) == pytest.approx(0.06)
+
+    def test_aggregator_matches_fight_by_codes(self):
+        from bot.signals.book_scrapers import MultiBookAggregator
+        agg = MultiBookAggregator(cache_ttl=999)
+        agg.fanduel.get_odds = lambda sk: []
+        agg.pinnacle.get_odds = lambda sk: [{
+            "book": "pinnacle", "home_team": "Max Holloway",
+            "away_team": "Conor McGregor", "home_prob": 0.70, "away_prob": 0.30,
+        }]
+        game = agg.find_game("mma_mixed_martial_arts", "conmcg", "maxhol")
+        assert game is not None
+        assert game["home_prob"] == pytest.approx(0.70)

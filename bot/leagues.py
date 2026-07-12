@@ -68,6 +68,16 @@ LEAGUES: Dict[str, Dict] = {
         "odds_api_key": "soccer_epl",
         "clock": {"periods": 2, "minutes": 45, "count_up": True},
     },
+    # UFC: event = a whole card, competitions = individual fights. No game
+    # clock in the registry sense (fights end without warning — round clocks
+    # don't map to a last-5-minutes gate). Live lines come from Pinnacle
+    # (league 1624); ESPN has no live win-prob model for MMA, so the
+    # live_win_prob signal is naturally a no-op and odds_value carries UFC.
+    "ufc": {
+        "espn_path": "mma/ufc",
+        "odds_api_key": "mma_mixed_martial_arts",
+        "clock": None,
+    },
 }
 
 

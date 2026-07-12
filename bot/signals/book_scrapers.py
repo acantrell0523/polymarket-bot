@@ -74,14 +74,31 @@ LEAGUE_TEAM_FRAGMENTS = {
 }
 
 
+def fighter_code(full_name: str) -> str:
+    """Polymarket's UFC fighter code: first 3 of first name + first 3 of last.
+
+    Verified against tonight's card (2026-07-11): "Max Holloway" -> maxhol,
+    "Conor McGregor" -> conmcg (slug aec-ufc-maxhol-conmcg-2026-07-11).
+    """
+    parts = [p for p in full_name.lower().replace(".", "").split() if p]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0][:6]
+    return (parts[0][:3] + parts[-1][:3])
+
+
 def _match_abbr(full_name: str, sport_key: str = "") -> str:
     """Reverse-lookup: find the abbreviation for a full team name.
 
     League-scoped nickname fragments take precedence when the caller knows
-    the sport; the flat cross-league TEAM_ABBREVS remains the fallback for
-    the original NBA/NHL/NCAA paths.
+    the sport; MMA derives the fighter code from the name (no fixed roster);
+    the flat cross-league TEAM_ABBREVS remains the fallback for the original
+    NBA/NHL/NCAA paths.
     """
     name = full_name.lower()
+    if sport_key == "mma_mixed_martial_arts":
+        return fighter_code(full_name)
     league_fragments = LEAGUE_TEAM_FRAGMENTS.get(sport_key)
     if league_fragments:
         for abbr, fragment in league_fragments.items():
@@ -237,6 +254,7 @@ PINNACLE_LEAGUES = {
     "baseball_mlb": 246,
     "basketball_wnba": 578,
     "soccer_usa_mls": 2663,
+    "mma_mixed_martial_arts": 1624,   # UFC (Pinnacle serves live fight lines)
 }
 
 

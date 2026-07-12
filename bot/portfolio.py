@@ -69,6 +69,9 @@ class Portfolio:
                 self.logger.error("position_state_restore_failed", {"error": str(e)})
             return
 
+        # Drop obviously-invalid rows (empty slug = pre-isolation test residue)
+        states = {slug: st for slug, st in states.items() if slug}
+
         self._bot_positions.update(states.keys())
 
         if self.paper_mode:
