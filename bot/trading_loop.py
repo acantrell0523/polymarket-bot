@@ -414,7 +414,11 @@ class TradingBot:
                 signal=trade_signal,
                 snapshot=snapshot,
                 num_books=num_books,
-                open_game_ids=open_games | games_opening,
+                # get_open_game_ids returns a dict (game_id -> slugs); union
+                # with the set of games opened this cycle needs its keys.
+                # (dict | set raised TypeError and killed every cycle that
+                # found an opportunity — 1,433 scan_cycle_errors on Jul 12.)
+                open_game_ids=set(open_games) | games_opening,
                 game_id=game_id,
                 daily_trades=self.risk.daily_trade_count,
                 max_daily_trades=tcfg.max_daily_trades,

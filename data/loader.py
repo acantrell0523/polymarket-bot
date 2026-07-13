@@ -106,7 +106,10 @@ def generate_synthetic_markets(
         # signal path (the one the live bot actually trades). Paired with a
         # HistoricalOddsCache.synthetic_from_market_data() consensus source,
         # this exercises the full external-validation pipeline in backtests.
-        slug = f"aec-nba-syn{m:03d}-opp{m:03d}-2024-01-01"
+        # Alphabetic team codes: strict game-slug validation (letters-only
+        # teams) must accept synthetic slugs, so encode the index as letters.
+        team_code = "".join(chr(97 + (m // (26 ** i)) % 26) for i in range(3))
+        slug = f"aec-nba-syn{team_code}-opp{team_code}-2024-01-01"
 
         snapshots = []
         for i in range(num_snapshots):

@@ -95,6 +95,18 @@ def odds_value_signal(
 
     Returns confidence=0 if no external odds are available, which blocks the trade.
     """
+    # Guard: only strict GAME slugs may match a moneyline consensus. Spread/
+    # total slugs (asc-mlb-tor-sd-...-neg-1pt5, tsc-...-8pt5) share the team
+    # tokens, so slug matching handed them the MONEYLINE probability — 8-13%
+    # phantom "edges" against the wrong reference, observed 2026-07-12 and
+    # stopped only by the 3-book rule. Sports-family non-game slugs get no
+    # external consensus, which blocks them at the gate.
+    from bot.leagues import league_from_slug
+    from bot.signals.live_win_prob import slug_game_teams
+    if league_from_slug(snapshot.slug) and slug_game_teams(snapshot.slug) is None:
+        return Signal(name="odds_value", value=0.5, confidence=0.0, direction="neutral",
+                      metadata={"reason": "non_game_market_no_moneyline_match"})
+
     if not odds_cache or not odds_cache.enabled:
         return Signal(name="odds_value", value=0.5, confidence=0.0, direction="neutral",
                       metadata={"reason": "no_odds_api_key"})

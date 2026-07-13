@@ -4051,3 +4051,59 @@ class TestUFCSupport:
         game = agg.find_game("mma_mixed_martial_arts", "conmcg", "maxhol")
         assert game is not None
         assert game["home_prob"] == pytest.approx(0.70)
+
+
+# ============================================================================
+# Jul 12 paper-session regressions
+# ============================================================================
+
+from bot.edge_log import get_open_game_ids
+
+
+class TestJul12Regressions:
+    def test_open_game_ids_union_pattern(self):
+        """get_open_game_ids returns a DICT; the validate call unions it with
+        the games-opened-this-cycle SET. dict | set raises TypeError — this
+        killed every cycle that found an opportunity on Jul 12 (1,433 errors,
+        zero decisions logged all day)."""
+        pos = Position(market_id="m", token_id="t", side="buy", entry_price=0.5,
+                       size_usd=10, quantity=20, estimated_prob=0.6,
+                       entry_time=datetime.now(timezone.utc),
+                       slug="aec-mlb-nyy-bos-2026-07-13")
+        open_games = get_open_game_ids([pos])
+        assert isinstance(open_games, dict)
+        merged = set(open_games) | {"other-game"}   # the fixed call-site pattern
+        assert "other-game" in merged
+        assert len(merged) == 2
+
+    def test_odds_value_refuses_non_game_sports_slugs(self, signal_config):
+        """Spread/total slugs share team tokens with the moneyline, so slug
+        matching handed them the MONEYLINE consensus (8-13% phantom edges,
+        observed Jul 12). Sports-family non-game slugs must get conf 0."""
+        cache = HistoricalOddsCache({
+            # even with consensus present for the team pair...
+            "asc-mlb-tor-sd-2026-07-11-neg-1pt5": [(0.0, 0.137, 4)],
+        })
+        snap = MarketSnapshot(
+            market_id="m", token_id="t", question="Blue Jays -1.5?", price=0.30,
+            volume_24h=5000, liquidity=5000, order_book=OrderBook(),
+            price_history=[0.30] * 20, timestamp=datetime.now(timezone.utc),
+            slug="asc-mlb-tor-sd-2026-07-11-neg-1pt5",
+        )
+        sig = odds_value_signal(snap, signal_config, cache)
+        assert sig.confidence == 0.0
+        assert "non_game" in sig.metadata.get("reason", "")
+
+    def test_odds_value_still_works_for_game_slugs(self, signal_config):
+        cache = HistoricalOddsCache({
+            "aec-mlb-tor-sd-2026-07-11": [(0.0, 0.137, 4)],
+        })
+        snap = MarketSnapshot(
+            market_id="m", token_id="t", question="q", price=0.20,
+            volume_24h=5000, liquidity=5000, order_book=OrderBook(),
+            price_history=[0.20] * 20, timestamp=datetime.now(timezone.utc),
+            slug="aec-mlb-tor-sd-2026-07-11",
+        )
+        cache.set_time(datetime.now(timezone.utc))
+        sig = odds_value_signal(snap, signal_config, cache)
+        assert sig.confidence > 0
