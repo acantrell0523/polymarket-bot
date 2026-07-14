@@ -89,6 +89,21 @@ class TradingConfig:
     # Clockless sports (baseball): no clock to gate on, so block entries from
     # this period (inning) onward — late innings are the endgame equivalent.
     live_clockless_max_period: int = 7
+    # --- Live discipline (Jul 13 postmortem: edge detection was right, the
+    # LEAK was re-entry churn — 6 stop-outs from re-buying choppy games,
+    # including buying the 52c top seconds after a profitable exit) ---
+    # Hard caps per game (game_id includes the date, so no daily reset needed):
+    max_entries_per_game: int = 3
+    max_stops_per_game: int = 2          # 2 stop-losses on a game = locked out
+    # Live stops need room: 25% of a 25c entry is 6c — inside normal live
+    # noise. Wider stop, smaller size = same $ risk with fewer whipsaws.
+    live_stop_loss_threshold: float = 0.35
+    live_max_position_size_usd: float = 25.0
+    # Two-scan confirmation: a live edge must persist across scans (first
+    # sighting at least min, at most max seconds old) before entering —
+    # filters single-play model spikes.
+    live_confirm_min_seconds: float = 3.0
+    live_confirm_max_seconds: float = 30.0
 
 
 # Default per-market-type weights — must stay in sync with WEIGHTS in estimator.py

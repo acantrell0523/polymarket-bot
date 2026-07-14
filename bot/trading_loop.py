@@ -227,6 +227,15 @@ class TradingBot:
         self._slug_cooldowns: Dict[str, float] = {}
         self._cooldown_seconds = 600  # 10 minutes
 
+        # Live discipline (Jul 13 postmortem): per-game entry/stop counters.
+        # game_id embeds the date, so counters never need a daily reset.
+        # Stop counts are restored from today's trades so a restart can't
+        # forget that a game already stopped us out twice.
+        self._game_entry_counts: Dict[str, int] = {}
+        self._game_stop_counts: Dict[str, int] = {}
+        self._pending_live_edges: Dict[str, tuple] = {}  # slug -> (side, first_seen_ts)
+        self._restore_game_discipline_counts()
+
         # Slugs we've already auto-settled — persisted to file so it survives restarts
         self._settled_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "settled_slugs.txt")
         self._settled_slugs: set = self._load_settled_slugs()
@@ -387,6 +396,20 @@ class TradingBot:
 
             game_id = extract_game_id(trade_signal.slug)
 
+            # PER-GAME DISCIPLINE (applies to both validation paths):
+            # after max_stops_per_game stop-losses the game is locked out,
+            # and no game takes more than max_entries_per_game entries.
+            # Jul 13: 6 of 12 trades were stop-outs from re-entering the
+            # same two games — these caps would have saved ~$30.
+            if self._game_stop_counts.get(game_id, 0) >= tcfg.max_stops_per_game:
+                self._log_decision(trade_signal, snapshot, "rejected",
+                                   f"game_lockout_{self._game_stop_counts[game_id]}_stops")
+                continue
+            if self._game_entry_counts.get(game_id, 0) >= tcfg.max_entries_per_game:
+                self._log_decision(trade_signal, snapshot, "rejected",
+                                   f"max_entries_per_game_{tcfg.max_entries_per_game}_reached")
+                continue
+
             # Get number of books for this market
             consensus = self.odds_cache.get_consensus_odds(trade_signal.slug)
             num_books = consensus.get("num_books", 0) if consensus else 0
@@ -489,8 +512,32 @@ class TradingBot:
                                    f"[{validation_path}] {rejection}")
                 continue
 
+            # TWO-SCAN CONFIRMATION (live only): a live edge must persist
+            # across scans before we act — a single model spike (one play,
+            # one stale book pull) is not an edge. First sighting arms the
+            # slug; a second sighting between confirm_min and confirm_max
+            # seconds later trades; older sightings re-arm.
+            if validation_path == "live":
+                import time as _time
+                now_ts = _time.time()
+                prev = self._pending_live_edges.get(trade_signal.slug)
+                window_ok = (prev is not None and prev[0] == trade_signal.side
+                             and tcfg.live_confirm_min_seconds
+                             <= now_ts - prev[1]
+                             <= tcfg.live_confirm_max_seconds)
+                if not window_ok:
+                    self._pending_live_edges[trade_signal.slug] = (trade_signal.side, now_ts)
+                    self._log_decision(trade_signal, snapshot, "rejected",
+                                       "[live] pending_confirmation_second_scan")
+                    continue
+                del self._pending_live_edges[trade_signal.slug]
+
             exposure = self.portfolio.get_total_exposure()
             size = self.sizer.size_position(trade_signal, self.portfolio.bankroll, exposure)
+            # Live positions run wider stops (0.35 vs 0.25), so they carry
+            # smaller size: similar $ risk, fewer noise whipsaws.
+            if validation_path == "live":
+                size = min(size, tcfg.live_max_position_size_usd)
             if size <= 0:
                 self._log_decision(trade_signal, snapshot, "skipped_sizing",
                                    "size_below_minimum_or_no_exposure_room")
@@ -505,6 +552,7 @@ class TradingBot:
                 self.portfolio.open_position(trade_signal, trade)
                 self.risk.record_trade_opened()
                 games_opening.add(game_id)
+                self._game_entry_counts[game_id] = self._game_entry_counts.get(game_id, 0) + 1
                 self._log_edge_entry(trade_signal, snapshot)
                 self._log_decision(trade_signal, snapshot, "executed",
                                    f"[{validation_path}] all_checks_passed")
@@ -615,6 +663,23 @@ class TradingBot:
                     f"Trading paused until `{resume_at.isoformat()}`")
             except Exception:
                 pass
+
+    def _restore_game_discipline_counts(self):
+        """Rebuild today's per-game stop/entry counts from the trades table."""
+        try:
+            from bot.trade_db import get_trades_since
+            from bot.edge_log import extract_game_id
+            today = datetime.now(timezone.utc).replace(
+                hour=0, minute=0, second=0, microsecond=0)
+            for t in get_trades_since(today):
+                gid = extract_game_id(t.get("slug", ""))
+                if not gid:
+                    continue
+                self._game_entry_counts[gid] = self._game_entry_counts.get(gid, 0) + 1
+                if t.get("close_reason") == "stop_loss":
+                    self._game_stop_counts[gid] = self._game_stop_counts.get(gid, 0) + 1
+        except Exception as e:
+            self.logger.warning("discipline_count_restore_failed", {"error": str(e)})
 
     def _load_settled_slugs(self) -> set:
         try:
@@ -808,10 +873,29 @@ class TradingBot:
                     "would_take_profit": would_tp,
                 })
 
-            # Check risk thresholds (also updates position.peak_price)
-            close_reason = self.risk.check_position(
-                position, position.current_price, position.estimated_prob
-            )
+            # Live positions get the wider live stop (0.35 vs 0.25): a 25%
+            # stop on a 25c live contract is 6c — inside normal in-game noise
+            # (Jul 13: six noise stop-outs). Size is capped smaller for live
+            # entries, so dollar risk stays comparable.
+            pos_is_live = False
+            try:
+                from bot.signals.live_win_prob import slug_game_teams as _sgt2
+                if _sgt2(slug) is not None:
+                    pos_is_live = self.live_cache.get_live_prob(slug) is not None
+            except Exception:
+                pos_is_live = False
+
+            _orig_sl = self.risk.config.stop_loss_threshold
+            if pos_is_live:
+                self.risk.config.stop_loss_threshold = \
+                    self.config.trading.live_stop_loss_threshold
+            try:
+                # Check risk thresholds (also updates position.peak_price)
+                close_reason = self.risk.check_position(
+                    position, position.current_price, position.estimated_prob
+                )
+            finally:
+                self.risk.config.stop_loss_threshold = _orig_sl
 
             # Persist bot-owned state so peak/extremes/estimated_prob survive
             # scan reconstruction and restarts (audit: state used to reset
@@ -914,9 +998,21 @@ class TradingBot:
                         "pnl": round(position.realized_pnl, 2),
                         "exchange_pnl": round(exchange_pnl, 2) if exchange_pnl is not None else None,
                     })
-                    # Smart re-entry: loss = 10min cooldown, win (>$2) = immediate
+                    # Per-game stop lockout bookkeeping
+                    if close_reason == "stop_loss":
+                        from bot.edge_log import extract_game_id as _egid
+                        gid = _egid(slug)
+                        if gid:
+                            self._game_stop_counts[gid] = self._game_stop_counts.get(gid, 0) + 1
+
+                    # Re-entry cooldown. Jul 13 postmortem: the old "win > $2
+                    # => immediate re-entry" exception bought the 52c top
+                    # seconds after a +$18 exit. GAME markets now always
+                    # cool down; the exception survives only for non-game
+                    # markets (crypto/politics), which don't whipsaw plays.
                     import time as _time
-                    if position.realized_pnl < 2.0:
+                    from bot.signals.live_win_prob import slug_game_teams as _sgt
+                    if _sgt(slug) is not None or position.realized_pnl < 2.0:
                         self._slug_cooldowns[slug] = _time.time() + self._cooldown_seconds
                 else:
                     self.logger.error("position_exit_failed", {

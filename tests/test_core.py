@@ -2971,11 +2971,16 @@ class TestLeagueRegistry:
 
     def test_game_schedule_watches_all_registered_leagues(self):
         """Regression: GameSchedule previously watched only NBA/NCAA/NHL —
-        all off-season in July — so the live bot slept all summer."""
+        all off-season in July — so the live bot slept all summer.
+        Leagues without ESPN coverage (espn_path None, e.g. ITF tennis)
+        are present with a None URL, which the fetcher skips safely."""
         from bot.game_schedule import ESPN_ENDPOINTS
-        for league in LEAGUES:
+        for league, info in LEAGUES.items():
             assert league in ESPN_ENDPOINTS
-            assert ESPN_ENDPOINTS[league]
+            if info.get("espn_path"):
+                assert ESPN_ENDPOINTS[league]
+            else:
+                assert ESPN_ENDPOINTS[league] is None
 
 
 class TestMultiLeagueIngest:
@@ -4203,3 +4208,107 @@ class TestLiveValidation:
         assert get_live_signal(sig) is not None
         sig.signals = [Signal(name="live_win_prob", value=0.5, confidence=0.0)]
         assert get_live_signal(sig) is None                  # stale = absent
+
+
+# ============================================================================
+# Live discipline (Jul 13 postmortem fixes) + tennis support
+# ============================================================================
+
+from bot.signals.book_scrapers import (
+    TENNIS_CIRCUIT_PREFIXES, PinnacleClient,
+)
+
+
+class TestLiveDiscipline:
+    def test_config_defaults(self, trading_config):
+        assert trading_config.max_entries_per_game == 3
+        assert trading_config.max_stops_per_game == 2
+        assert trading_config.live_stop_loss_threshold == pytest.approx(0.35)
+        assert trading_config.live_max_position_size_usd == pytest.approx(25.0)
+
+    def test_confirmation_window_logic(self):
+        """First live sighting arms; second within [min,max] confirms;
+        outside the window re-arms."""
+        import time as _time
+        pending = {}
+        cmin, cmax = 3.0, 30.0
+
+        def check(slug, side, now):
+            prev = pending.get(slug)
+            ok = (prev is not None and prev[0] == side
+                  and cmin <= now - prev[1] <= cmax)
+            if not ok:
+                pending[slug] = (side, now)
+            else:
+                del pending[slug]
+            return ok
+
+        t0 = 1000.0
+        assert check("s", "buy", t0) is False          # arm
+        assert check("s", "buy", t0 + 1) is False      # too soon (re-arms)
+        assert check("s", "buy", t0 + 5) is True       # confirmed
+        assert check("s", "buy", t0 + 6) is False      # re-armed after trade
+        assert check("s", "buy", t0 + 50) is False     # too old -> re-arm
+        assert check("s", "sell", t0 + 55) is False    # side flip re-arms
+
+    def test_game_slug_always_cools_down(self):
+        """Jul 13: 'win > $2 = instant re-entry' bought the 52c top seconds
+        after a profitable exit. Game markets must ALWAYS cool down."""
+        from bot.signals.live_win_prob import slug_game_teams
+        # game slug: cooldown regardless of pnl sign
+        assert slug_game_teams("aec-wnba-phx-min-2026-07-13") is not None
+        # non-game (crypto/politics): old behavior may keep the exception
+        assert slug_game_teams("bitcoin-100k-2026") is None
+
+
+class TestTennisSupport:
+    def test_itf_registered_no_espn(self):
+        assert "itfme" in LEAGUES and "itfwo" in LEAGUES
+        from bot.leagues import scoreboard_url, summary_url
+        assert scoreboard_url("itfme") is None       # no ESPN coverage
+        assert summary_url("itfwo") is None
+
+    def test_player_codes_verified_live(self):
+        # Verified against live slugs 2026-07-14:
+        # aec-itfme-timleg-jusrob..., aec-itfme-fonsam-..., aec-itfme-haohu-...
+        assert fighter_code("Timo Legout") == "timleg"
+        assert fighter_code("Justin Robert") == "jusrob"
+        assert fighter_code("Fons Van Sambeek") == "fonsam"   # skips "Van"
+        assert fighter_code("Haoran Hu") == "haohu"           # short last name
+        assert _match_abbr("Timo Legout", "tennis_itf_men") == "timleg"
+
+    def test_itf_slug_parses_as_game(self):
+        from bot.signals.live_win_prob import slug_game_teams
+        assert slug_game_teams("aec-itfme-timleg-jusrob-2026-07-14") == \
+            ("itfme", "timleg", "jusrob")
+
+    def test_pinnacle_dynamic_tennis_leagues(self):
+        """Tennis tournaments rotate weekly — league ids are discovered from
+        the sport-33 list, filtered by circuit prefix, doubles excluded."""
+        client = PinnacleClient(cache_ttl=999)
+        fake_leagues = [
+            {"id": 1, "name": "ITF Men Slobozia - R1", "matchupCount": 7},
+            {"id": 2, "name": "ITF Women Nottingham - R1", "matchupCount": 5},
+            {"id": 3, "name": "ITF Men Kramsach - Doubles", "matchupCount": 3},
+            {"id": 4, "name": "ATP Bastad", "matchupCount": 2},
+            {"id": 5, "name": "ITF Men Empty", "matchupCount": 0},
+        ]
+        client._get = lambda url: fake_leagues if "/sports/33/leagues" in url else []
+        assert client._tennis_league_ids("tennis_itf_men") == [1]
+        client._cache.pop("_tennis_leagues", None)
+        assert client._tennis_league_ids("tennis_itf_women") == [2]
+
+    def test_tennis_get_odds_aggregates_tournaments(self):
+        client = PinnacleClient(cache_ttl=999)
+        client._tennis_league_ids = lambda sk: [11, 12]
+        client._fetch_league = lambda lid: [
+            {"book": "pinnacle", "home_team": f"P{lid}", "away_team": f"Q{lid}",
+             "home_prob": 0.6, "away_prob": 0.4}]
+        odds = client.get_odds("tennis_itf_men")
+        assert len(odds) == 2
+
+    def test_itf_min_edge_default(self):
+        from bot.strategies.trade_filter import get_league_from_slug, get_league_min_edge
+        slug = "aec-itfme-timleg-jusrob-2026-07-14"
+        assert get_league_from_slug(slug) == "itfme"
+        assert get_league_min_edge(slug) >= 0.05   # default floor applies

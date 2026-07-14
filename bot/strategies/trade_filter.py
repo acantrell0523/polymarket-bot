@@ -22,6 +22,9 @@ LEAGUE_MIN_EDGE = {
     "wnba": 0.05,   # thinner books, less efficient than NBA
     "mls": 0.05,
     "ufc": 0.06,
+    # ITF tennis: thin, high-vig, notoriously noisy markets — demand more
+    "itfme": 0.07,
+    "itfwo": 0.07,
 }
 DEFAULT_MIN_EDGE = 0.05
 

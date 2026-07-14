@@ -57,6 +57,17 @@ trading:
   max_price: 0.85             # skip extreme favorites
   min_book_liquidity_usd: 1000.0
   max_spread: 0.10            # widest book we can exit cleanly
+  # --- Live in-game validation + discipline (Jul 13 postmortem) ---
+  max_live_model_age_seconds: 45.0   # stale ESPN model = no trade
+  max_live_divergence: 0.15          # bigger model-vs-market gap = red flag
+  live_min_elapsed_seconds: 300.0    # skip chaotic opening minutes
+  live_clockless_max_period: 7       # MLB: no entries from the 8th inning
+  max_entries_per_game: 3            # per-game entry cap
+  max_stops_per_game: 2              # 2 stop-losses = game locked out
+  live_stop_loss_threshold: 0.35     # wider stop for live noise...
+  live_max_position_size_usd: 25.0   # ...paired with smaller size
+  live_confirm_min_seconds: 3.0      # edge must persist across scans
+  live_confirm_max_seconds: 30.0
 signals:
   odds_value_weight: 0.4
   sports_context_weight: 0.15

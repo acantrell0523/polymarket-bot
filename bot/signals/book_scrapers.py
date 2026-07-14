@@ -97,7 +97,11 @@ def _match_abbr(full_name: str, sport_key: str = "") -> str:
     NBA/NHL/NCAA paths.
     """
     name = full_name.lower()
-    if sport_key == "mma_mixed_martial_arts":
+    # Person sports: Polymarket encodes people as first3(first)+first3(last)
+    # ("Max Holloway" -> maxhol, "Timo Legout" -> timleg; short last names
+    # keep their full length: "Haoran Hu" -> haohu). Verified live for both
+    # UFC (2026-07-11) and ITF tennis (2026-07-14).
+    if sport_key == "mma_mixed_martial_arts" or sport_key in TENNIS_CIRCUIT_PREFIXES:
         return fighter_code(full_name)
     league_fragments = LEAGUE_TEAM_FRAGMENTS.get(sport_key)
     if league_fragments:
@@ -257,6 +261,19 @@ PINNACLE_LEAGUES = {
     "mma_mixed_martial_arts": 1624,   # UFC (Pinnacle serves live fight lines)
 }
 
+# Tennis: Pinnacle has no stable league id — every tournament is its own
+# league (e.g. "ITF Men Slobozia - R1", id 272345), rotating weekly. The
+# client discovers current tournament ids from the sport-33 league list
+# (cached 1h) and aggregates matchups across tournaments whose name matches
+# the circuit prefix. Doubles tournaments are skipped (Polymarket lists
+# singles).
+TENNIS_SPORT_ID = 33
+TENNIS_CIRCUIT_PREFIXES = {
+    "tennis_itf_men": ("ITF Men",),
+    "tennis_itf_women": ("ITF Women",),
+}
+TENNIS_MAX_TOURNAMENTS = 20   # bound the per-refresh API cost
+
 
 class PinnacleClient:
     """Fetches odds from Pinnacle's public guest API. Pinnacle is a sharp book."""
@@ -279,6 +296,35 @@ class PinnacleClient:
             pass
         return None
 
+    def _tennis_league_ids(self, sport_key: str) -> List[int]:
+        """Current tournament league ids for a tennis circuit (cached 1h)."""
+        now = time.time()
+        cached = self._cache.get("_tennis_leagues")
+        if cached and now - cached[0] < 3600:
+            leagues = cached[1]
+        else:
+            leagues = self._get(
+                f"{PINNACLE_BASE}/sports/{TENNIS_SPORT_ID}/leagues?all=false") or []
+            self._cache["_tennis_leagues"] = (now, leagues)
+
+        prefixes = TENNIS_CIRCUIT_PREFIXES.get(sport_key, ())
+        ids = [
+            lg["id"] for lg in leagues
+            if any(lg.get("name", "").startswith(p) for p in prefixes)
+            and "Doubles" not in lg.get("name", "")
+            and lg.get("matchupCount", 0) > 0
+        ]
+        return ids[:TENNIS_MAX_TOURNAMENTS]
+
+    def _fetch_league(self, league_id: int) -> List[dict]:
+        matchups_raw = self._get(f"{PINNACLE_BASE}/leagues/{league_id}/matchups")
+        if not matchups_raw:
+            return []
+        markets_raw = self._get(f"{PINNACLE_BASE}/leagues/{league_id}/markets/straight")
+        if not markets_raw:
+            return []
+        return self._parse(matchups_raw, markets_raw)
+
     def get_odds(self, sport_key: str) -> List[dict]:
         """Get moneyline odds. Returns list of event dicts."""
         now = time.time()
@@ -287,21 +333,21 @@ class PinnacleClient:
             if now - ts < self.cache_ttl:
                 return data
 
+        if sport_key in TENNIS_CIRCUIT_PREFIXES:
+            results: List[dict] = []
+            for lid in self._tennis_league_ids(sport_key):
+                try:
+                    results.extend(self._fetch_league(lid))
+                except Exception:
+                    continue
+            self._cache[sport_key] = (now, results)
+            return results
+
         league_id = PINNACLE_LEAGUES.get(sport_key)
         if not league_id:
             return []
 
-        # Fetch matchups
-        matchups_raw = self._get(f"{PINNACLE_BASE}/leagues/{league_id}/matchups")
-        if not matchups_raw:
-            return []
-
-        # Fetch markets
-        markets_raw = self._get(f"{PINNACLE_BASE}/leagues/{league_id}/markets/straight")
-        if not markets_raw:
-            return []
-
-        results = self._parse(matchups_raw, markets_raw)
+        results = self._fetch_league(league_id)
         self._cache[sport_key] = (now, results)
         return results
 

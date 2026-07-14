@@ -78,6 +78,15 @@ LEAGUES: Dict[str, Dict] = {
         "odds_api_key": "mma_mixed_martial_arts",
         "clock": None,
     },
+    # Tennis (ITF men/women — the circuits Polymarket lists as game markets;
+    # slug person-codes decode with the same first3+first3 rule as UFC:
+    # "Timo Legout" -> timleg, verified live 2026-07-14). No ESPN coverage
+    # for ITF (espn_path None => schedule/live-model paths no-op safely);
+    # odds come from Pinnacle's per-tournament leagues, discovered
+    # dynamically (see book_scrapers TENNIS_SPORT_ID). Clockless AND
+    # period-less: live validation fails closed, so tennis trades PREGAME.
+    "itfme": {"espn_path": None, "odds_api_key": "tennis_itf_men", "clock": None},
+    "itfwo": {"espn_path": None, "odds_api_key": "tennis_itf_women", "clock": None},
 }
 
 
@@ -133,9 +142,10 @@ def league_from_slug(slug: str) -> Optional[str]:
 
 
 def scoreboard_url(league: str) -> Optional[str]:
-    """ESPN scoreboard URL for a league code, or None if unregistered."""
+    """ESPN scoreboard URL for a league code, or None if unregistered
+    or the league has no ESPN coverage (espn_path None, e.g. ITF tennis)."""
     info = LEAGUES.get(league)
-    if not info:
+    if not info or not info.get("espn_path"):
         return None
     return f"{ESPN_SITE_API}/{info['espn_path']}/scoreboard"
 
@@ -143,7 +153,7 @@ def scoreboard_url(league: str) -> Optional[str]:
 def summary_url(league: str) -> Optional[str]:
     """ESPN game-summary URL (pickcenter odds source) for a league code."""
     info = LEAGUES.get(league)
-    if not info:
+    if not info or not info.get("espn_path"):
         return None
     return f"{ESPN_SITE_API}/{info['espn_path']}/summary"
 
