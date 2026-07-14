@@ -3962,12 +3962,12 @@ class TestClockParsingFix:
         # WNBA Q2 with 3:07 left: 2 future quarters (1200s) + 187s = 1387s —
         # NOT 2400 (the audit's full-game misread)
         gs = self._schedule_with_event(self._event("3:07", 2))
-        remaining = gs.get_game_time_remaining("wnba", "phx", "lv")
+        remaining = gs.get_game_time_remaining("wnba", "phx", "las")
         assert remaining == pytest.approx(2 * 600 + 187)
 
     def test_last_five_minutes_detectable(self):
         gs = self._schedule_with_event(self._event("2:30", 4))
-        remaining = gs.get_game_time_remaining("wnba", "phx", "lv")
+        remaining = gs.get_game_time_remaining("wnba", "phx", "las")
         assert remaining == pytest.approx(150)
         assert remaining < 300  # the safety gate can actually fire now
 
@@ -3977,7 +3977,7 @@ class TestClockParsingFix:
         ev = self._event(None, 0)
         del ev["status"]["displayClock"]
         gs = self._schedule_with_event(ev)
-        assert gs.get_game_time_remaining("wnba", "phx", "lv") == 0.0
+        assert gs.get_game_time_remaining("wnba", "phx", "las") == 0.0
 
     def test_clockless_sport_returns_none(self):
         gs = self._schedule_with_event(self._event("0:00", 7, away="TOR", home="SD"))
@@ -4107,3 +4107,99 @@ class TestJul12Regressions:
         cache.set_time(datetime.now(timezone.utc))
         sig = odds_value_signal(snap, signal_config, cache)
         assert sig.confidence > 0
+
+
+# ============================================================================
+# Live-specific validation (validate_live_trade)
+# ============================================================================
+
+from bot.strategies.trade_filter import validate_live_trade, get_live_signal
+
+
+class TestLiveValidation:
+    def _snap(self, price=0.40, depth=800):
+        return MarketSnapshot(
+            market_id="m", token_id="t", question="q", price=price,
+            volume_24h=5000, liquidity=5000,
+            order_book=OrderBook(
+                bids=[OrderBookLevel(price=price - 0.02, size=depth)],
+                asks=[OrderBookLevel(price=price + 0.02, size=depth)]),
+            price_history=[price] * 20, timestamp=datetime.now(timezone.utc),
+            slug="aec-wnba-chi-dal-2026-07-13",
+        )
+
+    def _sig(self, edge=0.08, **kw):
+        base = dict(market_id="m", token_id="t", side="buy",
+                    estimated_prob=0.48, market_price=0.40, edge=edge,
+                    position_size_usd=0, slug="aec-wnba-chi-dal-2026-07-13",
+                    exec_price=0.42, net_edge=0.05, spread=0.04)
+        base.update(kw)
+        return TradeSignal(**base)
+
+    def _live(self, age=10.0, divergence=0.08):
+        return Signal(name="live_win_prob", value=0.48, confidence=0.9,
+                      metadata={"age_seconds": age, "edge": divergence})
+
+    def _validate(self, **kw):
+        args = dict(signal=self._sig(), snapshot=self._snap(),
+                    live_signal=self._live(), open_game_ids=set(),
+                    game_id="g1", daily_trades=0, max_daily_trades=5,
+                    game_time_remaining=1200.0, game_total_seconds=2400.0,
+                    max_spread=0.10, min_net_edge=0.02)
+        args.update(kw)
+        return validate_live_trade(**args)
+
+    def test_midgame_fresh_sane_passes(self):
+        assert self._validate() is None
+
+    def test_stale_model_rejected(self):
+        r = self._validate(live_signal=self._live(age=90))
+        assert r is not None and "stale" in r
+
+    def test_divergence_red_flag_rejected(self):
+        """Sky@Wings case: 24.9% model vs 13c market = 11.9% divergence
+        passes the 15% cap, but a 20%+ gap must be refused as bait."""
+        r = self._validate(live_signal=self._live(divergence=0.20))
+        assert r is not None and "red_flag" in r
+
+    def test_last_five_minutes_rejected(self):
+        r = self._validate(game_time_remaining=200.0)
+        assert r is not None and "last_5_minutes" in r
+
+    def test_too_early_rejected(self):
+        # 2400s game, 2200 remaining -> only 200s elapsed
+        r = self._validate(game_time_remaining=2200.0)
+        assert r is not None and "too_early" in r
+
+    def test_no_books_required_for_live(self):
+        """The whole point: mid-game there is no pregame book consensus,
+        and the live checklist must not demand one."""
+        assert self._validate() is None  # no num_books arg exists at all
+
+    def test_clockless_late_inning_rejected(self):
+        r = self._validate(game_time_remaining=None, game_total_seconds=None,
+                           game_period=8)
+        assert r is not None and "period_8" in r
+
+    def test_clockless_mid_inning_passes(self):
+        assert self._validate(game_time_remaining=None,
+                              game_total_seconds=None, game_period=5) is None
+
+    def test_no_phase_info_fails_closed(self):
+        r = self._validate(game_time_remaining=None, game_total_seconds=None,
+                           game_period=None)
+        assert r is not None and "no_game_phase" in r
+
+    def test_market_quality_gates_still_apply(self):
+        r = self._validate(snapshot=self._snap(depth=100))   # thin book
+        assert r is not None and "liquidity" in r
+        r = self._validate(signal=self._sig(net_edge=0.005))
+        assert r is not None and "net_edge" in r
+
+    def test_get_live_signal_routing(self):
+        sig = self._sig()
+        assert get_live_signal(sig) is None                  # no live signal
+        sig.signals = [self._live()]
+        assert get_live_signal(sig) is not None
+        sig.signals = [Signal(name="live_win_prob", value=0.5, confidence=0.0)]
+        assert get_live_signal(sig) is None                  # stale = absent

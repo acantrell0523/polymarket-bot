@@ -153,11 +153,15 @@ class GameSchedule:
 
         return False, "all_games_finished"
 
-    def get_game_time_remaining(self, sport: str, home_abbr: str, away_abbr: str) -> Optional[float]:
-        """Get seconds remaining in a game. Returns None if not live or unknown.
+    def _find_live_event(self, sport: str, home_abbr: str, away_abbr: str):
+        """Find the in-progress ESPN event for a team pair, or None.
 
-        Used for last-5-minutes blocking.
+        Caller abbrs are in the recorder's NORMALIZED space (slug abbrs like
+        gsv/conn/cws); ESPN scoreboards carry raw abbrs (gs/con/chw), so both
+        sides are normalized before comparing. Ordering-insensitive.
         """
+        from bot.leagues import normalize_abbr
+
         events = self._get_events(sport)
         for event in events:
             status = event.get("status", {}).get("type", {})
@@ -167,8 +171,10 @@ class GameSchedule:
             comps = event.get("competitions", [{}])[0]
             competitors = comps.get("competitors", [])
 
-            # Match teams
-            abbrs = [c.get("team", {}).get("abbreviation", "").lower() for c in competitors]
+            abbrs = [
+                normalize_abbr(sport, c.get("team", {}).get("abbreviation", "").lower())
+                for c in competitors
+            ]
             h_known = TEAM_ABBREVS.get(home_abbr, "")
             a_known = TEAM_ABBREVS.get(away_abbr, "")
             names = [c.get("team", {}).get("displayName", "").lower() for c in competitors]
@@ -180,8 +186,29 @@ class GameSchedule:
                 if any(h_known in n for n in names) and any(a_known in n for n in names):
                     matched = True
 
-            if not matched:
-                continue
+            if matched:
+                return event
+        return None
+
+    def get_game_period(self, sport: str, home_abbr: str, away_abbr: str) -> Optional[int]:
+        """Current period/quarter/inning of a LIVE game, or None.
+
+        The clockless-sport analog of the game clock: MLB live entries are
+        gated on inning (see trading.live_clockless_max_period).
+        """
+        event = self._find_live_event(sport, home_abbr, away_abbr)
+        if event is None:
+            return None
+        period = int(event.get("status", {}).get("period") or 0)
+        return period if period > 0 else None
+
+    def get_game_time_remaining(self, sport: str, home_abbr: str, away_abbr: str) -> Optional[float]:
+        """Get seconds remaining in a game. Returns None if not live or unknown.
+
+        Used for last-5-minutes blocking.
+        """
+        event = self._find_live_event(sport, home_abbr, away_abbr)
+        if event is not None:
 
             # AUDIT #7 FIX: displayClock and period live on event["status"],
             # NOT on status["type"] (verified against a live payload

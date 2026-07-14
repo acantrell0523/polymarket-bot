@@ -71,6 +71,24 @@ class TradingConfig:
     # Widest acceptable bid-ask spread (absolute, in price units). A book wider
     # than this cannot be exited cleanly, so we never enter it.
     max_spread: float = 0.10
+    # --- Live in-game validation (validate_live_trade) ---
+    # Mid-game trades can't use the pregame checklist: books pull their lines
+    # at tip-off, so the >=2-books rule blocked every live trade. Instead the
+    # ESPN win-prob model is the external validation, gated by:
+    # Freshness: model data older than this gets no trade (stale model during
+    # a live game is misinformation, not reduced information).
+    max_live_model_age_seconds: float = 45.0
+    # Divergence sanity cap: a model-vs-market gap LARGER than this is a red
+    # flag, not an opportunity — verified on Sky@Wings Q4 1:20 (model 24.9%
+    # vs market 13%: the market was right, Chicago lost). Genuine repricing
+    # lag lives in single digits.
+    max_live_divergence: float = 0.15
+    # Game-phase window: skip the chaotic opening minutes (model warming up)
+    # and rely on the existing last-5-minutes block for the endgame.
+    live_min_elapsed_seconds: float = 300.0
+    # Clockless sports (baseball): no clock to gate on, so block entries from
+    # this period (inning) onward — late innings are the endgame equivalent.
+    live_clockless_max_period: int = 7
 
 
 # Default per-market-type weights — must stay in sync with WEIGHTS in estimator.py

@@ -338,7 +338,10 @@ class TradingBot:
         """
         import time as _time
         from bot.edge_log import extract_game_id, get_open_game_ids
-        from bot.strategies.trade_filter import validate_trade, rank_opportunities, get_league_from_slug
+        from bot.strategies.trade_filter import (
+            validate_trade, validate_live_trade, get_live_signal,
+            rank_opportunities, get_league_from_slug,
+        )
 
         # Collect all edges
         opportunities = []
@@ -409,26 +412,70 @@ class TradingBot:
             trade_signal.spread = breakdown.spread
             trade_signal.fee_rate = breakdown.fee_rate
 
-            # Full validation checklist (thresholds config-driven)
-            rejection = validate_trade(
-                signal=trade_signal,
-                snapshot=snapshot,
-                num_books=num_books,
-                # get_open_game_ids returns a dict (game_id -> slugs); union
-                # with the set of games opened this cycle needs its keys.
-                # (dict | set raised TypeError and killed every cycle that
-                # found an opportunity — 1,433 scan_cycle_errors on Jul 12.)
-                open_game_ids=set(open_games) | games_opening,
-                game_id=game_id,
-                daily_trades=self.risk.daily_trade_count,
-                max_daily_trades=tcfg.max_daily_trades,
-                game_time_remaining=game_time_remaining,
-                min_price=tcfg.min_price,
-                max_price=tcfg.max_price,
-                min_liquidity_usd=tcfg.min_book_liquidity_usd,
-                max_spread=tcfg.max_spread,
-                min_net_edge=tcfg.min_net_edge,
-            )
+            # get_open_game_ids returns a dict (game_id -> slugs); union
+            # with the set of games opened this cycle needs its keys.
+            # (dict | set raised TypeError and killed every cycle that
+            # found an opportunity — 1,433 scan_cycle_errors on Jul 12.)
+            merged_open_games = set(open_games) | games_opening
+
+            # ROUTE: mid-game opportunities validated by the live model get
+            # the live checklist (books pull lines at tip-off, so the pregame
+            # >=2-books rule rejected every live trade); everything else uses
+            # the pregame checklist unchanged.
+            live_signal = get_live_signal(trade_signal)
+            if live_signal is not None and getattr(snapshot, "is_live", False):
+                validation_path = "live"
+                # Total game seconds from the league registry (elapsed-time
+                # window); None for clockless sports, which gate on period.
+                from bot.leagues import LEAGUES as _LEAGUES
+                clock_info = (_LEAGUES.get(league) or {}).get("clock")
+                game_total_seconds = (
+                    clock_info["periods"] * clock_info["minutes"] * 60
+                    if clock_info else None
+                )
+                game_period = None
+                if clock_info is None and len(parts) >= 4:
+                    game_period = self.game_schedule.get_game_period(
+                        league, parts[2], parts[3]
+                    )
+                rejection = validate_live_trade(
+                    signal=trade_signal,
+                    snapshot=snapshot,
+                    live_signal=live_signal,
+                    open_game_ids=merged_open_games,
+                    game_id=game_id,
+                    daily_trades=self.risk.daily_trade_count,
+                    max_daily_trades=tcfg.max_daily_trades,
+                    game_time_remaining=game_time_remaining,
+                    game_period=game_period,
+                    game_total_seconds=game_total_seconds,
+                    min_price=tcfg.min_price,
+                    max_price=tcfg.max_price,
+                    min_liquidity_usd=tcfg.min_book_liquidity_usd,
+                    max_spread=tcfg.max_spread,
+                    min_net_edge=tcfg.min_net_edge,
+                    max_model_age_seconds=tcfg.max_live_model_age_seconds,
+                    max_divergence=tcfg.max_live_divergence,
+                    min_elapsed_seconds=tcfg.live_min_elapsed_seconds,
+                    clockless_max_period=tcfg.live_clockless_max_period,
+                )
+            else:
+                validation_path = "pregame"
+                rejection = validate_trade(
+                    signal=trade_signal,
+                    snapshot=snapshot,
+                    num_books=num_books,
+                    open_game_ids=merged_open_games,
+                    game_id=game_id,
+                    daily_trades=self.risk.daily_trade_count,
+                    max_daily_trades=tcfg.max_daily_trades,
+                    game_time_remaining=game_time_remaining,
+                    min_price=tcfg.min_price,
+                    max_price=tcfg.max_price,
+                    min_liquidity_usd=tcfg.min_book_liquidity_usd,
+                    max_spread=tcfg.max_spread,
+                    min_net_edge=tcfg.min_net_edge,
+                )
 
             if rejection:
                 self.logger.info("trade_rejected", {
@@ -438,7 +485,8 @@ class TradingBot:
                     "side": trade_signal.side,
                     "reason": rejection,
                 })
-                self._log_decision(trade_signal, snapshot, "rejected", rejection)
+                self._log_decision(trade_signal, snapshot, "rejected",
+                                   f"[{validation_path}] {rejection}")
                 continue
 
             exposure = self.portfolio.get_total_exposure()
@@ -458,7 +506,8 @@ class TradingBot:
                 self.risk.record_trade_opened()
                 games_opening.add(game_id)
                 self._log_edge_entry(trade_signal, snapshot)
-                self._log_decision(trade_signal, snapshot, "executed", "all_checks_passed")
+                self._log_decision(trade_signal, snapshot, "executed",
+                                   f"[{validation_path}] all_checks_passed")
 
                 self.logger.info("sniper_trade_executed", {
                     "slug": trade_signal.slug,
