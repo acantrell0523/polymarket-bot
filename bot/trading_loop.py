@@ -238,6 +238,12 @@ class TradingBot:
         self._game_entry_counts: Dict[str, int] = {}
         self._game_stop_counts: Dict[str, int] = {}
         self._pending_live_edges: Dict[str, tuple] = {}  # slug -> (side, first_seen_ts)
+        # decision_log dedup: (slug,decision,reason) -> last-logged ts. A
+        # locked-out or 1-book market re-evaluates every 3s and would flood
+        # the table with identical rows (231 of 265 today), making CLV/edge
+        # analysis impossible. Log a repeat only after this cooldown.
+        self._decision_dedup: Dict[tuple, float] = {}
+        self._decision_dedup_seconds = 900  # 15 min
         self._restore_game_discipline_counts()
 
         # Slugs we've already auto-settled — persisted to file so it survives restarts
@@ -585,8 +591,23 @@ class TradingBot:
                                    "order_not_filled_or_error")
 
     def _log_decision(self, trade_signal, snapshot, decision: str, reason: str):
-        """Write one decision audit row. Never allowed to break trading."""
+        """Write one decision audit row. Never allowed to break trading.
+
+        Deduplicated: an identical (slug, decision, reason) is written at most
+        once per _decision_dedup_seconds, so repeated per-scan rejections
+        (game_lockout, only_1_books) don't drown the executed/novel decisions
+        the paper-validation analysis actually needs. 'executed' is NEVER
+        deduped — every real trade is always recorded.
+        """
         try:
+            import time as _time
+            if decision != "executed":
+                key = (trade_signal.slug, decision, reason)
+                last = self._decision_dedup.get(key, 0)
+                now_ts = _time.time()
+                if now_ts - last < self._decision_dedup_seconds:
+                    return
+                self._decision_dedup[key] = now_ts
             import json as _json
             from bot.trade_db import insert_decision
             from bot.signals.estimator import detect_market_type
