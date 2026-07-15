@@ -272,6 +272,66 @@ def liquidity_imbalance_signal(snapshot: MarketSnapshot, config: SignalConfig) -
     )
 
 
+def derivative_line_signal(
+    snapshot: MarketSnapshot,
+    config: SignalConfig,
+    line_aggregator=None,
+) -> Signal:
+    """Book consensus for SPREAD/TOTAL markets — the primary external signal
+    for derivative slugs (asc-/tsc- families).
+
+    Verified semantics (2026-07-14): spread YES = first-listed team covers
+    the signed line; total YES = over. The moneyline consensus is the WRONG
+    reference for these markets (it produced 8-13% phantom edges on Jul 12);
+    this signal compares against the book line at the SAME points instead.
+
+    Confidence mirrors odds_value conventions: scales with distinct books
+    quoting this exact line and with edge size, so the >=2 books validation
+    rule keeps single-book lines from trading large.
+    """
+    neutral = Signal(name="derivative_line", value=0.5, confidence=0.0,
+                     direction="neutral", metadata={"reason": "no_line_data"})
+    if line_aggregator is None:
+        return neutral
+
+    from bot.leagues import parse_derivative_slug, LEAGUES
+    parsed = parse_derivative_slug(snapshot.slug)
+    if not parsed:
+        neutral.metadata["reason"] = "not_derivative_slug"
+        return neutral
+
+    sport_key = (LEAGUES.get(parsed["league"]) or {}).get("odds_api_key")
+    if not sport_key:
+        return neutral
+
+    try:
+        result = line_aggregator.find_line(
+            sport_key, parsed["away"], parsed["home"],
+            parsed["kind"], parsed["line"],
+        )
+    except Exception as e:
+        neutral.metadata["reason"] = f"line_lookup_failed: {e}"
+        return neutral
+    if result is None:
+        neutral.metadata["reason"] = "line_not_quoted"
+        return neutral
+
+    prob, num_books = result
+    prob = max(0.01, min(0.99, prob))
+    edge = prob - snapshot.price
+    confidence = min(num_books / 2, 1.0) * min(abs(edge) * 5, 1.0)
+    confidence = max(0.1, min(confidence, 0.9))
+
+    return Signal(
+        name="derivative_line",
+        value=float(prob),
+        confidence=float(confidence),
+        direction="bullish" if edge > 0 else "bearish" if edge < 0 else "neutral",
+        metadata={"edge": edge, "num_books": num_books,
+                  "kind": parsed["kind"], "line": parsed["line"]},
+    )
+
+
 def live_win_prob_signal(
     snapshot: MarketSnapshot,
     config: SignalConfig,

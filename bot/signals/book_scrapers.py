@@ -179,6 +179,22 @@ class FanDuelClient:
         self._cache[sport_key] = (now, results)
         return results
 
+    def get_lines(self, sport_key: str) -> List[dict]:
+        """Spread/total lines (best-effort; see _fanduel_lines_from_payload)."""
+        now = time.time()
+        ck = f"lines_{sport_key}"
+        if ck in self._cache:
+            ts, data = self._cache[ck]
+            if now - ts < self.cache_ttl:
+                return data
+        fd_sport = FANDUEL_SPORTS.get(sport_key)
+        if not fd_sport:
+            return []
+        raw = self._fetch(fd_sport)
+        rows = _fanduel_lines_from_payload(raw) if raw else []
+        self._cache[ck] = (now, rows)
+        return rows
+
     def _parse(self, data: dict) -> List[dict]:
         """Parse FanDuel response into normalized odds."""
         attachments = data.get("attachments", {})
@@ -243,6 +259,75 @@ class FanDuelClient:
             })
 
         return results
+
+
+def _fanduel_lines_from_payload(data: dict) -> List[dict]:
+    """Best-effort FanDuel spread/total extraction.
+
+    UNVERIFIED against live game payloads (built during the All-Star break
+    when only futures were listed) — shapes are guarded so mismatches
+    return nothing instead of wrong lines. Verify on Friday's MLB slate.
+    """
+    rows: List[dict] = []
+    try:
+        attachments = data.get("attachments", {})
+        events = attachments.get("events", {})
+        markets = attachments.get("markets", {})
+        event_map = {}
+        for eid, ev in events.items():
+            name = ev.get("name", "")
+            if " @ " in name or " v " in name:
+                parts = name.replace(" v ", " @ ").split(" @ ")
+                if len(parts) == 2:
+                    event_map[str(ev.get("eventId", eid))] = {
+                        "away_team": parts[0].strip(),
+                        "home_team": parts[1].strip(),
+                    }
+        for mid, mkt in markets.items():
+            mname = mkt.get("marketName", "").lower()
+            teams = event_map.get(str(mkt.get("eventId", "")))
+            if not teams:
+                continue
+            runners = mkt.get("runners", [])
+            if len(runners) != 2:
+                continue
+
+            def _prob(r):
+                odds = r.get("winRunnerOdds", {}).get(
+                    "americanDisplayOdds", {}).get("americanOdds")
+                return american_to_prob(int(odds)) if odds is not None else None
+
+            if "run line" in mname or "runline" in mname:
+                away_r = next((r for r in runners
+                               if teams["away_team"].lower() in r.get("runnerName", "").lower()), None)
+                home_r = next((r for r in runners
+                               if teams["home_team"].lower() in r.get("runnerName", "").lower()), None)
+                if not away_r or not home_r:
+                    continue
+                pa, ph = _prob(away_r), _prob(home_r)
+                hcp = away_r.get("handicap")
+                if pa is None or ph is None or hcp is None or pa + ph <= 0:
+                    continue
+                rows.append({"book": "fanduel", **teams, "kind": "spread",
+                             "away_points": float(hcp),
+                             "prob_away": pa / (pa + ph)})
+            elif mname.startswith("total") or "total runs" in mname:
+                over_r = next((r for r in runners
+                               if r.get("runnerName", "").lower().startswith("over")), None)
+                under_r = next((r for r in runners
+                                if r.get("runnerName", "").lower().startswith("under")), None)
+                if not over_r or not under_r:
+                    continue
+                po, pu = _prob(over_r), _prob(under_r)
+                hcp = over_r.get("handicap")
+                if po is None or pu is None or hcp is None or po + pu <= 0:
+                    continue
+                rows.append({"book": "fanduel", **teams, "kind": "total",
+                             "points": float(hcp),
+                             "prob_over": po / (po + pu)})
+    except Exception:
+        return []
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -316,14 +401,107 @@ class PinnacleClient:
         ]
         return ids[:TENNIS_MAX_TOURNAMENTS]
 
-    def _fetch_league(self, league_id: int) -> List[dict]:
+    def _fetch_league_raw(self, league_id: int):
         matchups_raw = self._get(f"{PINNACLE_BASE}/leagues/{league_id}/matchups")
         if not matchups_raw:
-            return []
+            return None, None
         markets_raw = self._get(f"{PINNACLE_BASE}/leagues/{league_id}/markets/straight")
         if not markets_raw:
+            return None, None
+        return matchups_raw, markets_raw
+
+    def _fetch_league(self, league_id: int) -> List[dict]:
+        matchups_raw, markets_raw = self._fetch_league_raw(league_id)
+        if not matchups_raw:
             return []
         return self._parse(matchups_raw, markets_raw)
+
+    def _build_matchup_map(self, matchups: list) -> Dict:
+        matchup_map = {}
+        for m in matchups:
+            participants = m.get("participants", [])
+            home = away = ""
+            for pt in participants:
+                if pt.get("alignment") == "home":
+                    home = pt.get("name", "")
+                elif pt.get("alignment") == "away":
+                    away = pt.get("name", "")
+            if home and away:
+                matchup_map[m.get("id")] = {"home_team": home, "away_team": away}
+        return matchup_map
+
+    def _parse_lines(self, matchups: list, markets: list) -> List[dict]:
+        """Extract spread/total lines (INCLUDING alternates — Polymarket
+        lists a ladder of lines per game, so alternates are needed to match).
+
+        Row shapes (probabilities de-vigged so each pair sums to 1):
+          {"book","home_team","away_team","kind":"spread",
+           "away_points": +1.5, "prob_away": P(away covers away_points)}
+          {"book","home_team","away_team","kind":"total",
+           "points": 8.0, "prob_over": P(total > points)}
+        """
+        matchup_map = self._build_matchup_map(matchups)
+        rows: List[dict] = []
+        for mkt in markets:
+            if mkt.get("period") != 0 or mkt.get("status") not in (None, "open"):
+                continue
+            teams = matchup_map.get(mkt.get("matchupId"))
+            if not teams:
+                continue
+            prices = {p.get("designation"): p for p in mkt.get("prices", [])}
+            if mkt.get("type") == "spread":
+                h, a = prices.get("home"), prices.get("away")
+                if not h or not a:
+                    continue
+                ph = american_to_prob(int(h.get("price", 0)))
+                pa = american_to_prob(int(a.get("price", 0)))
+                if ph + pa <= 0:
+                    continue
+                rows.append({
+                    "book": self.name, **teams, "kind": "spread",
+                    "away_points": float(a.get("points", 0)),
+                    "prob_away": pa / (ph + pa),
+                })
+            elif mkt.get("type") == "total":
+                o, u = prices.get("over"), prices.get("under")
+                if not o or not u:
+                    continue
+                po = american_to_prob(int(o.get("price", 0)))
+                pu = american_to_prob(int(u.get("price", 0)))
+                if po + pu <= 0:
+                    continue
+                rows.append({
+                    "book": self.name, **teams, "kind": "total",
+                    "points": float(o.get("points", 0)),
+                    "prob_over": po / (po + pu),
+                })
+        return rows
+
+    def get_lines(self, sport_key: str) -> List[dict]:
+        """Spread/total lines for a sport (same league resolution as odds)."""
+        now = time.time()
+        ck = f"lines_{sport_key}"
+        if ck in self._cache:
+            ts, data = self._cache[ck]
+            if now - ts < self.cache_ttl:
+                return data
+
+        if sport_key in TENNIS_CIRCUIT_PREFIXES:
+            league_ids = self._tennis_league_ids(sport_key)
+        else:
+            lid = PINNACLE_LEAGUES.get(sport_key)
+            league_ids = [lid] if lid else []
+
+        rows: List[dict] = []
+        for lid in league_ids:
+            try:
+                matchups_raw, markets_raw = self._fetch_league_raw(lid)
+                if matchups_raw:
+                    rows.extend(self._parse_lines(matchups_raw, markets_raw))
+            except Exception:
+                continue
+        self._cache[ck] = (now, rows)
+        return rows
 
     def get_odds(self, sport_key: str) -> List[dict]:
         """Get moneyline odds. Returns list of event dicts."""
@@ -581,6 +759,66 @@ class MultiBookAggregator:
         h = home.lower().split()[0] if home else ""
         a = away.lower().split()[0] if away else ""
         return f"{a}@{h}" if h and a else ""
+
+    def get_lines(self, sport_key: str) -> List[dict]:
+        """Spread/total line rows from all books (cached)."""
+        now = time.time()
+        ck = f"lines_{sport_key}"
+        if ck in self._cache:
+            ts, data = self._cache[ck]
+            if now - ts < self.cache_ttl:
+                return data
+        rows: List[dict] = []
+        for client in (self.fanduel, self.pinnacle):
+            try:
+                rows.extend(client.get_lines(sport_key))
+            except Exception:
+                pass
+        self._cache[ck] = (now, rows)
+        return rows
+
+    def find_line(self, sport_key: str, away_abbr: str, home_abbr: str,
+                  kind: str, line: float) -> Optional[Tuple[float, int]]:
+        """Book probability for a derivative market's YES side.
+
+        Polymarket semantics (verified 2026-07-14):
+          spread: YES = FIRST-listed (away) team covers `line` (signed) —
+                  matched against the away side's points on each book row.
+          total:  YES = OVER `line`.
+
+        Returns (mean de-vigged prob across DISTINCT books quoting exactly
+        this line, num_books) or None.
+        """
+        probs: Dict[str, float] = {}   # book -> prob (dedup per book)
+        for row in self.get_lines(sport_key):
+            if row.get("kind") != kind:
+                continue
+            h = _match_abbr(row.get("home_team", ""), sport_key)
+            a = _match_abbr(row.get("away_team", ""), sport_key)
+            if not ((h == home_abbr and a == away_abbr)
+                    or (h == away_abbr and a == home_abbr)):
+                continue
+            flipped = (h == away_abbr and a == home_abbr)
+            book = row.get("book", "unknown")
+            if kind == "spread":
+                pts = row.get("away_points")
+                prob = row.get("prob_away")
+                if flipped:
+                    # row's away is OUR home: our away's points/prob mirror
+                    pts = -pts if pts is not None else None
+                    prob = 1 - prob if prob is not None else None
+                if pts is None or prob is None or abs(pts - line) > 0.01:
+                    continue
+                probs.setdefault(book, prob)
+            else:  # total — orientation-independent
+                if row.get("points") is None or abs(row["points"] - line) > 0.01:
+                    continue
+                if row.get("prob_over") is None:
+                    continue
+                probs.setdefault(book, row["prob_over"])
+        if not probs:
+            return None
+        return sum(probs.values()) / len(probs), len(probs)
 
     def find_game(self, sport_key: str, home_abbr: str, away_abbr: str) -> Optional[dict]:
         """Find consensus for a specific game by team abbreviations."""

@@ -178,3 +178,57 @@ def game_seconds_remaining(league: str, period: int, clock_seconds: float) -> Op
     # Count-down clocks: remaining = full future periods + current clock
     periods_left = max(0, clock["periods"] - period)
     return periods_left * period_seconds + clock_seconds
+
+
+def parse_derivative_slug(slug: str) -> Optional[Dict]:
+    """Parse a spread/total slug into its components, or None.
+
+    Verified semantics (live market questions, 2026-07-14):
+      asc-mlb-tor-sd-2026-07-11-neg-1pt5
+        -> spread; YES = FIRST-listed team (tor) covers -1.5
+           ("Will the American League cover -2.5 vs ...?")
+      tsc-mlb-tor-sd-2026-07-11-8pt5
+        -> total; YES = OVER 8.5
+           ("Will the total ... be MORE than 5.5?")
+
+    Returns {"league", "away", "home", "kind": "spread"|"total",
+             "line": float (signed for spreads, threshold for totals)}.
+    """
+    parts = slug.lower().split("-")
+    if len(parts) < 8 or parts[0] not in ("asc", "tsc"):
+        return None
+    league = parts[1]
+    if league not in LEAGUES:
+        return None
+    away, home, year = parts[2], parts[3], parts[4]
+    if not (away.isalpha() and home.isalpha()):
+        return None
+    if not (len(year) == 4 and year.isdigit()):
+        return None
+
+    def _num(token: str) -> Optional[float]:
+        try:
+            return float(token.replace("pt", "."))
+        except ValueError:
+            return None
+
+    if parts[0] == "asc":
+        # ...-{neg|pos}-{XptY}
+        if len(parts) != 9 or parts[7] not in ("neg", "pos"):
+            return None
+        line = _num(parts[8])
+        if line is None:
+            return None
+        if parts[7] == "neg":
+            line = -line
+        return {"league": league, "away": away, "home": home,
+                "kind": "spread", "line": line}
+
+    # tsc: ...-{XptY}
+    if len(parts) != 8:
+        return None
+    line = _num(parts[7])
+    if line is None:
+        return None
+    return {"league": league, "away": away, "home": home,
+            "kind": "total", "line": line}

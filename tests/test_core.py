@@ -4312,3 +4312,149 @@ class TestTennisSupport:
         slug = "aec-itfme-timleg-jusrob-2026-07-14"
         assert get_league_from_slug(slug) == "itfme"
         assert get_league_min_edge(slug) >= 0.05   # default floor applies
+
+
+# ============================================================================
+# MLB run lines & totals (derivative markets: asc-/tsc- families)
+# ============================================================================
+
+from bot.leagues import parse_derivative_slug
+from bot.signals.signals import derivative_line_signal
+
+
+class TestDerivativeSlugParsing:
+    def test_spread_semantics_verified_live(self):
+        # "Will American League cover -2.5 vs National League?" (2026-07-14)
+        assert parse_derivative_slug("asc-mlb-tor-sd-2026-07-11-neg-1pt5") == {
+            "league": "mlb", "away": "tor", "home": "sd",
+            "kind": "spread", "line": -1.5}
+        assert parse_derivative_slug("asc-mlb-al-nl-2026-07-14-pos-1pt5")["line"] == 1.5
+
+    def test_total_semantics_verified_live(self):
+        # "Will total ... be MORE than 8.5?" — YES = over
+        assert parse_derivative_slug("tsc-mlb-tor-sd-2026-07-11-8pt5") == {
+            "league": "mlb", "away": "tor", "home": "sd",
+            "kind": "total", "line": 8.5}
+
+    def test_non_derivative_slugs_none(self):
+        assert parse_derivative_slug("aec-mlb-tor-sd-2026-07-11") is None
+        assert parse_derivative_slug("astatc-ufc-a-b-2026-07-11-mov-f1-ko") is None
+        assert parse_derivative_slug("asc-xyz-a-b-2026-07-11-neg-1pt5") is None
+
+
+def _pinnacle_line_payload():
+    """Shapes copied from a live /markets/straight fetch (2026-07-14)."""
+    matchups = [{"id": 777, "participants": [
+        {"alignment": "home", "name": "San Diego Padres"},
+        {"alignment": "away", "name": "Toronto Blue Jays"},
+    ]}]
+    markets = [
+        {"matchupId": 777, "period": 0, "type": "spread", "status": "open",
+         "prices": [{"designation": "home", "points": -1.5, "price": 158},
+                    {"designation": "away", "points": 1.5, "price": -177}]},
+        {"matchupId": 777, "period": 0, "type": "total", "status": "open",
+         "prices": [{"designation": "over", "points": 8.0, "price": -114},
+                    {"designation": "under", "points": 8.0, "price": 101}]},
+        # alternate line — must also be captured (PM lists line ladders)
+        {"matchupId": 777, "period": 0, "type": "spread", "status": "open",
+         "isAlternate": True,
+         "prices": [{"designation": "home", "points": -2.5, "price": 250},
+                    {"designation": "away", "points": 2.5, "price": -310}]},
+        # wrong period — must be skipped
+        {"matchupId": 777, "period": 1, "type": "spread", "status": "open",
+         "prices": [{"designation": "home", "points": -0.5, "price": 100},
+                    {"designation": "away", "points": 0.5, "price": -120}]},
+    ]
+    return matchups, markets
+
+
+class TestPinnacleLineParsing:
+    def test_parse_lines_devigs_and_includes_alternates(self):
+        client = PinnacleClient(cache_ttl=999)
+        rows = client._parse_lines(*_pinnacle_line_payload())
+        spreads = [r for r in rows if r["kind"] == "spread"]
+        totals = [r for r in rows if r["kind"] == "total"]
+        assert len(spreads) == 2         # main + alternate, period-1 skipped
+        assert len(totals) == 1
+        main = next(r for r in spreads if r["away_points"] == 1.5)
+        # away -177 => 0.639 raw; home +158 => 0.388 raw; devig away = .622
+        assert main["prob_away"] == pytest.approx(0.6392 / (0.6392 + 0.3876), abs=0.01)
+        assert totals[0]["points"] == 8.0
+        # over -114 (0.533) vs under +101 (0.498) -> devig over ~0.517
+        assert totals[0]["prob_over"] == pytest.approx(0.517, abs=0.01)
+
+
+class TestFindLine:
+    def _agg(self):
+        from bot.signals.book_scrapers import MultiBookAggregator
+        agg = MultiBookAggregator(cache_ttl=999)
+        rows = PinnacleClient(cache_ttl=999)._parse_lines(*_pinnacle_line_payload())
+        agg.get_lines = lambda sk: rows
+        return agg
+
+    def test_spread_line_matched_by_away_points(self):
+        # PM slug asc-mlb-tor-sd-...-pos-1pt5: YES = tor (away) covers +1.5
+        result = self._agg().find_line("baseball_mlb", "tor", "sd", "spread", 1.5)
+        assert result is not None
+        prob, books = result
+        assert prob > 0.55          # away favored to cover +1.5
+        assert books == 1
+
+    def test_wrong_line_not_matched(self):
+        assert self._agg().find_line("baseball_mlb", "tor", "sd", "spread", -3.5) is None
+
+    def test_total_over_prob(self):
+        prob, books = self._agg().find_line("baseball_mlb", "tor", "sd", "total", 8.0)
+        assert prob == pytest.approx(0.517, abs=0.01)
+
+    def test_alternate_line_matched(self):
+        result = self._agg().find_line("baseball_mlb", "tor", "sd", "spread", 2.5)
+        assert result is not None
+        assert result[0] > 0.7      # away heavily favored at +2.5
+
+
+class TestDerivativeSignal:
+    def _snap(self, slug, price):
+        return MarketSnapshot(
+            market_id="m", token_id="t", question="q", price=price,
+            volume_24h=5000, liquidity=5000, order_book=OrderBook(),
+            price_history=[price] * 20, timestamp=datetime.now(timezone.utc),
+            slug=slug)
+
+    class _FakeLineAgg:
+        def __init__(self, prob, books=2):
+            self.prob, self.books = prob, books
+        def find_line(self, sport_key, away, home, kind, line):
+            return (self.prob, self.books)
+
+    def test_signal_value_and_edge(self, signal_config):
+        snap = self._snap("asc-mlb-tor-sd-2026-07-11-pos-1pt5", price=0.50)
+        sig = derivative_line_signal(snap, signal_config, self._FakeLineAgg(0.62))
+        assert sig.value == pytest.approx(0.62)
+        assert sig.metadata["edge"] == pytest.approx(0.12)
+        assert sig.metadata["num_books"] == 2
+        assert sig.confidence > 0
+
+    def test_no_aggregator_or_non_derivative_is_noop(self, signal_config):
+        snap = self._snap("asc-mlb-tor-sd-2026-07-11-pos-1pt5", 0.50)
+        assert derivative_line_signal(snap, signal_config, None).confidence == 0
+        snap2 = self._snap("aec-mlb-tor-sd-2026-07-11", 0.50)
+        sig = derivative_line_signal(snap2, signal_config, self._FakeLineAgg(0.62))
+        assert sig.confidence == 0
+
+    def test_estimator_uses_derivative_as_primary(self, signal_config):
+        """A spread market must trade against the BOOK LINE, never the
+        moneyline (Jul 12: moneyline matching produced 8-13% phantom edges)."""
+        est = ProbabilityEstimator(signal_config, odds_cache=None,
+                                   line_aggregator=self._FakeLineAgg(0.62))
+        snap = self._snap("asc-mlb-tor-sd-2026-07-11-pos-1pt5", price=0.50)
+        result = est.detect_edge(snap, min_edge=0.05, max_edge=0.40)
+        assert result is not None
+        assert result.side == "buy"
+        assert result.edge > 0.05
+
+    def test_derivative_blocked_without_line_data(self, signal_config):
+        est = ProbabilityEstimator(signal_config, odds_cache=None,
+                                   line_aggregator=None)
+        snap = self._snap("asc-mlb-tor-sd-2026-07-11-pos-1pt5", price=0.50)
+        assert est.detect_edge(snap, min_edge=0.05, max_edge=0.40) is None

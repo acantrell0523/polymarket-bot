@@ -24,6 +24,7 @@ from bot.signals.signals import (
     sports_context_signal,
     onchain_flow_signal,
     live_win_prob_signal,
+    derivative_line_signal,
 )
 from bot.signals.odds_api import OddsCache
 from bot.signals.cross_market import PredictItCache
@@ -60,6 +61,9 @@ WEIGHTS = {
         # weight only participates during live games — where it dominates
         # the pool (0.55 * conf 0.9 outweighs everything else combined).
         "live_win_prob": 0.55,
+        # Book consensus at the SAME spread/total line — primary for
+        # derivative (asc-/tsc-) markets; conf 0 everywhere else.
+        "derivative_line": 0.40,
     },
     "crypto": {
         "crypto_model": 0.45,
@@ -138,6 +142,7 @@ class ProbabilityEstimator:
         game_context_analyzer: Optional[GameContextAnalyzer] = None,
         onchain_client=None,
         live_cache=None,
+        line_aggregator=None,
     ):
         self.config = config
         self.odds_cache = odds_cache
@@ -148,6 +153,8 @@ class ProbabilityEstimator:
         self.onchain_client = onchain_client
         # LiveWinProbCache: ESPN in-game win probabilities (live-edge engine)
         self.live_cache = live_cache
+        # MultiBookAggregator: spread/total lines for derivative markets
+        self.line_aggregator = line_aggregator
 
     def compute_signals(self, snapshot: MarketSnapshot, market_type: str) -> List[Signal]:
         """Compute signals appropriate for the market type."""
@@ -172,6 +179,13 @@ class ProbabilityEstimator:
             # (confidence 0) pregame or without a live cache.
             if self.live_cache is not None and getattr(snapshot, "is_live", False):
                 signals.append(live_win_prob_signal(snapshot, self.config, self.live_cache))
+            # Derivative (spread/total) markets: book consensus at the same
+            # line is the primary; the moneyline consensus never applies.
+            if self.line_aggregator is not None:
+                from bot.leagues import parse_derivative_slug
+                if parse_derivative_slug(snapshot.slug):
+                    signals.append(derivative_line_signal(
+                        snapshot, self.config, self.line_aggregator))
         elif market_type == "crypto":
             signals.append(crypto_model_signal(snapshot, self.config, self.crypto_cache))
             signals.append(cross_market_signal(snapshot, self.config, self.predictit_cache))
@@ -218,6 +232,10 @@ class ProbabilityEstimator:
                          if s.name == "live_win_prob" and s.confidence > 0), None)
             if live is not None:
                 return live
+            deriv = next((s for s in signals
+                          if s.name == "derivative_line" and s.confidence > 0), None)
+            if deriv is not None:
+                return deriv
 
         primary_name = {
             "sports": "odds_value",

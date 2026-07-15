@@ -180,6 +180,10 @@ class TradingBot:
         from bot.signals.live_win_prob import LiveWinProbCache
         self.live_cache = LiveWinProbCache()
 
+        # Spread/total book lines (FanDuel + Pinnacle) for derivative markets
+        from bot.signals.book_scrapers import MultiBookAggregator
+        self.line_aggregator = MultiBookAggregator(cache_ttl=300)
+
         # Liveness + API health tracking (heartbeat file read by supervisor)
         self._data_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
         self.health = HealthMonitor(
@@ -249,7 +253,7 @@ class TradingBot:
         self.live_estimator = ProbabilityEstimator(
             live_signal_config, self.odds_cache, self.predictit_cache, self.crypto_cache,
             self.espn_cache, self.game_context, onchain_client=self.onchain_client,
-            live_cache=self.live_cache,
+            live_cache=self.live_cache, line_aggregator=self.line_aggregator,
         )
 
         # Live-game trading overrides — use same edge threshold as config
@@ -410,9 +414,18 @@ class TradingBot:
                                    f"max_entries_per_game_{tcfg.max_entries_per_game}_reached")
                 continue
 
-            # Get number of books for this market
-            consensus = self.odds_cache.get_consensus_odds(trade_signal.slug)
-            num_books = consensus.get("num_books", 0) if consensus else 0
+            # Get number of books for this market. Derivative markets carry
+            # their own book count (books quoting that exact line) on the
+            # derivative_line signal — the moneyline consensus lookup would
+            # return 0 for their slugs and wrongly block them.
+            deriv_sig = next((sg for sg in trade_signal.signals
+                              if sg.name == "derivative_line" and sg.confidence > 0),
+                             None)
+            if deriv_sig is not None:
+                num_books = int(deriv_sig.metadata.get("num_books", 0))
+            else:
+                consensus = self.odds_cache.get_consensus_odds(trade_signal.slug)
+                num_books = consensus.get("num_books", 0) if consensus else 0
 
             # Get game time remaining for last-5-minutes block
             league = get_league_from_slug(trade_signal.slug)
@@ -1188,9 +1201,11 @@ class TradingBot:
                     # game markets in registered leagues, plus non-sports
                     # markets (crypto/politics — no gameStartTime).
                     from bot.signals.live_win_prob import slug_game_teams
+                    from bot.leagues import parse_derivative_slug
                     scannable = [
                         m for m in markets
                         if slug_game_teams(m.get("slug", "")) is not None
+                        or parse_derivative_slug(m.get("slug", "")) is not None
                         or not m.get("gameStartTime")
                     ]
                     self.logger.info("full_scan_universe", {
