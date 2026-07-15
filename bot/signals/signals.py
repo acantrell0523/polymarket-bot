@@ -592,7 +592,8 @@ def crypto_model_signal(
         return Signal(name="crypto_model", value=0.5, confidence=0.0, direction="neutral",
                       metadata={"reason": "no_crypto_cache"})
 
-    result = crypto_cache.estimate_probability(snapshot.question, snapshot.price)
+    result = crypto_cache.estimate_probability(
+        snapshot.question, snapshot.price, slug=snapshot.slug)
     if result is None:
         return Signal(name="crypto_model", value=0.5, confidence=0.0, direction="neutral",
                       metadata={"reason": "no_crypto_match"})
@@ -603,11 +604,28 @@ def crypto_model_signal(
 
     value = max(0.01, min(0.99, model_prob))
 
-    # Confidence based on how much data we have and edge size
-    # Lower confidence for very long-dated markets (more uncertainty)
+    # Confidence — the external gate for crypto.
+    #  * time_confidence: long-dated barriers are inherently uncertain (vol
+    #    compounds), so trust them less.
+    #  * parse_confidence: a slug-parsed deadline is authoritative; a
+    #    question with NO date fell back to a 30-day GUESS (parse_source=
+    #    "question" + days_remaining==30) — that guess must NOT drive a
+    #    confident trade, so it's heavily discounted.
+    #  * A barrier probability that is essentially 0/1 (target already
+    #    touched, or wildly far) carries little tradeable signal — the edge
+    #    term handles that, but cap so a 90-point "edge" can't max out.
     days = meta.get("days_remaining", 30)
-    time_confidence = max(0.3, 1.0 - (days / 365))
-    confidence = min(abs(edge) * 4, 0.8) * time_confidence
+    time_confidence = max(0.3, 1.0 - (days / 730))   # decay over ~2yr, not 1yr
+    parse_confidence = 1.0
+    if meta.get("parse_source") == "question" and days == 30:
+        parse_confidence = 0.3   # 30-day default is a guess, not a deadline
+    confidence = min(abs(edge) * 4, 0.8) * time_confidence * parse_confidence
+    # Fat-tail guard: a GBM barrier model is LEAST reliable at the extremes
+    # (0/1 rails) — crypto's fat tails routinely violate log-normality there,
+    # so a model screaming "impossible/certain" is exactly where we should
+    # NOT bet big. Halve confidence when the model pins the rails.
+    if value <= 0.03 or value >= 0.97:
+        confidence *= 0.5
 
     direction = "bullish" if edge > 0.02 else "bearish" if edge < -0.02 else "neutral"
 

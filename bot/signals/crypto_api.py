@@ -35,6 +35,61 @@ DEFAULT_VOLATILITY = {
     "ripple": 0.90,
 }
 
+# Annualized-vol sanity band. Crypto majors realize ~0.4-1.0; the 30d
+# realized estimate can spike absurdly high (a single 30% day) or collapse
+# in a quiet month. The barrier/terminal models are VERY sensitive to vol
+# (σ√T is the whole distribution width), so clamp it.
+VOL_FLOOR = 0.30
+VOL_CAP = 2.50
+
+
+def _terminal_above_prob(S: float, K: float, T: float, vol: float) -> float:
+    """Risk-neutral P(S_T >= K) under GBM with r=0.
+
+    ln S_T = ln S_0 + (r - vol^2/2)T + vol*sqrt(T)*Z, r=0.
+    P(S_T >= K) = Phi( (ln(S/K) + (r - vol^2/2)T) / (vol*sqrt(T)) ).
+    (The old model used +vol^2/2 — WRONG SIGN — which overstated "above".)
+    """
+    nu = -0.5 * vol * vol
+    d = (math.log(S / K) + nu * T) / (vol * math.sqrt(T))
+    return _norm_cdf(d)
+
+
+def _barrier_hit_prob(S: float, K: float, T: float, vol: float, direction: str) -> float:
+    """P(price TOUCHES the barrier K at any time before T) — first passage.
+
+    Most Polymarket crypto markets are "will X hit $Y by date" TOUCH options,
+    not "be above $Y AT date" terminal options. For an out-of-the-money target
+    the touch probability is up to ~2x the terminal probability (reflection
+    principle), so terminal-pricing a touch market underprices YES massively.
+
+    Reflection principle for arithmetic BM X_t = nu*t + vol*B_t (X_0=0),
+    barrier level b = ln(K/S) in log space, nu = -vol^2/2 (r=0):
+      up-barrier (K>S, b>0):   P(max X >= b) = Phi((-b+nu T)/s) + e^(2 nu b/vol^2) Phi((-b-nu T)/s)
+      down-barrier (K<S, b<0): P(min X <= b) = Phi(( b-nu T)/s) + e^(2 nu b/vol^2) Phi(( b+nu T)/s)
+    with s = vol*sqrt(T). Driftless sanity: both reduce to 2*Phi(-|b|/s) = 2x terminal.
+    """
+    if direction == "above" and S >= K:
+        return 1.0   # already touched
+    if direction == "below" and S <= K:
+        return 1.0
+    nu = -0.5 * vol * vol
+    s = vol * math.sqrt(T)
+    b = math.log(K / S)
+    expo = max(-50.0, min(50.0, 2.0 * nu * b / (vol * vol)))  # guard overflow
+    if direction == "above":
+        p = _norm_cdf((-b + nu * T) / s) + math.exp(expo) * _norm_cdf((-b - nu * T) / s)
+    else:
+        p = _norm_cdf((b - nu * T) / s) + math.exp(expo) * _norm_cdf((b + nu * T) / s)
+    return max(0.0, min(1.0, p))
+
+
+def _last_day_of_month(year: int, month: int) -> int:
+    if month == 12:
+        return 31
+    from datetime import date
+    return (date(year, month + 1, 1) - __import__("datetime").timedelta(days=1)).day
+
 
 class CryptoCache:
     """Caches crypto price and volatility data from CoinGecko."""
@@ -97,82 +152,157 @@ class CryptoCache:
         self,
         question: str,
         polymarket_price: float,
+        slug: str = "",
     ) -> Optional[Tuple[float, Dict]]:
-        """Estimate the probability of a crypto price target being hit.
+        """Estimate the YES probability for a crypto price-target market.
 
-        Parses questions like:
-          "Will Bitcoin hit $100,000 by June 2026?"
-          "Will ETH be above $5000 on March 31?"
+        Handles both option styles, which the OLD model conflated:
+          * BARRIER / touch ("Will X hit/reach $Y by date"): P(touch <= T),
+            priced with the reflection principle. This is the DOMINANT
+            Polymarket style (cpc-btc-150k-12-31-2026: "When will Bitcoin
+            hit $150k?").
+          * TERMINAL ("Will X be above $Y ON date"): P(S_T >= K).
 
-        Uses a simple log-normal model:
-          P(S > K) = Φ((ln(S/K) + (r - σ²/2)T) / (σ√T))
+        Parsing is SLUG-FIRST: the live "hit" markets put the deadline (and
+        often the target) in the SLUG, not the question ("When will Bitcoin
+        hit $150k?" has no date). The old question-only parser defaulted to
+        30 days — catastrophically wrong for an 18-month barrier. Falls back
+        to question parsing when the slug isn't a recognizable cpc- slug.
 
-        Returns (probability, metadata) or None if we can't parse the question.
+        Returns (probability, metadata) or None if unparseable / no data.
         """
-        parsed = self._parse_crypto_question(question)
+        parsed = self._parse_crypto_slug(slug) if slug else None
+        source = "slug"
+        if not parsed:
+            parsed = self._parse_crypto_question(question)
+            source = "question"
         if not parsed:
             return None
 
-        coin_id, target_price, direction, days_remaining = parsed
+        coin_id, target_price, direction, days_remaining, is_barrier = parsed
 
         data = self.get_price_and_vol(coin_id)
         if not data:
             return None
-
         current_price, annual_vol = data
+        vol = max(VOL_FLOOR, min(VOL_CAP, annual_vol))
 
+        if current_price <= 0 or target_price <= 0:
+            return None
+
+        # Already resolved by deadline passing.
         if days_remaining <= 0:
-            # Already past deadline
             if direction == "above":
                 prob = 1.0 if current_price >= target_price else 0.0
             else:
                 prob = 1.0 if current_price <= target_price else 0.0
-            return (prob, {
-                "coin": coin_id, "current": current_price, "target": target_price,
-                "direction": direction, "days": 0, "model": "expired",
-            })
+            return (prob, {"coin": coin_id, "current_price": current_price,
+                           "target_price": target_price, "direction": direction,
+                           "days_remaining": 0, "model": "expired", "parse_source": source})
 
-        # Time in years
         T = days_remaining / 365.0
-        vol = annual_vol
-        r = 0.0  # risk-free rate ≈ 0 for crypto
 
-        # Log-normal probability
-        if current_price <= 0 or target_price <= 0:
-            return None
-
-        d = (math.log(current_price / target_price) + (r + 0.5 * vol ** 2) * T) / (vol * math.sqrt(T))
-
-        # Φ(d) = probability price ends above target
-        prob_above = _norm_cdf(d)
-
-        if direction == "above":
-            prob = prob_above
+        if is_barrier:
+            prob = _barrier_hit_prob(current_price, target_price, T, vol, direction)
+            model = f"barrier_{direction}"
         else:
-            prob = 1.0 - prob_above
+            above = _terminal_above_prob(current_price, target_price, T, vol)
+            prob = above if direction == "above" else 1.0 - above
+            model = f"terminal_{direction}"
 
         prob = max(0.01, min(0.99, prob))
-
         metadata = {
             "coin": coin_id,
             "current_price": current_price,
             "target_price": target_price,
             "direction": direction,
+            "is_barrier": is_barrier,
             "days_remaining": days_remaining,
-            "annual_vol": round(annual_vol, 3),
+            "annual_vol": round(vol, 3),
+            "model": model,
             "model_prob": round(prob, 4),
+            "parse_source": source,
         }
-
         return (prob, metadata)
 
-    def _parse_crypto_question(self, question: str) -> Optional[Tuple[str, float, str, float]]:
-        """Parse a crypto market question into components.
+    def _parse_crypto_slug(self, slug: str) -> Optional[Tuple[str, float, str, float, bool]]:
+        """Parse a Polymarket crypto-price slug into components.
 
-        Returns (coin_id, target_price, direction, days_remaining) or None.
+        Verified live 2026-07-15:
+          cpc-btc-150k-12-31-2026                 -> btc, 150000, above, barrier
+          cpc-btc-hitprice-high-yr-12-31-2026-200k-> btc, 200000, above, barrier
+        Date is MM-DD-YYYY somewhere in the slug; target is a k/m-suffixed
+        token (150k) or a bare >=1000 integer outside the date; coin is any
+        token in CRYPTO_IDS. "hit/hitprice/high/low/reach/touch" => barrier
+        (the cpc- family is touch markets). "close/settle/on" => terminal.
+
+        Returns (coin_id, target, direction, days_remaining, is_barrier) or None.
+        """
+        if not slug:
+            return None
+        parts = slug.lower().split("-")
+        tokens = set(parts)
+
+        coin_id = None
+        for tok in parts:
+            if tok in CRYPTO_IDS:
+                coin_id = CRYPTO_IDS[tok]
+                break
+        if coin_id is None:
+            return None
+
+        # Date MM-DD-YYYY: three consecutive numeric tokens ending in a 4-digit year.
+        now = datetime.now(timezone.utc)
+        days_remaining = None
+        date_idx = set()
+        for i in range(len(parts) - 2):
+            a, b, c = parts[i], parts[i + 1], parts[i + 2]
+            if a.isdigit() and b.isdigit() and c.isdigit() and len(c) == 4:
+                try:
+                    deadline = datetime(int(c), int(a), int(b), tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+                days_remaining = (deadline - now).days
+                date_idx = {i, i + 1, i + 2}
+                break
+        if days_remaining is None:
+            return None  # no reliable deadline in slug -> let question parser try
+
+        # Target: k/m suffixed token, else a bare >=1000 integer not in the date.
+        target = None
+        for i, tok in enumerate(parts):
+            m = re.fullmatch(r'(\d+(?:pt\d+)?)(k|m)?', tok)
+            if not m:
+                continue
+            base = float(m.group(1).replace("pt", "."))
+            suffix = m.group(2)
+            if suffix == "k":
+                target = base * 1_000
+            elif suffix == "m":
+                target = base * 1_000_000
+            elif i not in date_idx and base >= 1000:
+                target = base
+            if target is not None:
+                break
+        if target is None:
+            return None
+
+        direction = "above"
+        if any(w in tokens for w in ("low", "below", "under", "drop", "dip")):
+            direction = "below"
+        # Terminal only if the slug explicitly says settle/close/on-date.
+        is_barrier = not any(w in tokens for w in ("close", "settle", "closeprice"))
+
+        return (coin_id, target, direction, float(days_remaining), is_barrier)
+
+    def _parse_crypto_question(self, question: str) -> Optional[Tuple[str, float, str, float, bool]]:
+        """Parse a crypto market question (fallback when the slug isn't a cpc- slug).
+
+        Returns (coin_id, target_price, direction, days_remaining, is_barrier)
+        or None.
         """
         q = question.lower()
 
-        # Find the crypto asset
         coin_id = None
         for keyword, cid in CRYPTO_IDS.items():
             if keyword in q:
@@ -181,31 +311,41 @@ class CryptoCache:
         if not coin_id:
             return None
 
-        # Find target price — look for $ amounts
-        price_match = re.search(r'\$\s*([\d,]+(?:\.\d+)?)', question)
-        if not price_match:
-            # Try bare numbers with k suffix
-            price_match = re.search(r'(\d+(?:\.\d+)?)\s*k\b', q)
-            if price_match:
-                target_price = float(price_match.group(1).replace(",", "")) * 1000
+        # Target price. Handle "$100k"/"$1.5m" (the old $-regex captured "100"
+        # from "$100k" and dropped the k -> off by 1000x) as well as bare "100k".
+        target_price = None
+        dk = re.search(r'\$\s*([\d,]+(?:\.\d+)?)\s*([km])?', question, re.IGNORECASE)
+        if dk:
+            base = float(dk.group(1).replace(",", ""))
+            sfx = (dk.group(2) or "").lower()
+            target_price = base * (1000 if sfx == "k" else 1_000_000 if sfx == "m" else 1)
+        else:
+            bare = re.search(r'(\d+(?:\.\d+)?)\s*([km])\b', q)
+            if bare:
+                base = float(bare.group(1))
+                target_price = base * (1000 if bare.group(2) == "k" else 1_000_000)
             else:
                 return None
-        else:
-            target_price = float(price_match.group(1).replace(",", ""))
 
-        # Determine direction
-        direction = "above"  # default
-        if any(word in q for word in ["below", "under", "drop", "fall", "less than"]):
+        direction = "above"
+        if any(w in q for w in ["below", "under", "drop", "fall", "less than", "dip"]):
             direction = "below"
 
-        # Find deadline — look for dates
-        now = datetime.now(timezone.utc)
-        days_remaining = 30  # default
+        # Barrier vs terminal from phrasing. "hit/reach/touch/when will" => touch.
+        # "on <date>/close/settle/end at" => terminal. Default barrier (the
+        # dominant Polymarket style).
+        is_barrier = True
+        if re.search(r'\b(hit|reach|touch|hits|reaches|cross|when will)\b', q):
+            is_barrier = True
+        elif re.search(r'\b(close|settle|end (the )?(year|month|day)|on \w+ \d)\b', q):
+            is_barrier = False
 
-        # Try to find a date like "March 2026", "June 30", "2026-06-30"
+        now = datetime.now(timezone.utc)
+        days_remaining = 30  # default (question with no date is low-confidence)
+
         month_match = re.search(
             r'(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})',
-            q
+            q,
         )
         if month_match:
             month_names = {
@@ -216,12 +356,12 @@ class CryptoCache:
             month = month_names[month_match.group(1)]
             year = int(month_match.group(2))
             try:
-                deadline = datetime(year, month, 28, tzinfo=timezone.utc)  # end of month approx
+                deadline = datetime(year, month, _last_day_of_month(year, month),
+                                    tzinfo=timezone.utc)
                 days_remaining = max(1, (deadline - now).days)
             except ValueError:
                 pass
         else:
-            # Try ISO date
             iso_match = re.search(r'(\d{4}-\d{2}-\d{2})', question)
             if iso_match:
                 try:
@@ -231,8 +371,7 @@ class CryptoCache:
                 except Exception:
                     pass
 
-        return (coin_id, target_price, direction, days_remaining)
-
+        return (coin_id, target_price, direction, float(days_remaining), is_barrier)
 
 def _norm_cdf(x: float) -> float:
     """Standard normal CDF approximation (Abramowitz and Stegun)."""

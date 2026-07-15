@@ -4458,3 +4458,137 @@ class TestDerivativeSignal:
                                    line_aggregator=None)
         snap = self._snap("asc-mlb-tor-sd-2026-07-11-pos-1pt5", price=0.50)
         assert est.detect_edge(snap, min_edge=0.05, max_edge=0.40) is None
+
+
+# ============================================================================
+# Crypto model calibration: barrier pricing, slug parsing, drift-sign, vol
+# ============================================================================
+
+from bot.signals.crypto_api import (
+    CryptoCache, _barrier_hit_prob, _terminal_above_prob, VOL_FLOOR, VOL_CAP,
+)
+from bot.signals.signals import crypto_model_signal
+
+
+class _FakeCryptoCache(CryptoCache):
+    """CryptoCache with a fixed price/vol (no CoinGecko dependency)."""
+    def __init__(self, price, vol):
+        super().__init__()
+        self._fixed = (price, vol)
+    def get_price_and_vol(self, coin_id):
+        return self._fixed
+
+
+class TestBarrierMath:
+    def test_touch_exceeds_terminal(self):
+        term = _terminal_above_prob(100, 130, 0.5, 0.6)
+        barr = _barrier_hit_prob(100, 130, 0.5, 0.6, "above")
+        assert term < barr <= 1.0
+
+    def test_driftless_reflection_is_2x(self):
+        # As vol->0 the risk-neutral drift -vol^2/2 -> 0; touch -> 2x terminal
+        r = (_barrier_hit_prob(100, 130, 0.5, 0.02, "above")
+             / _terminal_above_prob(100, 130, 0.5, 0.02))
+        assert abs(r - 2.0) < 0.05
+
+    def test_drift_sign_fix_atm_below_half(self):
+        # Old bug used +sigma^2/2 giving P(above)>0.5 at-the-money; correct
+        # risk-neutral -sigma^2/2 gives <0.5 (median flat, mean pulled up).
+        assert _terminal_above_prob(100, 100, 1.0, 0.6) < 0.5
+
+    def test_monotone_in_time(self):
+        assert (_barrier_hit_prob(100, 130, 0.1, 0.6, "above")
+                < _barrier_hit_prob(100, 130, 2.0, 0.6, "above"))
+
+    def test_already_touched(self):
+        assert _barrier_hit_prob(150, 130, 1.0, 0.6, "above") == 1.0
+        assert _barrier_hit_prob(100, 130, 1.0, 0.6, "below") == 1.0
+
+    def test_down_barrier(self):
+        assert 0 < _barrier_hit_prob(130, 100, 0.5, 0.6, "below") < 1.0
+
+
+class TestCryptoSlugParsing:
+    def _c(self):
+        return CryptoCache()
+
+    def test_live_slug_barrier_date_target(self):
+        # cpc-btc-150k-12-31-2026: "When will Bitcoin hit $150k?" — deadline
+        # and target are in the SLUG (question has no date). Barrier.
+        p = self._c()._parse_crypto_slug("cpc-btc-150k-12-31-2026")
+        coin, target, direction, days, is_barrier = p
+        assert coin == "bitcoin" and target == 150000.0
+        assert direction == "above" and is_barrier is True
+        assert days > 100   # real deadline from slug, NOT the 30-day default
+
+    def test_live_slug_target_at_end(self):
+        p = self._c()._parse_crypto_slug("cpc-btc-hitprice-high-yr-12-31-2026-200k")
+        assert p[1] == 200000.0 and p[4] is True
+
+    def test_slug_without_date_returns_none(self):
+        assert self._c()._parse_crypto_slug("cpc-btc-150k") is None
+
+    def test_dollar_k_question_bug_fixed(self):
+        # "$100k" used to parse as $100 (k dropped) -> 1000x error
+        p = self._c()._parse_crypto_question("Will Bitcoin hit $100k by March 2026?")
+        assert p[1] == 100000.0
+
+    def test_question_barrier_vs_terminal_routing(self):
+        c = self._c()
+        assert c._parse_crypto_question("Will BTC hit $100k by June 2026?")[4] is True
+        term = c._parse_crypto_question("Will BTC close above $100k on June 30 2026?")
+        assert term[4] is False
+
+
+class TestCryptoModelSignal:
+    def _snap(self, price, slug, question="When will Bitcoin hit $150k?"):
+        return MarketSnapshot(
+            market_id="m", token_id="t", question=question, price=price,
+            volume_24h=5000, liquidity=5000, order_book=OrderBook(),
+            price_history=[price] * 20, timestamp=datetime.now(timezone.utc),
+            slug=slug)
+
+    def test_slug_deadline_beats_question_30day_default(self, signal_config):
+        # BTC $117k, hit 150k by Dec 2026 -> a real ~44% barrier probability,
+        # NOT the ~0% the old 30-day-default terminal model produced.
+        cache = _FakeCryptoCache(117000, 0.55)
+        snap = self._snap(0.55, "cpc-btc-150k-12-31-2026")
+        sig = crypto_model_signal(snap, signal_config, cache)
+        assert sig.metadata["parse_source"] == "slug"
+        assert sig.metadata["model"].startswith("barrier")
+        assert 0.30 < sig.value < 0.60   # sane, not railed at 0.01
+
+    def test_vol_floor_and_cap_applied(self, signal_config):
+        low = _FakeCryptoCache(117000, 0.01)   # absurdly low -> floored
+        high = _FakeCryptoCache(117000, 9.0)   # absurdly high -> capped
+        s = self._snap(0.5, "cpc-btc-150k-12-31-2026")
+        assert crypto_model_signal(s, signal_config, low).metadata["annual_vol"] == VOL_FLOOR
+        assert crypto_model_signal(s, signal_config, high).metadata["annual_vol"] == VOL_CAP
+
+    def test_question_30day_default_is_low_confidence(self, signal_config):
+        # No slug date, no question date -> 30-day GUESS -> discounted gate
+        cache = _FakeCryptoCache(117000, 0.55)
+        snap = self._snap(0.20, "unknown-slug-format",
+                          question="Will Bitcoin hit $150k?")
+        sig = crypto_model_signal(snap, signal_config, cache)
+        assert sig.metadata["parse_source"] == "question"
+        assert sig.confidence < 0.25   # heavily discounted
+
+    def test_fat_tail_rail_halves_confidence(self, signal_config):
+        # Model railed near 0/1 -> confidence halved (GBM unreliable in tails)
+        cache = _FakeCryptoCache(65000, 0.35)   # 150k far away -> model ~0.01
+        snap = self._snap(0.55, "cpc-btc-150k-12-31-2026")
+        sig = crypto_model_signal(snap, signal_config, cache)
+        assert sig.value <= 0.03
+
+    def test_no_cache_is_noop(self, signal_config):
+        snap = self._snap(0.5, "cpc-btc-150k-12-31-2026")
+        assert crypto_model_signal(snap, signal_config, None).confidence == 0.0
+
+    def test_estimator_crypto_uses_barrier_model(self, signal_config):
+        cache = _FakeCryptoCache(117000, 0.55)
+        est = ProbabilityEstimator(signal_config, crypto_cache=cache)
+        snap = self._snap(0.20, "cpc-btc-150k-12-31-2026")
+        result = est.detect_edge(snap, min_edge=0.05, max_edge=0.40)
+        # model ~0.44 vs market 0.20 -> BUY edge
+        assert result is not None and result.side == "buy"
