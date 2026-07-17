@@ -4215,7 +4215,7 @@ class TestLiveValidation:
 # ============================================================================
 
 from bot.signals.book_scrapers import (
-    TENNIS_CIRCUIT_PREFIXES, PinnacleClient,
+    TENNIS_CIRCUIT_PREFIXES, PinnacleClient, MultiBookAggregator,
 )
 
 
@@ -4592,3 +4592,56 @@ class TestCryptoModelSignal:
         result = est.detect_edge(snap, min_edge=0.05, max_edge=0.40)
         # model ~0.44 vs market 0.20 -> BUY edge
         assert result is not None and result.side == "buy"
+
+
+# ============================================================================
+# Derivative line interpolation (find_line ladder interpolation)
+# ============================================================================
+
+class TestLineInterpolation:
+    def test_interp_exact(self):
+        assert MultiBookAggregator._interp_prob([(8.5,0.52),(9.5,0.40)], 8.5) == pytest.approx(0.52)
+
+    def test_interp_between(self):
+        # midpoint 9.0 between 8.5(0.52) and 9.5(0.40) -> 0.46
+        assert MultiBookAggregator._interp_prob([(8.5,0.52),(9.5,0.40)], 9.0) == pytest.approx(0.46)
+
+    def test_interp_outside_range_is_none(self):
+        # no blind extrapolation beyond the quoted ladder
+        assert MultiBookAggregator._interp_prob([(8.5,0.52),(9.5,0.40)], 12.0) is None
+        assert MultiBookAggregator._interp_prob([(8.5,0.52),(9.5,0.40)], 5.0) is None
+
+    def test_interp_empty(self):
+        assert MultiBookAggregator._interp_prob([], 9.0) is None
+
+    def test_find_line_two_books_via_interpolation(self):
+        from bot.signals.book_scrapers import MultiBookAggregator
+        agg = MultiBookAggregator(cache_ttl=999)
+        # Pinnacle full ladder + FanDuel one nearby quote, neither at 9.0 exact
+        agg.get_lines = lambda sk: [
+            {"book":"pinnacle","kind":"total","home_team":"San Diego Padres",
+             "away_team":"Kansas City Royals","points":8.5,"prob_over":0.55},
+            {"book":"pinnacle","kind":"total","home_team":"San Diego Padres",
+             "away_team":"Kansas City Royals","points":9.5,"prob_over":0.45},
+            {"book":"fanduel","kind":"total","home_team":"San Diego Padres",
+             "away_team":"Kansas City Royals","points":9.0,"prob_over":0.50},
+        ]
+        r = agg.find_line("baseball_mlb", "kc", "sd", "total", 9.0)
+        assert r is not None
+        prob, books = r
+        assert books == 2                       # both books price 9.0 (Pin interp, FD exact)
+        assert prob == pytest.approx((0.50 + 0.50) / 2, abs=0.01)
+
+    def test_find_line_spread_orientation_flip_interpolated(self):
+        from bot.signals.book_scrapers import MultiBookAggregator
+        agg = MultiBookAggregator(cache_ttl=999)
+        # Book lists teams reversed vs our away/home; ladder must mirror
+        agg.get_lines = lambda sk: [
+            {"book":"pinnacle","kind":"spread","home_team":"Kansas City Royals",
+             "away_team":"San Diego Padres","away_points":1.0,"prob_away":0.40},
+            {"book":"pinnacle","kind":"spread","home_team":"Kansas City Royals",
+             "away_team":"San Diego Padres","away_points":2.0,"prob_away":0.55},
+        ]
+        # our away=kc (book's home) -> our away_points +1.5 mirrors book away -1.5
+        r = agg.find_line("baseball_mlb", "kc", "sd", "spread", -1.5)
+        assert r is not None

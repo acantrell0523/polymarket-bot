@@ -777,19 +777,53 @@ class MultiBookAggregator:
         self._cache[ck] = (now, rows)
         return rows
 
+    @staticmethod
+    def _interp_prob(points_probs, target: float, max_extrap: float = 0.0):
+        """Interpolate a book's implied probability at `target` from its own
+        line ladder. points_probs = [(line, prob), ...].
+
+        Books quote a ladder (totals 8.5/9.0/9.5...), rarely the exact
+        Polymarket line — but a book quoting 8.5 and 9.5 has a well-defined
+        implied prob at 9.0. Linear interpolation between the two nearest
+        quotes; exact quote used as-is. Returns None if target is outside the
+        book's quoted range (no blind extrapolation beyond max_extrap points).
+        """
+        if not points_probs:
+            return None
+        pts = sorted(points_probs)
+        for x, pr in pts:
+            if abs(x - target) < 0.01:
+                return pr
+        lo_x = pts[0][0]
+        hi_x = pts[-1][0]
+        if target < lo_x - max_extrap or target > hi_x + max_extrap:
+            return None
+        if target <= lo_x:
+            return pts[0][1]
+        if target >= hi_x:
+            return pts[-1][1]
+        for (x0, p0), (x1, p1) in zip(pts, pts[1:]):
+            if x0 <= target <= x1 and x1 > x0:
+                w = (target - x0) / (x1 - x0)
+                return p0 + w * (p1 - p0)
+        return None
+
     def find_line(self, sport_key: str, away_abbr: str, home_abbr: str,
                   kind: str, line: float) -> Optional[Tuple[float, int]]:
         """Book probability for a derivative market's YES side.
 
         Polymarket semantics (verified 2026-07-14):
-          spread: YES = FIRST-listed (away) team covers `line` (signed) —
-                  matched against the away side's points on each book row.
+          spread: YES = FIRST-listed (away) team covers `line` (signed).
           total:  YES = OVER `line`.
 
-        Returns (mean de-vigged prob across DISTINCT books quoting exactly
-        this line, num_books) or None.
+        Each book is INTERPOLATED to the exact Polymarket line from its own
+        ladder (books quote 8.5/9.0/9.5..., rarely the exact line; exact
+        matching found only ~17 pairs across a full MLB slate and left every
+        other derivative at only_1_books). Returns (mean prob across DISTINCT
+        books that can price this line, num_books) or None.
         """
-        probs: Dict[str, float] = {}   # book -> prob (dedup per book)
+        # Collect each book's ladder in OUR frame (away-team perspective).
+        ladders: Dict[str, list] = {}
         for row in self.get_lines(sport_key):
             if row.get("kind") != kind:
                 continue
@@ -801,21 +835,22 @@ class MultiBookAggregator:
             flipped = (h == away_abbr and a == home_abbr)
             book = row.get("book", "unknown")
             if kind == "spread":
-                pts = row.get("away_points")
-                prob = row.get("prob_away")
-                if flipped:
-                    # row's away is OUR home: our away's points/prob mirror
-                    pts = -pts if pts is not None else None
-                    prob = 1 - prob if prob is not None else None
-                if pts is None or prob is None or abs(pts - line) > 0.01:
+                pts, prob = row.get("away_points"), row.get("prob_away")
+                if pts is None or prob is None:
                     continue
-                probs.setdefault(book, prob)
-            else:  # total — orientation-independent
-                if row.get("points") is None or abs(row["points"] - line) > 0.01:
+                if flipped:               # book's away is OUR home -> mirror
+                    pts, prob = -pts, 1 - prob
+            else:                          # total — orientation-independent
+                pts, prob = row.get("points"), row.get("prob_over")
+                if pts is None or prob is None:
                     continue
-                if row.get("prob_over") is None:
-                    continue
-                probs.setdefault(book, row["prob_over"])
+            ladders.setdefault(book, []).append((float(pts), float(prob)))
+
+        probs = {}
+        for book, pp in ladders.items():
+            v = self._interp_prob(pp, line)
+            if v is not None:
+                probs[book] = max(0.01, min(0.99, v))
         if not probs:
             return None
         return sum(probs.values()) / len(probs), len(probs)
