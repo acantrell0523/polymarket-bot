@@ -19,7 +19,11 @@ LEAGUE_MIN_EDGE = {
     "epl": 0.05,
     "nfl": 0.05,
     "mlb": 0.05,
-    "wnba": 0.05,   # thinner books, less efficient than NBA
+    # WNBA: STARVED 2026-07-18 on measured evidence — avg CLV -1.57%,
+    # 1 of 17 entries beat the close, -$20 realized. The market reads us,
+    # not the reverse. 15% bar = effectively delisted without code removal;
+    # revisit only if a future signal source demonstrates positive CLV.
+    "wnba": 0.15,
     "mls": 0.05,
     "ufc": 0.06,
     # ITF tennis: thin, high-vig, notoriously noisy markets — demand more

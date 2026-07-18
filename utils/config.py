@@ -178,6 +178,9 @@ class FilterConfig:
     min_daily_volume_usd: float = 500.0
     min_liquidity_usd: float = 200.0
     min_hours_to_expiry: float = 1.0
+    # Crypto barrier ladders (cpc-) resolve months out — the 14-day
+    # non-sports window would exclude all of them.
+    crypto_window_days: float = 200.0
     max_hours_to_expiry: float = 48.0
     min_price_history_length: int = 10
     # Time-to-resolution windows actually enforced by MarketDataClient.

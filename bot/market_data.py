@@ -128,11 +128,33 @@ class MarketDataClient:
 
         filtered = []
         live_count = 0
+        from bot.signals.live_win_prob import slug_game_teams
+        from bot.leagues import parse_derivative_slug
+        crypto_window_days = getattr(self.filters, "crypto_window_days", 200.0)
+        crypto_cutoff = now + timedelta(days=crypto_window_days)
         for m in markets:
             game_start_str = m.get("gameStartTime")
             end_date_str = m.get("endDate")
+            slug = m.get("slug", "")
 
-            if game_start_str:
+            # gameStartTime is only authoritative for REAL game slugs. The
+            # gateway attaches it to everything (verified 2026-07-18:
+            # cpc-btc-150k carries a stale July 8 gameStartTime, season
+            # futures carry Sept dates) — trusting it blindly silently
+            # excluded every crypto market from the scan universe, so the
+            # calibrated barrier model never saw a single market.
+            is_game = (slug_game_teams(slug) is not None
+                       or parse_derivative_slug(slug) is not None)
+
+            if slug.startswith("cpc-"):
+                # Crypto price ladders resolve months out — own window.
+                ref_time = self._parse_datetime(end_date_str)
+                if ref_time is None or ref_time < min_expiry or ref_time > crypto_cutoff:
+                    continue
+                filtered.append(m)
+                continue
+
+            if game_start_str and is_game:
                 game_start = self._parse_datetime(game_start_str)
                 if game_start is None:
                     continue

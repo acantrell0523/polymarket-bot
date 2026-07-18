@@ -796,10 +796,30 @@ class TradingBot:
                 slug = market.get("slug", "")
                 if not slug:
                     continue
-                # Get consensus at tip-off
+                # Get consensus at tip-off. The odds_cache path fails at
+                # exactly the wrong moment (books pull lines at tip-off),
+                # which left every Jul 17 MLB entry unstamped — fall back to
+                # the 4-book aggregator, whose caches still hold the pregame
+                # close. YES side = first-listed (away) team.
+                consensus = None
                 result = self.odds_cache.get_probability_for_slug(slug)
                 if result:
                     consensus, _ = result
+                if not consensus:
+                    try:
+                        from bot.signals.live_win_prob import slug_game_teams
+                        from bot.leagues import LEAGUES
+                        parsed = slug_game_teams(slug)
+                        if parsed:
+                            league, away, home = parsed
+                            sk = (LEAGUES.get(league) or {}).get("odds_api_key")
+                            game = (self.line_aggregator.find_game(sk, home, away)
+                                    if sk else None)
+                            if game:
+                                consensus = game.get("away_prob")
+                    except Exception:
+                        pass
+                if consensus:
                     live_price = self.market_data.get_live_price(slug)
                     if live_price:
                         record_closing_line(slug, consensus, live_price)
@@ -1227,6 +1247,7 @@ class TradingBot:
                         m for m in markets
                         if slug_game_teams(m.get("slug", "")) is not None
                         or parse_derivative_slug(m.get("slug", "")) is not None
+                        or m.get("slug", "").startswith("cpc-")
                         or not m.get("gameStartTime")
                     ]
                     self.logger.info("full_scan_universe", {

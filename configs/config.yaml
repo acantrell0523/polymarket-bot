@@ -120,6 +120,7 @@ filters:
   # Time-to-resolution windows enforced by the market scanner:
   sports_window_hours: 24     # only scan games starting within 24h
   nonsports_window_days: 14   # only scan non-sports markets resolving within 14d
+  crypto_window_days: 200     # cpc- price ladders resolve months out
   min_price_history_length: 10
   include_categories: []
   exclude_categories: []

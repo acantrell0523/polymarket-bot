@@ -51,8 +51,8 @@ def init_edge_tables():
             is_live_game INTEGER DEFAULT 0,
             entry_time TEXT DEFAULT '',
             close_time TEXT DEFAULT '',
-            closing_line_value REAL DEFAULT 0,
-            closing_line_price REAL DEFAULT 0,
+            closing_line_value REAL,
+            closing_line_price REAL,
             resolution_flag TEXT DEFAULT '',
             created_at TEXT DEFAULT (datetime('now'))
         );
@@ -75,6 +75,14 @@ def init_edge_tables():
         CREATE INDEX IF NOT EXISTS idx_line_movement_slug ON line_movement(slug);
         CREATE INDEX IF NOT EXISTS idx_line_movement_timestamp ON line_movement(timestamp);
     """)
+    # MIGRATION (2026-07-18): pre-existing rows used DEFAULT 0 for the
+    # closing-line columns, making "never stamped" look like a real 0.0000
+    # CLV. A true closing PRICE of exactly 0 can't exist for a probability,
+    # so 0-price rows are safely normalized to NULL (= unstamped, retryable).
+    conn.execute(
+        """UPDATE edge_log SET closing_line_value = NULL, closing_line_price = NULL
+           WHERE closing_line_price = 0"""
+    )
     conn.commit()
     conn.close()
 
@@ -151,12 +159,18 @@ def record_closing_line(slug: str, closing_consensus: float, polymarket_closing:
 
     CLV = entry_price vs closing_line. Positive CLV = we got value.
     Called when a game starts (live scan detects game start).
+
+    Unstamped rows are NULL (schema default was 0, which made
+    "never stamped" indistinguishable from a true zero CLV — the Jul 17
+    MLB entries all showed fake 0.0000). NULL check keeps retrying every
+    live cycle until a consensus lookup succeeds.
     """
+    if not closing_consensus or closing_consensus <= 0:
+        return   # never stamp a zero/missing consensus as a real closing line
     conn = _get_conn()
-    # Get the most recent edge_log entry for this slug that doesn't have a closing line yet
     row = conn.execute(
         """SELECT id, polymarket_price FROM edge_log
-           WHERE slug = ? AND closing_line_price = 0
+           WHERE slug = ? AND (closing_line_price IS NULL OR closing_line_price = 0)
            ORDER BY timestamp DESC LIMIT 1""",
         (slug,),
     ).fetchone()
