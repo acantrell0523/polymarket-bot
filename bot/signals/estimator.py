@@ -25,6 +25,7 @@ from bot.signals.signals import (
     onchain_flow_signal,
     live_win_prob_signal,
     derivative_line_signal,
+    kalshi_value_signal,
 )
 from bot.signals.odds_api import OddsCache
 from bot.signals.cross_market import PredictItCache
@@ -73,6 +74,7 @@ WEIGHTS = {
         "onchain_flow": 0.10,
     },
     "politics": {
+        "kalshi_value": 0.50,   # same-instrument exchange price; no-op unmatched
         "cross_market": 0.45,
         "order_book_imbalance": 0.25,
         "line_movement": 0.15,
@@ -80,6 +82,7 @@ WEIGHTS = {
         "onchain_flow": 0.10,
     },
     "other": {
+        "kalshi_value": 0.50,   # same-instrument exchange price; no-op unmatched
         "cross_market": 0.40,
         "order_book_imbalance": 0.25,
         "line_movement": 0.20,
@@ -143,6 +146,7 @@ class ProbabilityEstimator:
         onchain_client=None,
         live_cache=None,
         line_aggregator=None,
+        kalshi_cache=None,
     ):
         self.config = config
         self.odds_cache = odds_cache
@@ -155,6 +159,8 @@ class ProbabilityEstimator:
         self.live_cache = live_cache
         # MultiBookAggregator: spread/total lines for derivative markets
         self.line_aggregator = line_aggregator
+        # KalshiCache: cross-exchange prices for identical instruments
+        self.kalshi_cache = kalshi_cache
 
     def compute_signals(self, snapshot: MarketSnapshot, market_type: str) -> List[Signal]:
         """Compute signals appropriate for the market type."""
@@ -192,9 +198,13 @@ class ProbabilityEstimator:
         elif market_type == "politics":
             signals.append(cross_market_signal(snapshot, self.config, self.predictit_cache))
             signals.append(line_movement_signal(snapshot, self.config))
+            if self.kalshi_cache is not None:
+                signals.append(kalshi_value_signal(snapshot, self.config, self.kalshi_cache))
         else:  # "other"
             signals.append(cross_market_signal(snapshot, self.config, self.predictit_cache))
             signals.append(line_movement_signal(snapshot, self.config))
+            if self.kalshi_cache is not None:
+                signals.append(kalshi_value_signal(snapshot, self.config, self.kalshi_cache))
 
         return signals
 
@@ -236,6 +246,14 @@ class ProbabilityEstimator:
                           if s.name == "derivative_line" and s.confidence > 0), None)
             if deriv is not None:
                 return deriv
+
+        if market_type in ("politics", "other"):
+            # A matched Kalshi market (same instrument on a regulated
+            # exchange) outranks PredictIt fuzzy-matching whenever present.
+            kal = next((s for s in signals
+                        if s.name == "kalshi_value" and s.confidence > 0), None)
+            if kal is not None:
+                return kal
 
         primary_name = {
             "sports": "odds_value",

@@ -4866,3 +4866,109 @@ class TestUniverseWindows:
             import pytest as _pt
             _pt.skip("windowing not exposed as helper")
         assert len(out) == 1
+
+
+# ============================================================================
+# Kalshi cross-exchange source (weather vertical)
+# ============================================================================
+
+from bot.signals.kalshi import KalshiCache, parse_temp_slug, TEMP_CITY_SERIES
+from bot.signals.signals import kalshi_value_signal
+
+
+class TestKalshiTempMatching:
+    def test_parse_temp_slug_verified_live(self):
+        # Live slugs 2026-07-18
+        p = parse_temp_slug("tc-temp-nychigh-2026-07-18-lt79f")
+        assert p == {"city": "nychigh", "date_token": "26JUL18",
+                     "kind": "below", "bound": 79}
+        p = parse_temp_slug("tc-temp-miahigh-2026-07-18-gte92lt93f")
+        assert p["kind"] == "range" and p["lo"] == 92 and p["hi"] == 93
+        assert parse_temp_slug("tc-temp-nychigh-2026-07-18-gte87f")["kind"] == "above"
+        assert parse_temp_slug("aec-mlb-tor-sd-2026-07-11") is None
+
+    def _cache_with(self, markets):
+        c = KalshiCache(cache_ttl=999)
+        c._series_markets = lambda st: markets
+        return c
+
+    def test_below_tail_match(self):
+        # KXHIGHNY-26JUL18-T79 "78 or below": cap=79 == PM lt79f (verified)
+        c = self._cache_with([{"ticker": "KXHIGHNY-26JUL18-T79",
+                               "floor_strike": None, "cap_strike": 79,
+                               "yes_bid_dollars": "0.81", "yes_ask_dollars": "0.83"}])
+        m = c.match_temp_market("tc-temp-nychigh-2026-07-18-lt79f")
+        assert m is not None
+        assert m["prob"] == pytest.approx(0.82)
+        assert m["spread"] == pytest.approx(0.02)
+
+    def test_above_tail_match(self):
+        # KXHIGHNY-26JUL18-T86 "87 or above": floor=86 == PM gte87f (verified)
+        c = self._cache_with([{"ticker": "KXHIGHNY-26JUL18-T86",
+                               "floor_strike": 86, "cap_strike": None,
+                               "yes_bid_dollars": "0.01", "yes_ask_dollars": "0.02"}])
+        assert c.match_temp_market("tc-temp-nychigh-2026-07-18-gte87f") is not None
+
+    def test_mismatched_bucket_returns_none(self):
+        # Kalshi 2-degree interior (84-85) must NOT price PM's 1-degree 84-85f... 
+        # PM gte84lt86f == [84,85] MATCHES floor 84/cap 85; but gte84lt85f (=84 only) must not
+        c = self._cache_with([{"ticker": "KXHIGHNY-26JUL18-B84.5",
+                               "floor_strike": 84, "cap_strike": 85,
+                               "yes_bid_dollars": "0.12", "yes_ask_dollars": "0.14"}])
+        assert c.match_temp_market("tc-temp-nychigh-2026-07-18-gte84lt86f") is not None
+        assert c.match_temp_market("tc-temp-nychigh-2026-07-18-gte84lt85f") is None
+
+    def test_one_sided_book_returns_none(self):
+        c = self._cache_with([{"ticker": "KXHIGHNY-26JUL18-T79",
+                               "floor_strike": None, "cap_strike": 79,
+                               "yes_bid_dollars": "0", "yes_ask_dollars": "0.98"}])
+        assert c.match_temp_market("tc-temp-nychigh-2026-07-18-lt79f") is None
+
+    def test_unmapped_city_returns_none(self):
+        c = self._cache_with([])
+        assert c.match_temp_market("tc-temp-sfohigh-2026-07-18-lt79f") is None
+        assert "sfohigh" not in TEMP_CITY_SERIES
+
+
+class TestKalshiSignal:
+    def _snap(self, slug, price):
+        return MarketSnapshot(
+            market_id="m", token_id="t", question="Highest temperature in NYC?",
+            price=price, volume_24h=2000, liquidity=2000, order_book=OrderBook(),
+            price_history=[price] * 20, timestamp=datetime.now(timezone.utc),
+            slug=slug)
+
+    class _FakeKalshi:
+        def __init__(self, prob, spread=0.02):
+            self.prob, self.spread = prob, spread
+        def match_slug(self, slug):
+            return {"prob": self.prob, "spread": self.spread, "ticker": "T"}
+
+    def test_tight_book_high_confidence(self, signal_config):
+        sig = kalshi_value_signal(self._snap("tc-temp-nychigh-2026-07-18-lt79f", 0.70),
+                                  signal_config, self._FakeKalshi(0.82, 0.02))
+        assert sig.confidence == pytest.approx(0.85)
+        assert sig.metadata["edge"] == pytest.approx(0.12)
+
+    def test_wide_book_no_confidence(self, signal_config):
+        sig = kalshi_value_signal(self._snap("tc-temp-nychigh-2026-07-18-lt79f", 0.70),
+                                  signal_config, self._FakeKalshi(0.82, 0.10))
+        assert sig.confidence == 0.0
+
+    def test_estimator_prefers_kalshi_over_predictit(self, signal_config):
+        from bot.signals.kalshi import KalshiCache
+        kc = KalshiCache(cache_ttl=999)
+        kc.match_slug = lambda slug: {"prob": 0.82, "spread": 0.02, "ticker": "T"}
+        est = ProbabilityEstimator(signal_config, kalshi_cache=kc)
+        snap = self._snap("tc-temp-nychigh-2026-07-18-lt79f", 0.70)
+        result = est.detect_edge(snap, min_edge=0.05, max_edge=0.40)
+        assert result is not None and result.side == "buy"
+
+    def test_no_match_blocks_at_gate(self, signal_config):
+        from bot.signals.kalshi import KalshiCache
+        kc = KalshiCache(cache_ttl=999)
+        kc.match_slug = lambda slug: None
+        est = ProbabilityEstimator(signal_config, kalshi_cache=kc)
+        snap = self._snap("tc-temp-nychigh-2026-07-18-lt79f", 0.70)
+        # no kalshi match + no predictit -> external gate blocks
+        assert est.detect_edge(snap, min_edge=0.05, max_edge=0.40) is None

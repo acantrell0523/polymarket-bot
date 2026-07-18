@@ -184,6 +184,10 @@ class TradingBot:
         from bot.signals.book_scrapers import MultiBookAggregator
         self.line_aggregator = MultiBookAggregator(cache_ttl=300)
 
+        # Kalshi cross-exchange prices (same-instrument validation)
+        from bot.signals.kalshi import KalshiCache
+        self.kalshi_cache = KalshiCache(cache_ttl=120)
+
         # Liveness + API health tracking (heartbeat file read by supervisor)
         self._data_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
         self.health = HealthMonitor(
@@ -260,6 +264,7 @@ class TradingBot:
             live_signal_config, self.odds_cache, self.predictit_cache, self.crypto_cache,
             self.espn_cache, self.game_context, onchain_client=self.onchain_client,
             live_cache=self.live_cache, line_aggregator=self.line_aggregator,
+            kalshi_cache=self.kalshi_cache,
         )
 
         # Live-game trading overrides — use same edge threshold as config
@@ -427,8 +432,16 @@ class TradingBot:
             deriv_sig = next((sg for sg in trade_signal.signals
                               if sg.name == "derivative_line" and sg.confidence > 0),
                              None)
+            kalshi_sig = next((sg for sg in trade_signal.signals
+                               if sg.name == "kalshi_value" and sg.confidence > 0),
+                              None)
             if deriv_sig is not None:
                 num_books = int(deriv_sig.metadata.get("num_books", 0))
+            elif kalshi_sig is not None:
+                # A matched same-instrument Kalshi market IS the external
+                # validation — the >=2 books rule is satisfied by a regulated
+                # exchange quoting the identical contract.
+                num_books = 2
             else:
                 consensus = self.odds_cache.get_consensus_odds(trade_signal.slug)
                 num_books = consensus.get("num_books", 0) if consensus else 0
@@ -1247,7 +1260,7 @@ class TradingBot:
                         m for m in markets
                         if slug_game_teams(m.get("slug", "")) is not None
                         or parse_derivative_slug(m.get("slug", "")) is not None
-                        or m.get("slug", "").startswith("cpc-")
+                        or m.get("slug", "").startswith(("cpc-", "tc-temp-"))
                         or not m.get("gameStartTime")
                     ]
                     self.logger.info("full_scan_universe", {

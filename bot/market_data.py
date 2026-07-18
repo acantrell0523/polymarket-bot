@@ -154,6 +154,14 @@ class MarketDataClient:
                 filtered.append(m)
                 continue
 
+            if slug.startswith("tc-temp-"):
+                # Daily temperature buckets (Kalshi-matched) — endDate window.
+                ref_time = self._parse_datetime(end_date_str)
+                if ref_time is None or ref_time < min_expiry or ref_time > nonsports_cutoff:
+                    continue
+                filtered.append(m)
+                continue
+
             if game_start_str and is_game:
                 game_start = self._parse_datetime(game_start_str)
                 if game_start is None:

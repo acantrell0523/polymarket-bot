@@ -272,6 +272,54 @@ def liquidity_imbalance_signal(snapshot: MarketSnapshot, config: SignalConfig) -
     )
 
 
+def kalshi_value_signal(
+    snapshot: MarketSnapshot,
+    config: SignalConfig,
+    kalshi_cache=None,
+) -> Signal:
+    """Cross-exchange price from Kalshi for the SAME instrument.
+
+    A regulated exchange's mid on an identical market (e.g. NYC daily high
+    temp buckets, verified in sync with Polymarket 2026-07-18) is the
+    strongest external validation we have — the divergence IS the edge.
+    Mechanical matching only (bot/signals/kalshi.py); no fuzzy text.
+    """
+    neutral = Signal(name="kalshi_value", value=0.5, confidence=0.0,
+                     direction="neutral", metadata={"reason": "no_match"})
+    if kalshi_cache is None:
+        neutral.metadata["reason"] = "no_kalshi_cache"
+        return neutral
+    try:
+        match = kalshi_cache.match_slug(snapshot.slug)
+    except Exception as e:
+        neutral.metadata["reason"] = f"kalshi_error: {e}"
+        return neutral
+    if not match:
+        return neutral
+
+    prob = max(0.01, min(0.99, float(match["prob"])))
+    spread = float(match.get("spread", 1.0))
+    edge = prob - snapshot.price
+
+    # Confidence keyed to Kalshi's own book quality: a tight two-sided
+    # market is near-authoritative; a wide one is weak information.
+    if spread <= 0.03:
+        confidence = 0.85
+    elif spread <= 0.06:
+        confidence = 0.5
+    else:
+        confidence = 0.0
+
+    return Signal(
+        name="kalshi_value",
+        value=prob,
+        confidence=confidence,
+        direction="bullish" if edge > 0 else "bearish" if edge < 0 else "neutral",
+        metadata={"edge": edge, "kalshi_ticker": match.get("ticker"),
+                  "kalshi_spread": spread},
+    )
+
+
 def derivative_line_signal(
     snapshot: MarketSnapshot,
     config: SignalConfig,
