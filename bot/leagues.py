@@ -63,6 +63,16 @@ LEAGUES: Dict[str, Dict] = {
         "odds_api_key": "americanfootball_nfl",
         "clock": {"periods": 4, "minutes": 15, "count_up": False},
     },
+    # College football — Polymarket league code confirmed live 2026-07-17
+    # (203 markets already listed: tec-cfb-champ-2027-01-25-w-...). ESPN has
+    # full scoreboard (99 events on the preseason board) AND per-play win
+    # probability, so the live-edge engine extends automatically. ABBR_MAP
+    # entries pending first real game slugs (aec-cfb-...).
+    "cfb": {
+        "espn_path": "football/college-football",
+        "odds_api_key": "americanfootball_ncaaf",
+        "clock": {"periods": 4, "minutes": 15, "count_up": False},
+    },
     "epl": {
         "espn_path": "soccer/eng.1",
         "odds_api_key": "soccer_epl",

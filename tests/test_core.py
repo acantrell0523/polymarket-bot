@@ -4004,6 +4004,7 @@ class TestBookDedup:
         ]
         agg.fanduel.get_odds = lambda sk: events[:2]
         agg.pinnacle.get_odds = lambda sk: events[2:]
+        agg.bovada.get_odds = lambda sk: []   # third book stubbed out
         consensus = agg.get_consensus("baseball_mlb")
         assert len(consensus) == 1
         assert consensus[0]["num_books"] == 2          # not 3
@@ -4645,3 +4646,110 @@ class TestLineInterpolation:
         # our away=kc (book's home) -> our away_points +1.5 mirrors book away -1.5
         r = agg.find_line("baseball_mlb", "kc", "sd", "spread", -1.5)
         assert r is not None
+
+
+# ============================================================================
+# Football buildout: Bovada (3rd book), NFL/CFB wiring
+# ============================================================================
+
+from bot.signals.book_scrapers import BovadaClient, BOVADA_PATHS, _bovada_american
+
+
+def _bovada_payload():
+    """Shape copied from the live NFL coupon response (2026-07-17)."""
+    return [{"events": [{
+        "description": "New England Patriots @ Seattle Seahawks",
+        "displayGroups": [{"markets": [
+            {"description": "Point Spread", "period": {"main": True}, "outcomes": [
+                {"description": "New England Patriots",
+                 "price": {"american": "-110", "handicap": "3.5"}},
+                {"description": "Seattle Seahawks",
+                 "price": {"american": "-110", "handicap": "-3.5"}}]},
+            {"description": "Moneyline", "period": {"main": True}, "outcomes": [
+                {"description": "New England Patriots", "price": {"american": "+165"}},
+                {"description": "Seattle Seahawks", "price": {"american": "-195"}}]},
+            {"description": "Total", "period": {"main": True}, "outcomes": [
+                {"description": "Over", "price": {"american": "EVEN", "handicap": "44.5"}},
+                {"description": "Under", "price": {"american": "-120", "handicap": "44.5"}}]},
+            # quarter market must be excluded
+            {"description": "Moneyline", "period": {"main": False}, "outcomes": [
+                {"description": "New England Patriots", "price": {"american": "+120"}},
+                {"description": "Seattle Seahawks", "price": {"american": "-140"}}]},
+        ]}]}]}]
+
+
+class TestBovadaClient:
+    def _client(self):
+        c = BovadaClient(cache_ttl=999)
+        c._fetch = lambda path: _bovada_payload()
+        return c
+
+    def test_moneyline_devig(self):
+        odds = self._client().get_odds("americanfootball_nfl")
+        assert len(odds) == 1
+        g = odds[0]
+        assert g["book"] == "bovada"
+        assert g["away_team"] == "New England Patriots"
+        # -195 favorite ~0.66 raw, +165 dog ~0.377 -> devig home ~0.637
+        assert g["home_prob"] == pytest.approx(0.637, abs=0.01)
+        assert g["home_prob"] + g["away_prob"] == pytest.approx(1.0)
+
+    def test_lines_spread_total_and_even(self):
+        rows = self._client().get_lines("americanfootball_nfl")
+        spread = next(r for r in rows if r["kind"] == "spread")
+        total = next(r for r in rows if r["kind"] == "total")
+        assert spread["away_points"] == 3.5          # away team's handicap
+        assert total["points"] == 44.5
+        # EVEN over (0.5 raw) vs -120 under (0.545) -> devig over ~0.478
+        assert total["prob_over"] == pytest.approx(0.478, abs=0.01)
+
+    def test_quarter_markets_excluded(self):
+        # only ONE moneyline row despite two Moneyline markets in payload
+        assert len(self._client().get_odds("americanfootball_nfl")) == 1
+
+    def test_even_parsing(self):
+        assert _bovada_american({"american": "EVEN"}) == 0.5
+        assert _bovada_american({"american": "-110"}) == pytest.approx(0.524, abs=0.01)
+        assert _bovada_american({}) is None
+
+    def test_football_paths_registered(self):
+        assert BOVADA_PATHS["americanfootball_nfl"] == "football/nfl"
+        assert BOVADA_PATHS["americanfootball_ncaaf"] == "football/college-football"
+
+
+class TestFootballWiring:
+    def test_cfb_registered(self):
+        assert "cfb" in LEAGUES
+        assert LEAGUES["cfb"]["odds_api_key"] == "americanfootball_ncaaf"
+        assert LEAGUES["cfb"]["clock"]["periods"] == 4
+        from bot.leagues import scoreboard_url
+        assert "college-football" in scoreboard_url("cfb")
+
+    def test_nfl_fragments(self):
+        assert _match_abbr("Kansas City Chiefs", "americanfootball_nfl") == "kc"
+        assert _match_abbr("San Francisco 49ers", "americanfootball_nfl") == "sf"
+        assert _match_abbr("Washington Commanders", "americanfootball_nfl") == "wsh"
+
+    def test_cfb_specific_before_generic(self):
+        # "georgia tech" must not match "georgia"; state schools before base
+        assert _match_abbr("Georgia Tech Yellow Jackets", "americanfootball_ncaaf") == "gt"
+        assert _match_abbr("Georgia Bulldogs", "americanfootball_ncaaf") == "uga"
+        assert _match_abbr("Ohio State Buckeyes", "americanfootball_ncaaf") == "osu"
+        assert _match_abbr("Michigan State Spartans", "americanfootball_ncaaf") == "msu"
+        assert _match_abbr("Michigan Wolverines", "americanfootball_ncaaf") == "mich"
+        assert _match_abbr("Texas A&M Aggies", "americanfootball_ncaaf") == "txam"
+        assert _match_abbr("Texas Longhorns", "americanfootball_ncaaf") == "tex"
+
+    def test_aggregator_has_three_books(self):
+        agg = MultiBookAggregator(cache_ttl=999)
+        assert hasattr(agg, "bovada")
+        assert agg.bovada.name == "bovada"
+
+    def test_cfb_min_edge(self):
+        from bot.strategies.trade_filter import get_league_min_edge
+        assert get_league_min_edge("aec-cfb-mich-osu-2026-08-29") == pytest.approx(0.05)
+
+    def test_pinnacle_football_leagues(self):
+        from bot.signals.book_scrapers import PINNACLE_LEAGUES
+        assert PINNACLE_LEAGUES["americanfootball_nfl"] == 889
+        assert PINNACLE_LEAGUES["americanfootball_ncaaf"] == 880

@@ -25,6 +25,8 @@ LEAGUE_MIN_EDGE = {
     # ITF tennis: thin, high-vig, notoriously noisy markets — demand more
     "itfme": 0.07,
     "itfwo": 0.07,
+    # College football: soft market (the thesis), but hold the standard floor
+    "cfb": 0.05,
 }
 DEFAULT_MIN_EDGE = 0.05
 

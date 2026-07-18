@@ -58,6 +58,43 @@ LEAGUE_TEAM_FRAGMENTS = {
         "phx": "mercury", "por": "fire", "sea": "storm",
         "tor": "tempo", "wsh": "mystics",
     },
+    "americanfootball_nfl": {
+        # Nicknames are unique within the NFL; abbrs are ESPN's (the
+        # normalized space slugs use for other leagues — verify against
+        # real aec-nfl game slugs when Polymarket posts them).
+        "ari": "cardinals", "atl": "falcons", "bal": "ravens",
+        "buf": "bills", "car": "panthers", "chi": "bears",
+        "cin": "bengals", "cle": "browns", "dal": "cowboys",
+        "den": "broncos", "det": "lions", "gb": "packers",
+        "hou": "texans", "ind": "colts", "jax": "jaguars",
+        "kc": "chiefs", "lac": "chargers", "lar": "rams",
+        "lv": "raiders", "mia": "dolphins", "min": "vikings",
+        "ne": "patriots", "no": "saints", "nyg": "giants",
+        "nyj": "jets", "phi": "eagles", "pit": "steelers",
+        "sea": "seahawks", "sf": "49ers", "tb": "buccaneers",
+        "ten": "titans", "wsh": "commanders",
+    },
+    "americanfootball_ncaaf": {
+        # CFB matches on SCHOOL names (nicknames collide constantly —
+        # Tigers/Bulldogs/Wildcats everywhere). Multi-word specific names
+        # MUST precede their prefixes ("georgia tech" before "georgia") —
+        # _match_abbr iterates in insertion order. Abbrs are internal-
+        # consistent placeholders good enough for cross-book game grouping;
+        # VERIFY against real aec-cfb game slugs before slug-based matching
+        # matters (same process as MLB/WNBA on 2026-07-11).
+        "gt": "georgia tech", "uga": "georgia",
+        "txam": "texas a&m", "ttu": "texas tech", "tex": "texas",
+        "msu": "michigan state", "mich": "michigan",
+        "okst": "oklahoma state", "okla": "oklahoma",
+        "fsu": "florida state", "fla": "florida",
+        "ala": "alabama", "osu": "ohio state", "psu": "penn state",
+        "nd": "notre dame", "lsu": "lsu", "clem": "clemson",
+        "ore": "oregon", "wash": "washington", "tenn": "tennessee",
+        "aub": "auburn", "miss": "ole miss", "usc": "usc",
+        "utah": "utah", "wis": "wisconsin", "iowa": "iowa",
+        "neb": "nebraska", "mizz": "missouri", "ksu": "kansas state",
+        "ariz": "arizona state",
+    },
     "soccer_usa_mls": {
         # Pinnacle/ESPN use distinctive club names; extend as matches surface
         "atl": "atlanta united", "atx": "austin", "clt": "charlotte fc",
@@ -127,6 +164,10 @@ FANDUEL_SPORTS = {
     # No MLS custom page exists — MLS coverage comes from Pinnacle + ESPN.
     "baseball_mlb": "mlb",
     "basketball_wnba": "wnba",
+    # Football (verified live 2026-07-17: nfl=255 markets, ncaaf=350;
+    # "college-football" page 404s — the page id is ncaaf)
+    "americanfootball_nfl": "nfl",
+    "americanfootball_ncaaf": "ncaaf",
 }
 
 
@@ -331,6 +372,178 @@ def _fanduel_lines_from_payload(data: dict) -> List[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Bovada client (verified live 2026-07-17: NFL 20 events, moneyline +
+# spread + total with clean american prices and handicaps; no auth)
+# ---------------------------------------------------------------------------
+
+BOVADA_BASE = "https://www.bovada.lv/services/sports/event/coupon/events/A/description"
+BOVADA_PATHS = {
+    "americanfootball_nfl": "football/nfl",
+    "americanfootball_ncaaf": "football/college-football",
+    "baseball_mlb": "baseball/mlb",
+    "basketball_wnba": "basketball/wnba",
+    "basketball_nba": "basketball/nba",
+    "basketball_ncaab": "basketball/college-basketball",
+    "icehockey_nhl": "hockey/nhl",
+}
+
+
+def _bovada_american(price: dict) -> Optional[float]:
+    """Bovada american odds -> implied prob. 'EVEN' means +100."""
+    raw = price.get("american")
+    if raw is None:
+        return None
+    if str(raw).upper() == "EVEN":
+        return 0.5
+    try:
+        return american_to_prob(int(raw))
+    except (ValueError, TypeError):
+        return None
+
+
+class BovadaClient:
+    """Fetches odds from Bovada's public coupon API."""
+
+    def __init__(self, cache_ttl: int = 300):
+        self.cache_ttl = cache_ttl
+        self._cache: Dict[str, Tuple[float, List[dict]]] = {}
+        self.name = "bovada"
+
+    def _fetch(self, path: str) -> Optional[list]:
+        try:
+            resp = requests.get(
+                f"{BOVADA_BASE}/{path}",
+                params={"marketFilterId": "def", "lang": "en"},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=15,
+            )
+            if resp.status_code != 200 or not resp.text.strip().startswith("["):
+                return None
+            return resp.json()
+        except Exception:
+            return None
+
+    def _events(self, sport_key: str) -> list:
+        path = BOVADA_PATHS.get(sport_key)
+        if not path:
+            return []
+        data = self._fetch(path)
+        if not data:
+            return []
+        events = []
+        for section in data:
+            events.extend(section.get("events", []))
+        return events
+
+    @staticmethod
+    def _teams(ev: dict) -> Optional[Tuple[str, str]]:
+        """Bovada event description is 'Away @ Home'."""
+        desc = ev.get("description", "")
+        if " @ " not in desc:
+            return None
+        away, home = desc.split(" @ ", 1)
+        return away.strip(), home.strip()
+
+    @staticmethod
+    def _main_markets(ev: dict):
+        for dg in ev.get("displayGroups", []):
+            for mkt in dg.get("markets", []):
+                per = mkt.get("period") or {}
+                # keep full-game markets only (quarters/halves excluded)
+                if per and per.get("main") is False:
+                    continue
+                yield mkt
+
+    def get_odds(self, sport_key: str) -> List[dict]:
+        """Moneyline odds: [{home_team, away_team, home_prob, away_prob, book}]."""
+        now = time.time()
+        if sport_key in self._cache:
+            ts, data = self._cache[sport_key]
+            if now - ts < self.cache_ttl:
+                return data
+
+        results: List[dict] = []
+        for ev in self._events(sport_key):
+            teams = self._teams(ev)
+            if not teams:
+                continue
+            away, home = teams
+            for mkt in self._main_markets(ev):
+                if mkt.get("description") != "Moneyline":
+                    continue
+                probs = {}
+                for o in mkt.get("outcomes", []):
+                    pr = _bovada_american(o.get("price", {}))
+                    if pr is not None:
+                        probs[o.get("description", "")] = pr
+                hp, ap = probs.get(home), probs.get(away)
+                if hp is None or ap is None or hp + ap <= 0:
+                    continue
+                results.append({
+                    "book": self.name, "home_team": home, "away_team": away,
+                    "home_prob": hp / (hp + ap), "away_prob": ap / (hp + ap),
+                })
+                break   # one moneyline per event
+        self._cache[sport_key] = (now, results)
+        return results
+
+    def get_lines(self, sport_key: str) -> List[dict]:
+        """Spread/total rows in the aggregator's shared shape."""
+        now = time.time()
+        ck = f"lines_{sport_key}"
+        if ck in self._cache:
+            ts, data = self._cache[ck]
+            if now - ts < self.cache_ttl:
+                return data
+
+        rows: List[dict] = []
+        for ev in self._events(sport_key):
+            teams = self._teams(ev)
+            if not teams:
+                continue
+            away, home = teams
+            for mkt in self._main_markets(ev):
+                desc = mkt.get("description", "")
+                outs = mkt.get("outcomes", [])
+                if desc == "Point Spread" and len(outs) >= 2:
+                    entries = {}
+                    for o in outs:
+                        pr = _bovada_american(o.get("price", {}))
+                        hcp = o.get("price", {}).get("handicap")
+                        if pr is None or hcp is None:
+                            continue
+                        entries[o.get("description", "")] = (float(hcp), pr)
+                    if away in entries and home in entries:
+                        (a_pts, a_pr), (_, h_pr) = entries[away], entries[home]
+                        if a_pr + h_pr > 0:
+                            rows.append({
+                                "book": self.name, "home_team": home,
+                                "away_team": away, "kind": "spread",
+                                "away_points": a_pts,
+                                "prob_away": a_pr / (a_pr + h_pr),
+                            })
+                elif desc == "Total" and len(outs) >= 2:
+                    entries = {}
+                    for o in outs:
+                        pr = _bovada_american(o.get("price", {}))
+                        hcp = o.get("price", {}).get("handicap")
+                        if pr is None or hcp is None:
+                            continue
+                        entries[o.get("description", "").lower()] = (float(hcp), pr)
+                    if "over" in entries and "under" in entries:
+                        (pts, o_pr), (_, u_pr) = entries["over"], entries["under"]
+                        if o_pr + u_pr > 0:
+                            rows.append({
+                                "book": self.name, "home_team": home,
+                                "away_team": away, "kind": "total",
+                                "points": pts,
+                                "prob_over": o_pr / (o_pr + u_pr),
+                            })
+        self._cache[ck] = (now, rows)
+        return rows
+
+
+# ---------------------------------------------------------------------------
 # Pinnacle client
 # ---------------------------------------------------------------------------
 
@@ -344,6 +557,9 @@ PINNACLE_LEAGUES = {
     "basketball_wnba": 578,
     "soccer_usa_mls": 2663,
     "mma_mixed_martial_arts": 1624,   # UFC (Pinnacle serves live fight lines)
+    # Football (discovered live 2026-07-17: NFL 143 matchups, NCAA 153)
+    "americanfootball_nfl": 889,
+    "americanfootball_ncaaf": 880,
 }
 
 # Tennis: Pinnacle has no stable league id — every tournament is its own
@@ -612,6 +828,7 @@ class MultiBookAggregator:
     def __init__(self, cache_ttl: int = 300):
         self.fanduel = FanDuelClient(cache_ttl=cache_ttl)
         self.pinnacle = PinnacleClient(cache_ttl=cache_ttl)
+        self.bovada = BovadaClient(cache_ttl=cache_ttl)
         self.cache_ttl = cache_ttl
         self._cache: Dict[str, Tuple[float, dict]] = {}
 
@@ -641,6 +858,13 @@ class MultiBookAggregator:
         try:
             pin = self.pinnacle.get_odds(sport_key)
             all_events.extend(pin)
+        except Exception:
+            pass
+
+        # Bovada (third book — verified live 2026-07-17)
+        try:
+            bov = self.bovada.get_odds(sport_key)
+            all_events.extend(bov)
         except Exception:
             pass
 
@@ -769,7 +993,7 @@ class MultiBookAggregator:
             if now - ts < self.cache_ttl:
                 return data
         rows: List[dict] = []
-        for client in (self.fanduel, self.pinnacle):
+        for client in (self.fanduel, self.pinnacle, self.bovada):
             try:
                 rows.extend(client.get_lines(sport_key))
             except Exception:
