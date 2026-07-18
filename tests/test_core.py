@@ -4005,6 +4005,7 @@ class TestBookDedup:
         agg.fanduel.get_odds = lambda sk: events[:2]
         agg.pinnacle.get_odds = lambda sk: events[2:]
         agg.bovada.get_odds = lambda sk: []   # third book stubbed out
+        agg.espn_dk.get_odds = lambda sk: []  # fourth book stubbed out
         consensus = agg.get_consensus("baseball_mlb")
         assert len(consensus) == 1
         assert consensus[0]["num_books"] == 2          # not 3
@@ -4753,3 +4754,80 @@ class TestFootballWiring:
         from bot.signals.book_scrapers import PINNACLE_LEAGUES
         assert PINNACLE_LEAGUES["americanfootball_nfl"] == 889
         assert PINNACLE_LEAGUES["americanfootball_ncaaf"] == 880
+
+
+# ============================================================================
+# DraftKings via ESPN scoreboard (4th book)
+# ============================================================================
+
+from bot.signals.book_scrapers import (
+    EspnDkClient, _espn_close_odds, _espn_close_line,
+)
+
+
+def _espn_event():
+    """Shape copied from the live MLB scoreboard response (2026-07-17)."""
+    return {"competitions": [{
+        "competitors": [
+            {"homeAway": "home", "team": {"displayName": "Cleveland Guardians"}},
+            {"homeAway": "away", "team": {"displayName": "Pittsburgh Pirates"}},
+        ],
+        "odds": [{
+            "provider": {"name": "DraftKings"},
+            "moneyline": {"home": {"close": {"odds": "-131"}},
+                          "away": {"close": {"odds": "+111"}}},
+            "pointSpread": {"home": {"close": {"line": "-1.5", "odds": "+162"}},
+                            "away": {"close": {"line": "+1.5", "odds": "-198"}}},
+            "total": {"over": {"close": {"line": "o7.5", "odds": "-105"}},
+                      "under": {"close": {"line": "u7.5", "odds": "-115"}}},
+        }],
+    }]}
+
+
+class TestEspnDkClient:
+    def _client(self):
+        c = EspnDkClient(cache_ttl=999)
+        c._scoreboard_events = lambda sk: [_espn_event()]
+        return c
+
+    def test_close_parsers(self):
+        assert _espn_close_odds({"close": {"odds": "-131"}}) == pytest.approx(0.567, abs=0.01)
+        assert _espn_close_odds({"close": {"odds": "+111"}}) == pytest.approx(0.474, abs=0.01)
+        assert _espn_close_odds(None) is None
+        assert _espn_close_line({"close": {"line": "o7.5"}}) == 7.5
+        assert _espn_close_line({"close": {"line": "-1.5"}}) == -1.5
+        assert _espn_close_line({"close": {"line": "+1.5"}}) == 1.5
+
+    def test_moneyline_devig(self):
+        odds = self._client().get_odds("baseball_mlb")
+        assert len(odds) == 1
+        g = odds[0]
+        assert g["book"] == "draftkings"
+        assert g["home_team"] == "Cleveland Guardians"
+        # -131 (0.567) vs +111 (0.474) -> devig home ~0.545
+        assert g["home_prob"] == pytest.approx(0.545, abs=0.01)
+
+    def test_lines_spread_mirror_and_total(self):
+        rows = self._client().get_lines("baseball_mlb")
+        spread = next(r for r in rows if r["kind"] == "spread")
+        total = next(r for r in rows if r["kind"] == "total")
+        # away = mirror of home line (home -1.5 => away +1.5)
+        assert spread["away_points"] == 1.5
+        # away -198 heavy favorite to cover +1.5
+        assert spread["prob_away"] > 0.5
+        assert total["points"] == 7.5
+        # over -105 vs under -115 -> over slightly under half
+        assert total["prob_over"] == pytest.approx(0.489, abs=0.01)
+
+    def test_missing_moneyline_skipped(self):
+        ev = _espn_event()
+        del ev["competitions"][0]["odds"][0]["moneyline"]
+        c = EspnDkClient(cache_ttl=999)
+        c._scoreboard_events = lambda sk: [ev]
+        assert c.get_odds("baseball_mlb") == []
+        # but lines still parse
+        assert len(c.get_lines("baseball_mlb")) == 2
+
+    def test_aggregator_has_four_books(self):
+        agg = MultiBookAggregator(cache_ttl=999)
+        assert agg.espn_dk.name == "draftkings"

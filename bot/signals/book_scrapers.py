@@ -544,6 +544,145 @@ class BovadaClient:
 
 
 # ---------------------------------------------------------------------------
+# ESPN scoreboard odds = DraftKings (verified live 2026-07-17: every NFL/MLB
+# event + 51 CFB events carry provider=DraftKings with nested
+# moneyline/pointSpread/total close odds). DK's own API is bot-blocked (403);
+# ESPN redistributes the same line free — one call per league.
+# ---------------------------------------------------------------------------
+
+def _espn_close_odds(node: Optional[dict]) -> Optional[float]:
+    """ESPN nested odds node ({'close': {'odds': '-131', ...}}) -> implied prob."""
+    if not node:
+        return None
+    raw = (node.get("close") or {}).get("odds")
+    if raw is None:
+        return None
+    raw = str(raw).replace("EVEN", "+100")
+    try:
+        return american_to_prob(int(raw.replace("+", ""))
+                                if raw.startswith("+") else int(raw))
+    except (ValueError, TypeError):
+        return None
+
+
+def _espn_close_line(node: Optional[dict]) -> Optional[float]:
+    """ESPN nested line ('-1.5', '+1.5', 'o7.5', 'u7.5') -> float."""
+    if not node:
+        return None
+    raw = (node.get("close") or {}).get("line")
+    if raw is None:
+        return None
+    try:
+        return float(str(raw).lstrip("ou").replace("+", ""))
+    except (ValueError, TypeError):
+        return None
+
+
+class EspnDkClient:
+    """DraftKings odds via ESPN's scoreboard (free redistribution)."""
+
+    def __init__(self, cache_ttl: int = 300):
+        self.cache_ttl = cache_ttl
+        self._cache: Dict[str, Tuple[float, List[dict]]] = {}
+        self.name = "draftkings"
+
+    def _scoreboard_events(self, sport_key: str) -> list:
+        from bot.leagues import LEAGUES, scoreboard_url
+        league = next((code for code, info in LEAGUES.items()
+                       if info.get("odds_api_key") == sport_key), None)
+        url = scoreboard_url(league) if league else None
+        if not url:
+            return []
+        try:
+            resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"},
+                                timeout=15)
+            if resp.status_code != 200:
+                return []
+            return resp.json().get("events", [])
+        except Exception:
+            return []
+
+    @staticmethod
+    def _event_parts(ev: dict):
+        """(home_name, away_name, odds_obj) or None."""
+        comp = (ev.get("competitions") or [{}])[0]
+        home = away = None
+        for c in comp.get("competitors", []):
+            nm = c.get("team", {}).get("displayName", "")
+            if c.get("homeAway") == "home":
+                home = nm
+            elif c.get("homeAway") == "away":
+                away = nm
+        odds = comp.get("odds") or []
+        if not (home and away and odds):
+            return None
+        return home, away, odds[0]
+
+    def get_odds(self, sport_key: str) -> List[dict]:
+        now = time.time()
+        if sport_key in self._cache:
+            ts, data = self._cache[sport_key]
+            if now - ts < self.cache_ttl:
+                return data
+        results: List[dict] = []
+        for ev in self._scoreboard_events(sport_key):
+            parts = self._event_parts(ev)
+            if not parts:
+                continue
+            home, away, o = parts
+            ml = o.get("moneyline") or {}
+            hp = _espn_close_odds(ml.get("home"))
+            ap = _espn_close_odds(ml.get("away"))
+            if hp is None or ap is None or hp + ap <= 0:
+                continue
+            results.append({
+                "book": self.name, "home_team": home, "away_team": away,
+                "home_prob": hp / (hp + ap), "away_prob": ap / (hp + ap),
+            })
+        self._cache[sport_key] = (now, results)
+        return results
+
+    def get_lines(self, sport_key: str) -> List[dict]:
+        now = time.time()
+        ck = f"lines_{sport_key}"
+        if ck in self._cache:
+            ts, data = self._cache[ck]
+            if now - ts < self.cache_ttl:
+                return data
+        rows: List[dict] = []
+        for ev in self._scoreboard_events(sport_key):
+            parts = self._event_parts(ev)
+            if not parts:
+                continue
+            home, away, o = parts
+            ps = o.get("pointSpread") or {}
+            a_pts = _espn_close_line(ps.get("away"))
+            a_pr = _espn_close_odds(ps.get("away"))
+            h_pr = _espn_close_odds(ps.get("home"))
+            if a_pts is not None and a_pr and h_pr and a_pr + h_pr > 0:
+                # away line sign: ESPN gives it signed already except '+' strip;
+                # detail string carries the sign for away as the mirror of home
+                h_pts = _espn_close_line(ps.get("home"))
+                if h_pts is not None:
+                    a_pts = -h_pts   # authoritative: away = mirror of home line
+                rows.append({"book": self.name, "home_team": home,
+                             "away_team": away, "kind": "spread",
+                             "away_points": a_pts,
+                             "prob_away": a_pr / (a_pr + h_pr)})
+            tot = o.get("total") or {}
+            pts = _espn_close_line(tot.get("over"))
+            o_pr = _espn_close_odds(tot.get("over"))
+            u_pr = _espn_close_odds(tot.get("under"))
+            if pts is not None and o_pr and u_pr and o_pr + u_pr > 0:
+                rows.append({"book": self.name, "home_team": home,
+                             "away_team": away, "kind": "total",
+                             "points": pts,
+                             "prob_over": o_pr / (o_pr + u_pr)})
+        self._cache[ck] = (now, rows)
+        return rows
+
+
+# ---------------------------------------------------------------------------
 # Pinnacle client
 # ---------------------------------------------------------------------------
 
@@ -829,6 +968,7 @@ class MultiBookAggregator:
         self.fanduel = FanDuelClient(cache_ttl=cache_ttl)
         self.pinnacle = PinnacleClient(cache_ttl=cache_ttl)
         self.bovada = BovadaClient(cache_ttl=cache_ttl)
+        self.espn_dk = EspnDkClient(cache_ttl=cache_ttl)
         self.cache_ttl = cache_ttl
         self._cache: Dict[str, Tuple[float, dict]] = {}
 
@@ -865,6 +1005,14 @@ class MultiBookAggregator:
         try:
             bov = self.bovada.get_odds(sport_key)
             all_events.extend(bov)
+        except Exception:
+            pass
+
+        # DraftKings via ESPN scoreboard (fourth book — DK direct is 403;
+        # ESPN redistributes the identical line free)
+        try:
+            dk = self.espn_dk.get_odds(sport_key)
+            all_events.extend(dk)
         except Exception:
             pass
 
@@ -993,7 +1141,7 @@ class MultiBookAggregator:
             if now - ts < self.cache_ttl:
                 return data
         rows: List[dict] = []
-        for client in (self.fanduel, self.pinnacle, self.bovada):
+        for client in (self.fanduel, self.pinnacle, self.bovada, self.espn_dk):
             try:
                 rows.extend(client.get_lines(sport_key))
             except Exception:
