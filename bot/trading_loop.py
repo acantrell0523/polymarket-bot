@@ -821,7 +821,7 @@ class TradingBot:
                 if not consensus:
                     try:
                         from bot.signals.live_win_prob import slug_game_teams
-                        from bot.leagues import LEAGUES
+                        from bot.leagues import LEAGUES, parse_derivative_slug
                         parsed = slug_game_teams(slug)
                         if parsed:
                             league, away, home = parsed
@@ -830,6 +830,19 @@ class TradingBot:
                                     if sk else None)
                             if game:
                                 consensus = game.get("away_prob")
+                        else:
+                            # Derivative (spread/total) slugs — the weekend's
+                            # dominant trades — never stamped: they don't
+                            # parse as games. Use the book line at the same
+                            # points, exactly as the entry signal does.
+                            d = parse_derivative_slug(slug)
+                            if d:
+                                sk = (LEAGUES.get(d["league"]) or {}).get("odds_api_key")
+                                r = (self.line_aggregator.find_line(
+                                        sk, d["away"], d["home"], d["kind"], d["line"])
+                                     if sk else None)
+                                if r:
+                                    consensus = r[0]
                     except Exception:
                         pass
                 if consensus:
@@ -1300,7 +1313,29 @@ class TradingBot:
 
                 else:
                     # === FAST SCAN: live games only ===
-                    live_markets, _ = self._split_markets(self._cached_markets)
+                    live_markets, pregame_markets = self._split_markets(self._cached_markets)
+
+                    # Stamp closing lines PREGAME (start <=15 min out):
+                    # books still quote the game then, whereas at the live
+                    # transition they've already pulled it — that race left
+                    # the entire weekend unstamped.
+                    try:
+                        now_utc = datetime.now(timezone.utc)
+                        imminent = []
+                        for pm in pregame_markets:
+                            gs = pm.get("gameStartTime")
+                            if not gs:
+                                continue
+                            try:
+                                start = dateutil_parser.isoparse(gs)
+                            except Exception:
+                                continue
+                            if timedelta(0) <= start - now_utc <= timedelta(minutes=15):
+                                imminent.append(pm)
+                        if imminent:
+                            self._record_closing_lines(imminent)
+                    except Exception:
+                        pass
 
                     if live_markets:
                         # Beat inside the fast path too: a long live pass must

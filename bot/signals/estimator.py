@@ -250,10 +250,16 @@ class ProbabilityEstimator:
         if market_type in ("politics", "other"):
             # A matched Kalshi market (same instrument on a regulated
             # exchange) outranks PredictIt fuzzy-matching whenever present.
-            kal = next((s for s in signals
-                        if s.name == "kalshi_value" and s.confidence > 0), None)
+            kal = next((s for s in signals if s.name == "kalshi_value"), None)
             if kal is not None:
-                return kal
+                if kal.confidence > 0:
+                    return kal
+                if kal.metadata.get("mechanical_family"):
+                    # A slug we know how to match mechanically but DIDN'T
+                    # match has no trustworthy external source — block it
+                    # rather than let PredictIt fuzzy-match it (that path
+                    # produced phantom edges on unmatched temp buckets).
+                    return None
 
         primary_name = {
             "sports": "odds_value",

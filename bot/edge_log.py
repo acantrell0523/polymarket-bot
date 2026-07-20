@@ -111,8 +111,9 @@ def insert_edge_log(
         """INSERT INTO edge_log
            (slug, timestamp, market_type, league, polymarket_price, consensus_price,
             books_used, num_books, edge_at_entry, signal_snapshot, edge_pattern,
-            is_live_game, entry_time, resolution_flag)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            is_live_game, entry_time, resolution_flag,
+            closing_line_value, closing_line_price)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)""",
         (slug, datetime.now(timezone.utc).isoformat(), market_type, league,
          polymarket_price, consensus_price, books_used, num_books,
          edge_at_entry, json.dumps(signal_snapshot, default=str),

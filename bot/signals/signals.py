@@ -285,7 +285,14 @@ def kalshi_value_signal(
     Mechanical matching only (bot/signals/kalshi.py); no fuzzy text.
     """
     neutral = Signal(name="kalshi_value", value=0.5, confidence=0.0,
-                     direction="neutral", metadata={"reason": "no_match"})
+                     direction="neutral",
+                     metadata={"reason": "no_match",
+                               # Mechanical families must FAIL CLOSED when
+                               # unmatched — never fall through to PredictIt
+                               # fuzzy matching (the audit caught unmatched
+                               # temp buckets reaching validation that way).
+                               "mechanical_family":
+                                   snapshot.slug.startswith("tc-temp-")})
     if kalshi_cache is None:
         neutral.metadata["reason"] = "no_kalshi_cache"
         return neutral
