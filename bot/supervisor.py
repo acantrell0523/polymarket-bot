@@ -32,6 +32,10 @@ from bot.edge_log import (
 KILL_SWITCH_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "kill_switch")
 DATA_DIR = os.path.dirname(KILL_SWITCH_PATH)
 
+# Trading-liveness guard thresholds (the Jul 20-23 lockout ran 3 days unseen)
+LIVENESS_STUCK_HOURS = 6.0      # alive + scannable but not trading this long => alert
+LIVENESS_MIN_PRICEABLE = 10     # only meaningful when a real universe is in view
+
 
 class Supervisor:
     """Read-only supervisor. Reports performance, never changes config."""
@@ -423,6 +427,81 @@ class Supervisor:
             self.alerter._post(COLOR_GREEN,
                 ":heartbeat: Trading loop heartbeat recovered.")
 
+    def check_trading_liveness(self):
+        """Alert when the loop is ALIVE but no longer TRADING.
+
+        check_heartbeat only proves the PROCESS is up. The Jul 20-23 lockout
+        was invisible to it: a stuck daily-trade counter made
+        can_open_position() return False every cycle, so the bot scanned a
+        full universe for 3 days and logged zero decisions with a perfectly
+        fresh heartbeat and no error. This is the "function liveness" guard.
+
+        Two independent trip conditions (either fires):
+          1. can_open has been False continuously for > LIVENESS_STUCK_HOURS
+             while a scannable universe exists — a risk gate stuck shut
+             (daily-limit lockout, orphaned positions, un-cleared pause).
+          2. No decision has been logged for > LIVENESS_STUCK_HOURS while
+             priceable markets exist — the decision path is dead upstream.
+        Fires once per episode; recovers when it clears.
+        """
+        from bot.health import HealthMonitor, STALE_HEARTBEAT_SECONDS
+        import time as _time
+
+        hb = HealthMonitor.read_heartbeat(DATA_DIR)
+        if hb is None:
+            return
+        age = HealthMonitor.heartbeat_age_seconds(DATA_DIR)
+        if age is None or age > STALE_HEARTBEAT_SECONDS:
+            return  # process death is the heartbeat check's job, not this one
+
+        priceable = hb.get("priceable", 0) or 0
+        can_open = hb.get("can_open", True)
+        last_dec = hb.get("last_decision_ts", 0) or 0
+        now = _time.time()
+        stuck_secs = LIVENESS_STUCK_HOURS * 3600
+
+        # Only meaningful when there IS something to trade.
+        if priceable < LIVENESS_MIN_PRICEABLE:
+            self._clear_liveness_alert()
+            return
+
+        reason = None
+        # 1. Risk gate stuck shut.
+        if not can_open:
+            since = getattr(self, "_cannot_open_since", None)
+            if since is None:
+                self._cannot_open_since = now
+            elif now - since > stuck_secs:
+                reason = (f"can_open=false for {(now - since)/3600:.1f}h "
+                          f"(daily_trades={hb.get('daily_trades', '?')}, "
+                          f"open_positions={hb.get('open_positions', '?')})")
+        else:
+            self._cannot_open_since = None
+
+        # 2. Decision path silent while a universe exists.
+        if reason is None and last_dec > 0 and now - last_dec > stuck_secs:
+            reason = (f"no decision logged for {(now - last_dec)/3600:.1f}h "
+                      f"while {priceable} markets priceable")
+
+        if reason and not getattr(self, "_liveness_alerted", False):
+            self._liveness_alerted = True
+            self.logger.error("trading_liveness_stuck", {"reason": reason, "hb": hb})
+            self.alerter._post(COLOR_RED,
+                f":no_entry: *Bot alive but not trading* — {reason}.\n"
+                f"Heartbeat is fresh (cycle `{hb.get('cycle','?')}`) so the "
+                f"process is healthy; the trade path is blocked. Check the "
+                f"risk gate / daily counters."
+            )
+        elif not reason and getattr(self, "_liveness_alerted", False):
+            self._clear_liveness_alert()
+
+    def _clear_liveness_alert(self):
+        if getattr(self, "_liveness_alerted", False):
+            self._liveness_alerted = False
+            self.alerter._post(COLOR_GREEN,
+                ":white_check_mark: Trading resumed — liveness recovered.")
+        self._cannot_open_since = None
+
     # ------------------------------------------------------------------
     # Daily review (report only)
     # ------------------------------------------------------------------
@@ -632,6 +711,14 @@ class Supervisor:
             minutes=5,
             id="heartbeat_check",
             name="Trading Loop Heartbeat Check",
+        )
+
+        scheduler.add_job(
+            self.check_trading_liveness,
+            "interval",
+            minutes=15,
+            id="trading_liveness_check",
+            name="Trading Liveness Check (alive but not trading)",
         )
 
         scheduler.add_job(

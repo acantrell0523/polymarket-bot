@@ -247,6 +247,12 @@ class TradingBot:
         # the table with identical rows (231 of 265 today), making CLV/edge
         # analysis impossible. Log a repeat only after this cooldown.
         self._decision_dedup: Dict[tuple, float] = {}
+        # Trading-liveness telemetry for the supervisor's silence guard.
+        # The Jul 20-23 lockout was invisible because the heartbeat only
+        # proved the PROCESS was alive, not that it could still TRADE.
+        self._last_decision_ts: float = 0.0
+        self._last_scan_priceable: int = 0
+        self._last_scan_live: int = 0
         self._decision_dedup_seconds = 900  # 15 min
         self._restore_game_discipline_counts()
 
@@ -621,6 +627,7 @@ class TradingBot:
                 if now_ts - last < self._decision_dedup_seconds:
                     return
                 self._decision_dedup[key] = now_ts
+            self._last_decision_ts = _time.time()
             import json as _json
             from bot.trade_db import insert_decision
             from bot.signals.estimator import detect_market_type
@@ -1155,6 +1162,28 @@ class TradingBot:
         for p in open_pos:
             print(f"    {p.side.upper():4s}  ${p.size_usd:.0f}  @ {p.entry_price:.3f}  {p.market_id}")
 
+    def _heartbeat_payload(self, cycle: int, mode: str, **extra) -> dict:
+        """Base heartbeat every beat() shares, so BOTH the full-scan and
+        fast-scan paths carry the trading-liveness telemetry the supervisor's
+        silence guard needs (can_open / daily_trades / last_decision_ts /
+        priceable). A minimal fast-path beat used to clobber the enriched
+        full-scan beat, blanking those fields."""
+        _open = self.portfolio.get_open_positions()
+        payload = {
+            "cycle": cycle,
+            "mode": mode,
+            "open_positions": len(_open),
+            "can_open": bool(self.risk.can_open_position(_open)),
+            "daily_trades": self.risk.daily_trade_count,
+            "last_decision_ts": self._last_decision_ts,
+            "priceable": self._last_scan_priceable,
+            "degraded_sources": [
+                s for s in ("market_data",) if self.health.is_degraded(s)
+            ],
+        }
+        payload.update(extra)
+        return payload
+
     def run(self):
         """Main trading loop with dual-speed scanning.
 
@@ -1212,14 +1241,11 @@ class TradingBot:
             cycle += 1
             try:
                 # Liveness heartbeat — read by the supervisor's stale check
-                self.health.beat({
-                    "cycle": cycle,
-                    "mode": mode,
-                    "open_positions": len(self.portfolio.get_open_positions()),
-                    "degraded_sources": [
-                        s for s in ("market_data",) if self.health.is_degraded(s)
-                    ],
-                })
+                # Liveness heartbeat — carries trading-liveness telemetry so
+                # the supervisor can detect a loop that is ALIVE but no longer
+                # TRADING (the Jul 20-23 lockout: healthy heartbeat, zero
+                # decisions for 3 days).
+                self.health.beat(self._heartbeat_payload(cycle, mode))
 
                 # Check supervisor kill switch / pause
                 if not self._check_supervisor_flags():
@@ -1276,6 +1302,7 @@ class TradingBot:
                         or m.get("slug", "").startswith(("cpc-", "tc-temp-"))
                         or not m.get("gameStartTime")
                     ]
+                    self._last_scan_priceable = len(scannable)
                     self.logger.info("full_scan_universe", {
                         "in_window": len(markets),
                         "priceable": len(scannable),
@@ -1340,13 +1367,9 @@ class TradingBot:
                     if live_markets:
                         # Beat inside the fast path too: a long live pass must
                         # not look like a dead loop to the supervisor.
-                        self.health.beat({
-                            "cycle": cycle,
-                            "mode": mode,
-                            "phase": "live_scan",
-                            "live_count": len(live_markets),
-                            "open_positions": len(self.portfolio.get_open_positions()),
-                        })
+                        self.health.beat(self._heartbeat_payload(
+                            cycle, mode, phase="live_scan",
+                            live_count=len(live_markets)))
                         self.logger.info("live_scan_start", {
                             "cycle": cycle,
                             "live_count": len(live_markets),

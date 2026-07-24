@@ -5020,3 +5020,93 @@ class TestDailyLimitRollover:
         rm.reset_daily_pnl(datetime.now(timezone.utc).strftime("%Y-%m-%d"))
         rm.daily_trade_count = 5
         assert rm.is_daily_trade_limit_reached() is True   # not a new day
+
+
+# ============================================================================
+# Supervisor trading-liveness guard (would have caught the Jul 20-23 lockout)
+# ============================================================================
+
+class TestTradingLivenessGuard:
+    def _sup(self):
+        import bot.supervisor as sup_mod
+        import bot.health as health_mod
+        self._health_mod = health_mod
+        s = sup_mod.Supervisor.__new__(sup_mod.Supervisor)   # skip __init__/scheduler
+        # minimal stubs
+        class _A:
+            posts = []
+            def _post(self, color, msg): self.posts.append((color, msg))
+        class _L:
+            def error(self, *a, **k): pass
+        s.alerter = _A(); s.logger = _L()
+        return s, sup_mod
+
+    def _hb(self, **kw):
+        import time as _t
+        base = {"timestamp": _t.time(), "cycle": 5, "mode": "PAPER",
+                "priceable": 300, "can_open": True, "daily_trades": 2,
+                "open_positions": 0, "last_decision_ts": _t.time()}
+        base.update(kw)
+        return base
+
+    def test_healthy_no_alert(self, monkeypatch):
+        s, mod = self._sup()
+        monkeypatch.setattr(self._health_mod.HealthMonitor, "read_heartbeat", staticmethod(lambda d: self._hb()))
+        monkeypatch.setattr(self._health_mod.HealthMonitor, "heartbeat_age_seconds", staticmethod(lambda d: 5.0))
+        s.check_trading_liveness()
+        assert not getattr(s, "_liveness_alerted", False)
+        assert s.alerter.posts == []
+
+    def test_lockout_can_open_false_fires(self, monkeypatch):
+        """The exact Jul 20 scenario: fresh heartbeat, full universe,
+        can_open False for hours."""
+        import time as _t
+        s, mod = self._sup()
+        monkeypatch.setattr(self._health_mod.HealthMonitor, "read_heartbeat",
+                            staticmethod(lambda d: self._hb(can_open=False, daily_trades=5)))
+        monkeypatch.setattr(self._health_mod.HealthMonitor, "heartbeat_age_seconds", staticmethod(lambda d: 5.0))
+        # First check arms the timer; simulate it started 7h ago
+        s.check_trading_liveness()
+        s._cannot_open_since = _t.time() - 7 * 3600
+        s.check_trading_liveness()
+        assert s._liveness_alerted is True
+        assert any("not trading" in m for _, m in s.alerter.posts)
+        assert any("can_open=false" in m for _, m in s.alerter.posts)
+
+    def test_decision_silence_fires(self, monkeypatch):
+        import time as _t
+        s, mod = self._sup()
+        monkeypatch.setattr(self._health_mod.HealthMonitor, "read_heartbeat",
+                            staticmethod(lambda d: self._hb(last_decision_ts=_t.time() - 8 * 3600)))
+        monkeypatch.setattr(self._health_mod.HealthMonitor, "heartbeat_age_seconds", staticmethod(lambda d: 5.0))
+        s.check_trading_liveness()
+        assert s._liveness_alerted is True
+        assert any("no decision logged" in m for _, m in s.alerter.posts)
+
+    def test_empty_universe_no_false_alarm(self, monkeypatch):
+        """No priceable markets (genuine off-hours) must NOT alert even with
+        can_open False."""
+        s, mod = self._sup()
+        monkeypatch.setattr(self._health_mod.HealthMonitor, "read_heartbeat",
+                            staticmethod(lambda d: self._hb(priceable=0, can_open=False)))
+        monkeypatch.setattr(self._health_mod.HealthMonitor, "heartbeat_age_seconds", staticmethod(lambda d: 5.0))
+        s.check_trading_liveness()
+        assert not getattr(s, "_liveness_alerted", False)
+
+    def test_stale_heartbeat_deferred_to_heartbeat_check(self, monkeypatch):
+        s, mod = self._sup()
+        monkeypatch.setattr(self._health_mod.HealthMonitor, "read_heartbeat", staticmethod(lambda d: self._hb(can_open=False)))
+        monkeypatch.setattr(self._health_mod.HealthMonitor, "heartbeat_age_seconds", staticmethod(lambda d: 9999.0))
+        s.check_trading_liveness()
+        assert not getattr(s, "_liveness_alerted", False)   # process-death is the other check's job
+
+    def test_recovery_message(self, monkeypatch):
+        import time as _t
+        s, mod = self._sup()
+        # start alerted
+        s._liveness_alerted = True; s._cannot_open_since = None
+        monkeypatch.setattr(self._health_mod.HealthMonitor, "read_heartbeat", staticmethod(lambda d: self._hb()))
+        monkeypatch.setattr(self._health_mod.HealthMonitor, "heartbeat_age_seconds", staticmethod(lambda d: 5.0))
+        s.check_trading_liveness()
+        assert s._liveness_alerted is False
+        assert any("recovered" in m for _, m in s.alerter.posts)
