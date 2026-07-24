@@ -35,10 +35,28 @@ class RiskManager:
             self.reset_daily_pnl(today)
         self.daily_trade_count += 1
 
+    def _roll_day_if_needed(self):
+        """Reset daily counters on the UTC date boundary.
+
+        CRITICAL: the reset was previously lazy — only record_trade_opened()
+        and record_pnl() checked the date. But can_open_position() reads the
+        daily-limit checks WITHOUT opening a trade, so once a day hit
+        max_daily_trades and then went idle (no further open/close to fire a
+        write-path reset), the counter stayed maxed across every following
+        date boundary and locked the bot out permanently. Observed 2026-07-20:
+        5 trades opened, then 3 full days of zero decisions. The reset must
+        fire on READ, not just on write.
+        """
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self.last_reset_date is not None and self.last_reset_date != today:
+            self.reset_daily_pnl(today)
+
     def is_daily_trade_limit_reached(self) -> bool:
+        self._roll_day_if_needed()
         return self.daily_trade_count >= self.config.max_daily_trades
 
     def is_daily_limit_breached(self) -> bool:
+        self._roll_day_if_needed()
         return self.daily_pnl <= -self.config.daily_loss_limit_usd
 
     def check_position(self, position: Position, current_price: float, estimated_prob: float) -> Optional[str]:
@@ -144,6 +162,7 @@ class RiskManager:
         return None
 
     def can_open_position(self, current_positions: List[Position]) -> bool:
+        self._roll_day_if_needed()
         open_positions = [p for p in current_positions if p.status == "open"]
         if len(open_positions) >= self.config.max_open_positions:
             return False

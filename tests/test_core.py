@@ -4972,3 +4972,51 @@ class TestKalshiSignal:
         snap = self._snap("tc-temp-nychigh-2026-07-18-lt79f", 0.70)
         # no kalshi match + no predictit -> external gate blocks
         assert est.detect_edge(snap, min_edge=0.05, max_edge=0.40) is None
+
+
+# ============================================================================
+# Daily-limit lockout regression (2026-07-20: 3-day silent lockout)
+# ============================================================================
+
+class TestDailyLimitRollover:
+    """The daily trade counter reset lazily (write-path only), so a day that
+    hit max_daily_trades and then went idle stayed maxed across every later
+    date boundary — the bot logged zero decisions for 3 days."""
+
+    def _rm(self):
+        from bot.strategies.risk import RiskManager
+        from utils.config import TradingConfig
+        return RiskManager(TradingConfig(max_daily_trades=5, daily_loss_limit_usd=75.0))
+
+    def test_trade_limit_resets_on_new_day_via_read(self):
+        rm = self._rm()
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        rm.reset_daily_pnl(today)          # maxed TODAY
+        rm.daily_trade_count = 5
+        assert rm.is_daily_trade_limit_reached()     # holds same day
+        # Date advances with NO open/close between (the lockout scenario):
+        rm.last_reset_date = "2000-01-01"            # any prior date
+        assert rm.is_daily_trade_limit_reached() is False   # read-path rolls it
+        assert rm.daily_trade_count == 0
+
+    def test_can_open_position_rolls_day(self):
+        from utils.models import Position
+        rm = self._rm()
+        rm.reset_daily_pnl("2026-07-20")
+        rm.daily_trade_count = 5
+        rm.last_reset_date = "2026-07-19"   # stale -> must roll on read
+        assert rm.can_open_position([]) is True
+
+    def test_loss_limit_resets_on_new_day(self):
+        rm = self._rm()
+        rm.reset_daily_pnl("2026-07-20")
+        rm.daily_pnl = -100.0
+        rm.last_reset_date = "2026-07-19"
+        assert rm.is_daily_limit_breached() is False
+        assert rm.daily_pnl == 0.0
+
+    def test_same_day_limit_still_holds(self):
+        rm = self._rm()
+        rm.reset_daily_pnl(datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+        rm.daily_trade_count = 5
+        assert rm.is_daily_trade_limit_reached() is True   # not a new day
