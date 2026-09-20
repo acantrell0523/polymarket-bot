@@ -10,7 +10,7 @@ api:
   max_retries: 3
   retry_backoff_base: 2.0
 onchain:
-  enabled: true
+  enabled: false   # 2026-09-20: 0.6s/market of extra API calls; disabled for the live loop
   max_requests_per_second: 3
   cache_ttl_seconds: 120
   enrich_all_markets: false

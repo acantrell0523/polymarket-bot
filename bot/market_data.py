@@ -14,6 +14,20 @@ from utils.config import APIConfig, FilterConfig
 from utils.logger import TradingLogger
 
 
+# Game-winner slug families on polymarket.us: aec- = 2-way moneyline,
+# atc- = 3-way (soccer). Spreads (asc-), totals (tsc-), props (astatc-…)
+# and futures (tec-) are excluded from the scan universe.
+from bot.leagues import LEAGUES
+from bot.signals.lines import LINE_PREFIXES, SUPPORTED_LEAGUES, parse_line_slug
+
+MONEYLINE_PREFIXES = ("aec-", "atc-")
+# Spread/total markets (asc-/tsc-) are admitted for leagues in
+# bot.signals.lines.SUPPORTED_LEAGUES when token 0 is priced in this band.
+LINE_MIN_PRICE = 0.30
+LINE_MAX_PRICE = 0.70
+MAX_LINES_PER_GAME = 3   # per game per kind (spread / total)
+
+
 class MarketDataClient:
     """Fetches market data from Polymarket US API (primary) and CLOB API (fallback for order books)."""
 
@@ -23,6 +37,12 @@ class MarketDataClient:
         self.filters = filters or FilterConfig()
         self._min_interval = 1.0 / config.max_requests_per_second
         self._last_call = 0.0
+        # The gateway rate-limits /book and /bbo far harder than /markets:
+        # measured 2026-09-20 at ~5 requests per 10-second window (429 with
+        # Retry-After up to 10s beyond that), while 80 list pages at 4 rps
+        # never 429'd. Book calls get their own, slower limiter.
+        self._book_min_interval = 2.0
+        self._last_book_call = 0.0
 
         self.session = requests.Session()
         retries = Retry(
@@ -42,8 +62,17 @@ class MarketDataClient:
             time.sleep(self._min_interval - elapsed)
         self._last_call = time.time()
 
+    def _book_rate_limit(self):
+        elapsed = time.time() - self._last_book_call
+        if elapsed < self._book_min_interval:
+            time.sleep(self._book_min_interval - elapsed)
+        self._last_book_call = time.time()
+
     def _get(self, url: str, params: Optional[Dict] = None) -> Optional[Any]:
-        self._rate_limit()
+        if "/book" in url or "/bbo" in url:
+            self._book_rate_limit()
+        else:
+            self._rate_limit()
         try:
             resp = self.session.get(url, params=params, timeout=15)
             resp.raise_for_status()
@@ -57,7 +86,19 @@ class MarketDataClient:
                     self.logger.error("api_request_failed", {"url": url, "error": err_str})
             return None
 
-    def get_active_markets(self, page_size: int = 500, max_markets: int = 20000) -> List[Dict]:
+    @staticmethod
+    def _token0_price(market: Dict) -> Optional[float]:
+        """outcomePrices[0] as float; the gateway serializes it as a JSON string."""
+        raw = market.get("outcomePrices")
+        try:
+            if isinstance(raw, str):
+                import json as _json
+                raw = _json.loads(raw)
+            return float(raw[0])
+        except Exception:
+            return None
+
+    def get_active_markets(self, page_size: int = 500, max_markets: int = 40000) -> List[Dict]:
         """Fetch ALL active markets from Polymarket US API, filtered by time window.
 
         PAGINATED: the gateway lists thousands of active markets (measured
@@ -128,11 +169,54 @@ class MarketDataClient:
 
         filtered = []
         live_count = 0
+        non_moneyline = 0
+        unregistered = 0
+        line_out_of_band = 0
+        line_candidates = []  # (parsed, token0 price, market)
         for m in markets:
             game_start_str = m.get("gameStartTime")
             end_date_str = m.get("endDate")
 
             if game_start_str:
+                # Moneyline-only universe. The gateway lists ~300 markets per
+                # NFL game (spreads, totals, player props, 1H/1Q variants);
+                # the odds_value signal prices moneylines only, and building
+                # 3,700 live order books at 5 req/s stalls the fast scan for
+                # 12+ minutes. Keep the aec- (2-way) and atc- (3-way soccer)
+                # game-winner families only.
+                slug = str(m.get("slug", ""))
+                if slug.startswith(LINE_PREFIXES):
+                    # Full-game spreads/totals for leagues the lines model
+                    # supports, and only lines priced inside the band the
+                    # trade filter would accept anyway (the ladder of ±20
+                    # alternates at 2c/98c is untradeable and would cost an
+                    # order-book call each).
+                    parsed = parse_line_slug(slug)
+                    if not parsed or parsed["league"] not in SUPPORTED_LEAGUES:
+                        non_moneyline += 1
+                        continue
+                    p0 = self._token0_price(m)
+                    if p0 is None or not (LINE_MIN_PRICE <= p0 <= LINE_MAX_PRICE):
+                        line_out_of_band += 1
+                        continue
+                    line_candidates.append((parsed, p0, m))
+                    continue  # admitted below, capped per game
+                elif not slug.startswith(MONEYLINE_PREFIXES):
+                    non_moneyline += 1
+                    continue
+                parts = slug.split("-")
+                # Only leagues in the registry have an odds source; the
+                # gateway also lists La Liga, Bundesliga, Norway, Iceland,
+                # Dota 2, ... which would burn order-book calls for nothing.
+                if len(parts) < 2 or parts[1] not in LEAGUES:
+                    unregistered += 1
+                    continue
+                # Full-game slug only: aec-{lg}-{away}-{home}-{y}-{m}-{d} is
+                # 7 parts (atc- adds the outcome: 8). Period variants such as
+                # aec-nfl-car-atl-2026-09-20-1h are separate markets.
+                if len(parts) != (7 if slug.startswith("aec-") else 8):
+                    non_moneyline += 1
+                    continue
                 game_start = self._parse_datetime(game_start_str)
                 if game_start is None:
                     continue
@@ -157,11 +241,32 @@ class MarketDataClient:
 
             filtered.append(m)
 
+        # Spread/total ladder: keep only the MAX_LINES_PER_GAME lines nearest
+        # 50c per game and kind. A game lists ~40 spreads and ~30 totals;
+        # the ones near even money are where a mispricing is tradeable, and
+        # every admitted market costs an order-book call per scan.
+        by_game: Dict[tuple, list] = {}
+        for parsed, p0, m in line_candidates:
+            key = (parsed["league"], parsed["away"], parsed["home"], parsed["date"], parsed["kind"])
+            by_game.setdefault(key, []).append((abs(p0 - 0.5), m))
+        line_kept = 0
+        for key, rows in by_game.items():
+            rows.sort(key=lambda r: r[0])
+            for _, m in rows[:MAX_LINES_PER_GAME]:
+                filtered.append(m)
+                line_kept += 1
+                if self._parse_datetime(m.get("gameStartTime")) <= now:
+                    live_count += 1
+
         if self.logger:
             self.logger.info("markets_filtered", {
                 "total": len(markets),
                 "after_time_filter": len(filtered),
                 "live_games": live_count,
+                "dropped_non_moneyline": non_moneyline,
+                "dropped_unregistered_league": unregistered,
+                "dropped_line_out_of_band": line_out_of_band,
+                "line_markets_kept": line_kept,
                 "sports_window_hours": sports_window_hours,
                 "nonsports_window_days": nonsports_window_days,
             })
@@ -293,8 +398,14 @@ class MarketDataClient:
 
         return prices
 
-    def build_snapshot(self, market: Dict) -> Optional[MarketSnapshot]:
-        """Build a MarketSnapshot from a Polymarket US market dict."""
+    def build_snapshot(self, market: Dict, fetch_book: bool = True) -> Optional[MarketSnapshot]:
+        """Build a MarketSnapshot from a Polymarket US market dict.
+
+        fetch_book=False builds a LIGHT snapshot from the list price alone
+        (empty order book, zero HTTP calls). The trading loop pre-screens
+        every market this way and fetches real books only for the few that
+        show edge, because the gateway allows ~0.5 book calls per second.
+        """
         try:
             market_id = str(market.get("id", ""))
             slug = market.get("slug", "")
@@ -315,16 +426,16 @@ class MarketDataClient:
             if market_sides:
                 token_id = market_sides[0].get("identifier", "")
 
-            # Fetch order book from US API
-            order_book = self.get_us_order_book(slug)
+            # Fetch order book from US API (or an empty book for a light snapshot)
+            order_book = self.get_us_order_book(slug) if fetch_book else OrderBook()
 
             # No price history needed — signals use order book and external odds
             price_history = [price]
 
             # Skip markets with no order book data
             has_order_book = order_book.bid_depth > 0 or order_book.ask_depth > 0
-            if not price_history and not has_order_book:
-                return None
+            if fetch_book and not has_order_book:
+                return None  # a real book that came back empty is untradeable
 
             if not price_history:
                 price_history = [price]

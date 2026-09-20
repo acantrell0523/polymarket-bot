@@ -30,6 +30,9 @@ LEAGUES: Dict[str, Dict] = {
         # Baseball has no game clock — last-5-minutes blocking doesn't apply.
         "clock": None,
     },
+    "nfl": {
+        "wsh": "was",   # Washington Commanders (verified: aec-nfl-was-dal-2026-09-20)
+    },
     "wnba": {
         "espn_path": "basketball/wnba",
         "odds_api_key": "basketball_wnba",

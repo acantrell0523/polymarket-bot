@@ -68,7 +68,9 @@ class LiveWinProbCache:
         self.scoreboard_ttl = scoreboard_ttl
         self.summary_ttl = summary_ttl
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "Mozilla/5.0"})
+        # ESPN's CDN returns 403 to the bare "Mozilla/5.0" UA (observed
+        # 2026-09-20) and 200 to the default client UA — send no override.
+        # self.session.headers.update({"User-Agent": "Mozilla/5.0"})
         self.session.mount("https://", HTTPAdapter(max_retries=Retry(
             total=2, backoff_factor=0.3, status_forcelist=[429, 500, 502, 503])))
 

@@ -180,6 +180,10 @@ class TradingBot:
         from bot.signals.live_win_prob import LiveWinProbCache
         self.live_cache = LiveWinProbCache()
 
+        # Spread/total quotes (Pinnacle + FanDuel + ESPN) for asc-/tsc- markets
+        from bot.signals.lines import LinesCache
+        self.lines_cache = LinesCache(cache_ttl=120, game_schedule=self.game_schedule)
+
         # Liveness + API health tracking (heartbeat file read by supervisor)
         self._data_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
         self.health = HealthMonitor(
@@ -203,7 +207,7 @@ class TradingBot:
         self.estimator = ProbabilityEstimator(
             config.signals, self.odds_cache, self.predictit_cache, self.crypto_cache,
             self.espn_cache, self.game_context, onchain_client=self.onchain_client,
-            live_cache=self.live_cache,
+            live_cache=self.live_cache, lines_cache=self.lines_cache,
         )
 
         self.portfolio = Portfolio(
@@ -240,14 +244,16 @@ class TradingBot:
         self.live_estimator = ProbabilityEstimator(
             live_signal_config, self.odds_cache, self.predictit_cache, self.crypto_cache,
             self.espn_cache, self.game_context, onchain_client=self.onchain_client,
-            live_cache=self.live_cache,
+            live_cache=self.live_cache, lines_cache=self.lines_cache,
         )
 
         # Live-game trading overrides — use same edge threshold as config
         self.live_min_edge = config.trading.min_edge_threshold
         self.live_take_profit = 0.03
         self.live_scan_interval = 3
-        self.full_scan_interval = 60
+        # 180s: paginating the 40k-market list takes ~30s, and the fast loop
+        # (live books, 0.5 req/s) needs the time between full scans.
+        self.full_scan_interval = 180
 
         # Cached market list from last full scan
         self._cached_markets: List[Dict] = []
@@ -371,9 +377,14 @@ class TradingBot:
 
             game_id = extract_game_id(trade_signal.slug)
 
-            # Get number of books for this market
-            consensus = self.odds_cache.get_consensus_odds(trade_signal.slug)
-            num_books = consensus.get("num_books", 0) if consensus else 0
+            # Get number of books for this market. Spread/total markets
+            # carry their own book count on the spread_total signal.
+            line_sig = next((s for s in trade_signal.signals if s.name == "spread_total"), None)
+            if line_sig is not None:
+                num_books = int(line_sig.metadata.get("num_books", 0))
+            else:
+                consensus = self.odds_cache.get_consensus_odds(trade_signal.slug)
+                num_books = consensus.get("num_books", 0) if consensus else 0
 
             # Get game time remaining for last-5-minutes block
             league = get_league_from_slug(trade_signal.slug)
@@ -401,7 +412,7 @@ class TradingBot:
                 signal=trade_signal,
                 snapshot=snapshot,
                 num_books=num_books,
-                open_game_ids=open_games | games_opening,
+                open_game_ids=set(open_games) | games_opening,  # dict keys | set
                 game_id=game_id,
                 daily_trades=self.risk.daily_trade_count,
                 max_daily_trades=tcfg.max_daily_trades,
@@ -623,11 +634,30 @@ class TradingBot:
         except Exception as e:
             self.logger.error("live_ncaa_edge_check_failed", {"error": str(e)})
 
+    def _closing_line_candidates(self, live_markets: List[Dict]) -> List[Dict]:
+        """Moneyline markets whose closing line we have not recorded yet.
+
+        record_closing_line() needs a live price from the gateway's /bbo
+        endpoint (~0.5 req/s budget). Calling it for every live market on
+        every 20th cycle stalled the loop for 2 minutes (56 live markets);
+        spreads/totals have no moneyline consensus to compare anyway.
+        """
+        if not hasattr(self, "_closing_recorded"):
+            self._closing_recorded: set = set()
+        out = []
+        for m in live_markets:
+            slug = m.get("slug", "")
+            if not slug.startswith(("aec-", "atc-")) or slug in self._closing_recorded:
+                continue
+            self._closing_recorded.add(slug)
+            out.append(m)
+        return out
+
     def _record_closing_lines(self, live_markets: List[Dict]):
         """When a game transitions to live, record the closing line for CLV tracking."""
         try:
             from bot.edge_log import record_closing_line
-            for market in live_markets:
+            for market in self._closing_line_candidates(live_markets):
                 slug = market.get("slug", "")
                 if not slug:
                     continue
@@ -877,16 +907,52 @@ class TradingBot:
         self._last_full_scan = time.time()
         return markets
 
-    def _do_live_scan(self, live_markets: List[Dict]):
-        """Fast scan — only builds snapshots for live game markets."""
+    def _prescreen(self, markets: List[Dict], label: str) -> List[Dict]:
+        """Stage 1 of the two-stage scan: run the estimator on LIGHT
+        snapshots (list price, no order-book call) and keep only the markets
+        that show edge, plus any market we hold a position in. Stage 2 then
+        fetches real order books for those only. The gateway permits ~0.5
+        book calls/second, so scanning books for every market (56 live, 200
+        total today) took minutes per cycle; the pre-screen costs nothing.
+        """
+        open_slugs = {p.slug for p in self.portfolio.get_open_positions()}
+        keep, screened = [], 0
+        for market in markets:
+            if not self.running:
+                break
+            slug = market.get("slug", "")
+            if slug in open_slugs:
+                keep.append(market)
+                continue
+            light = self.market_data.build_snapshot(market, fetch_book=False)
+            if not light:
+                continue
+            screened += 1
+            try:
+                if self._detect_edge(light) is not None:
+                    keep.append(market)
+            except Exception as e:
+                self.logger.warning("prescreen_error", {"slug": slug, "error": str(e)})
+        self.logger.info("prescreen_complete", {
+            "scan": label, "markets": len(markets), "screened": screened,
+            "candidates": len(keep), "held": len(open_slugs & {m.get("slug") for m in keep}),
+        })
+        return keep
+
+    def _build_snapshots(self, markets: List[Dict]) -> list:
         snapshots = []
-        for market in live_markets:
+        for market in markets:
             if not self.running:
                 break
             snapshot = self.market_data.build_snapshot(market)
             if snapshot:
                 snapshots.append(snapshot)
-        self.process_markets(snapshots)
+        return snapshots
+
+    def _do_live_scan(self, live_markets: List[Dict]):
+        """Fast scan — pre-screen live markets, real books for candidates only."""
+        candidates = self._prescreen(live_markets, "live")
+        self.process_markets(self._build_snapshots(candidates))
 
     def _log_open_positions(self):
         """Log all currently open positions at startup."""
@@ -1019,14 +1085,9 @@ class TradingBot:
 
                     live_markets, pregame_markets = self._split_markets(markets)
 
-                    # Build all snapshots, then rank and process best opportunities
-                    snapshots = []
-                    for market in markets:
-                        if not self.running:
-                            break
-                        snapshot = self.market_data.build_snapshot(market)
-                        if snapshot:
-                            snapshots.append(snapshot)
+                    # Two-stage: pre-screen on list prices, real books for
+                    # candidates and held markets only (see _prescreen).
+                    snapshots = self._build_snapshots(self._prescreen(markets, "full"))
 
                     # Refresh open positions' probability estimates BEFORE the
                     # exit checks so take-profit sees current beliefs.
@@ -1097,7 +1158,9 @@ class TradingBot:
                 time.sleep(self.live_scan_interval)
 
             except Exception as e:
-                self.logger.error("scan_cycle_error", {"cycle": cycle, "error": str(e)})
+                import traceback as _tb
+                self.logger.error("scan_cycle_error", {"cycle": cycle, "error": str(e),
+                                                        "traceback": _tb.format_exc()[-1500:]})
                 if self.config.alerts.on_error:
                     self.alerter.error(f"Scan cycle {cycle} failed", str(e))
                 time.sleep(self.config.api.scan_interval_seconds)

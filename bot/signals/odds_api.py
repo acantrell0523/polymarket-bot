@@ -102,12 +102,16 @@ def _fetch_espn_odds(sport_key: str) -> List[dict]:
         # Build bookmaker odds from ESPN odds data
         bookmakers = []
         for odds in odds_list:
-            provider = odds.get("provider", {}).get("name", "")
+            # ESPN emits null odds entries / null providers once a game is
+            # live (observed 2026-09-20) — skip rather than crash the scan.
+            if not isinstance(odds, dict):
+                continue
+            provider = (odds.get("provider") or {}).get("name", "")
             spread = odds.get("spread")
             details = odds.get("details", "")
 
-            home_ml = odds.get("homeTeamOdds", {}).get("moneyLine")
-            away_ml = odds.get("awayTeamOdds", {}).get("moneyLine")
+            home_ml = (odds.get("homeTeamOdds") or {}).get("moneyLine")
+            away_ml = (odds.get("awayTeamOdds") or {}).get("moneyLine")
 
             # Build outcomes
             outcomes = []
@@ -211,6 +215,12 @@ TARGET_BOOKS = {"fanduel", "draftkings", "betmgm", "pointsbetus", "bovada", "wil
 SHARP_BOOKS = {"pinnacle", "circa"}
 
 
+# Paid the-odds-api usage is limited to these sport keys and refreshed at
+# most every ODDS_API_TTL seconds (free tier: 500 requests/month).
+ODDS_API_SPORT_KEYS = {"americanfootball_nfl"}
+ODDS_API_TTL = 1800
+
+
 class OddsCache:
     """Caches odds per sport with a TTL to stay within API rate limits.
 
@@ -229,6 +239,7 @@ class OddsCache:
         # Multi-book aggregator (FanDuel + Pinnacle)
         self._multi_book = None  # lazy init to avoid circular imports
         self._multi_book_cache: Dict[str, Tuple[float, Dict]] = {}
+        self._paid_cache: Dict[str, Tuple[float, List[dict]]] = {}
 
     def _get_multi_book(self):
         if self._multi_book is None:
@@ -238,8 +249,15 @@ class OddsCache:
 
     def _fetch_sport(self, sport_key: str) -> List[dict]:
         """Fetch odds for a sport. Tries the-odds-api first, falls back to ESPN."""
-        # Try the-odds-api if we have a key
-        if self._odds_api_available:
+        # Try the-odds-api if we have a key. Quota guard (free tier =
+        # 500 requests/month): only the sports listed in ODDS_API_SPORT_KEYS
+        # use the paid API, and a paid response is held for ODDS_API_TTL
+        # regardless of the general cache_ttl. Everything else gets its
+        # consensus from the free FanDuel/Pinnacle/ESPN sources.
+        if self._odds_api_available and sport_key in ODDS_API_SPORT_KEYS:
+            paid = self._paid_cache.get(sport_key)
+            if paid and time.time() - paid[0] < ODDS_API_TTL:
+                return paid[1]
             try:
                 resp = requests.get(
                     f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/",
@@ -254,6 +272,7 @@ class OddsCache:
                 if resp.status_code == 200:
                     events = resp.json()
                     if events:
+                        self._paid_cache[sport_key] = (time.time(), events)
                         return events
                 # If 401/429 (quota exhausted), disable for this session
                 if resp.status_code in (401, 429):

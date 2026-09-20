@@ -29,6 +29,7 @@ from bot.signals.odds_api import OddsCache
 from bot.signals.cross_market import PredictItCache
 from bot.signals.crypto_api import CryptoCache
 from bot.signals.sports_data import ESPNCache, GameContextAnalyzer
+from bot.signals.lines import is_line_market, spread_total_signal
 
 
 # Market type detection patterns
@@ -60,6 +61,10 @@ WEIGHTS = {
         # weight only participates during live games — where it dominates
         # the pool (0.55 * conf 0.9 outweighs everything else combined).
         "live_win_prob": 0.55,
+        # Spread/total model for asc-/tsc- markets (bot/signals/lines.py).
+        # Those markets skip odds_value entirely, so this is their only
+        # external signal and carries the same weight live_win_prob does.
+        "spread_total": 0.55,
     },
     "crypto": {
         "crypto_model": 0.45,
@@ -138,6 +143,7 @@ class ProbabilityEstimator:
         game_context_analyzer: Optional[GameContextAnalyzer] = None,
         onchain_client=None,
         live_cache=None,
+        lines_cache=None,
     ):
         self.config = config
         self.odds_cache = odds_cache
@@ -148,6 +154,8 @@ class ProbabilityEstimator:
         self.onchain_client = onchain_client
         # LiveWinProbCache: ESPN in-game win probabilities (live-edge engine)
         self.live_cache = live_cache
+        # LinesCache: spread/total quotes for asc-/tsc- markets
+        self.lines_cache = lines_cache
 
     def compute_signals(self, snapshot: MarketSnapshot, market_type: str) -> List[Signal]:
         """Compute signals appropriate for the market type."""
@@ -161,7 +169,13 @@ class ProbabilityEstimator:
         if self.onchain_client is not None:
             signals.append(onchain_flow_signal(snapshot, self.config, self.onchain_client))
 
-        if market_type == "sports":
+        if market_type == "sports" and is_line_market(snapshot.slug):
+            # Spread/total markets: the moneyline consensus says nothing
+            # about "cover -3.5" / "over 44.5", so odds_value, sports_context
+            # and live_win_prob are all skipped; the lines model is the sole
+            # external signal (order-book signals remain as aux).
+            signals.append(spread_total_signal(snapshot, self.config, self.lines_cache))
+        elif market_type == "sports":
             signals.append(odds_value_signal(snapshot, self.config, self.odds_cache))
             signals.append(line_movement_signal(snapshot, self.config))
             signals.append(sports_context_signal(
@@ -214,6 +228,9 @@ class ProbabilityEstimator:
         so pregame behavior is unchanged.
         """
         if market_type == "sports":
+            line = next((s for s in signals if s.name == "spread_total"), None)
+            if line is not None:
+                return line
             live = next((s for s in signals
                          if s.name == "live_win_prob" and s.confidence > 0), None)
             if live is not None:

@@ -4,6 +4,22 @@ This document is a comprehensive reference for AI assistants (and human develope
 
 ---
 
+## Latest Changes — 2026-09-20 (football restart: spreads/totals, live lines, gateway limits)
+
+Restored from GitHub after the local checkout was lost (~2026-08-29); runs
+from `~/Projects/polymarket-bot` via the two launchd jobs. Paper mode.
+
+| Area | Change |
+|------|--------|
+| **Spread/total engine** | New `bot/signals/lines.py`. Prices `asc-` (spread) and `tsc-` (total) full-game markets with a normal model (NFL margin σ 13.5, total σ 10) fitted to de-vigged quotes from Pinnacle (NFL league 889, main + alternate lines, live child matchups), FanDuel (`nfl` page, `inPlay` flag) and ESPN (pregame DK line). Token 0 is ALWAYS the away team's side of the spread / Over — the `outcomes` labels are unordered; `marketSides[].team` confirms. Live games use live quotes only and shrink σ by √(fraction of clock remaining). Exact-line quotes blend 50/50 with the model. `spread_total` is the sole primary signal for these markets (odds_value / live_win_prob / sports_context are skipped). Tests in `tests/test_lines.py`. |
+| **Scan universe** | `get_active_markets()` admits: full-game moneylines (7-part `aec-` / 8-part `atc-` slugs) for registered leagues only; plus the 3 spreads and 3 totals nearest 50c per game (token-0 price 0.30–0.70) for leagues in `lines.SUPPORTED_LEAGUES`. The gateway lists 45k+ active markets (~300 per NFL game: props, quarters, halves, alt lines) and foreign soccer/esports the bot has no odds for. |
+| **Two-stage scan** | `_prescreen()` runs the estimator on LIGHT snapshots (`build_snapshot(m, fetch_book=False)`: list price, empty book, zero HTTP) and fetches real order books only for markets with edge plus held positions. Reason: the gateway allows ~5 `/book`+`/bbo` calls per 10s (429, Retry-After up to 10s) while `/markets` paging is unlimited — measured 2026-09-20. `/book` and `/bbo` have their own 2s-interval limiter in `MarketDataClient._get`. Never run a second scanner process alongside the bot. |
+| **Bugs fixed** | `process_markets` crashed at validation (`dict | set`) — no trade could ever validate since July. ESPN scoreboard emits null `odds` entries/providers once a game is live (crash in `_fetch_espn_odds`). ESPN's CDN returns 403 to the bare `Mozilla/5.0` UA — `live_win_prob.py` sent it, so the live win-probability signal was silently dead; default UA works. `_record_closing_lines` now records each moneyline once (it burned a `/bbo` call per live market every 20 cycles). |
+| **Config** | `onchain.enabled: false` (0.6s/market of extra API calls for a ≤0.5-confidence aux signal). `full_scan_interval` 60→180s. the-odds-api usage limited to `ODDS_API_SPORT_KEYS={americanfootball_nfl}` with a 30-min TTL (free tier 500/mo); other leagues use the free books. NFL added to `PINNACLE_LEAGUES`, `FANDUEL_SPORTS`, `LEAGUE_TEAM_FRAGMENTS`; `ABBR_MAP["nfl"] = {"wsh": "was"}`. |
+| **Known / next** | The Polymarket US API key from March returns "API key not found" (supervisor logs `account_value_failed` every 15 min; harmless in paper mode, regenerate at polymarket.us/developer before live). The correlated-game rule rejects a total/spread on a game where the moneyline is held. The SDK exposes `client.ws.markets` — a websocket book feed would remove the `/book` budget problem entirely. CFB has futures only on polymarket.us (no game markets). |
+
+---
+
 ## Latest Changes — 2026-07-11 PM (external audit: blockers 1-5 fixed)
 
 An external audit (GPT session) flagged 4 critical execution blockers + a

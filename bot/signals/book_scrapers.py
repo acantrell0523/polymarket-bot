@@ -39,6 +39,18 @@ def _normalize_team(name: str) -> str:
 # contains "golden state" (gs) — city-first matching returned the wrong
 # league's abbreviation for all of them.
 LEAGUE_TEAM_FRAGMENTS = {
+    "americanfootball_nfl": {
+        # Polymarket slug abbreviations (ESPN's "wsh" is "was" here — see
+        # bot.leagues.ABBR_MAP). Nicknames are unique within the NFL.
+        "ari": "cardinals", "atl": "falcons", "bal": "ravens", "buf": "bills",
+        "car": "panthers", "chi": "bears", "cin": "bengals", "cle": "browns",
+        "dal": "cowboys", "den": "broncos", "det": "lions", "gb": "packers",
+        "hou": "texans", "ind": "colts", "jax": "jaguars", "kc": "chiefs",
+        "lv": "raiders", "lac": "chargers", "lar": "rams", "mia": "dolphins",
+        "min": "vikings", "ne": "patriots", "no": "saints", "nyg": "giants",
+        "nyj": "jets", "phi": "eagles", "pit": "steelers", "sf": "49ers",
+        "sea": "seahawks", "tb": "buccaneers", "ten": "titans", "was": "commanders",
+    },
     "baseball_mlb": {
         "ari": "diamondbacks", "atl": "braves", "bal": "orioles",
         "bos": "red sox", "chc": "cubs", "cws": "white sox",
@@ -123,6 +135,9 @@ FANDUEL_SPORTS = {
     # No MLS custom page exists — MLS coverage comes from Pinnacle + ESPN.
     "baseball_mlb": "mlb",
     "basketball_wnba": "wnba",
+    # NFL custom page verified live 2026-09-20: 15 moneylines, 15 spreads,
+    # 15 totals, inPlay flag set on in-progress games.
+    "americanfootball_nfl": "nfl",
 }
 
 
@@ -255,6 +270,9 @@ PINNACLE_LEAGUES = {
     "basketball_wnba": 578,
     "soccer_usa_mls": 2663,
     "mma_mixed_martial_arts": 1624,   # UFC (Pinnacle serves live fight lines)
+    # Football: sport 15 → NFL 889, NCAA 880 (discovered live 2026-09-20)
+    "americanfootball_nfl": 889,
+    "americanfootball_ncaaf": 880,
 }
 
 
