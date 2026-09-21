@@ -4,6 +4,7 @@ few live markets, print the first books. Run after generating a new key at
 polymarket.us/developer:  python scripts/ws_smoke.py aec-nfl-nyg-lar-2026-09-21
 """
 import asyncio, os, sys, time
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 from bot.book_feed import BookFeed
