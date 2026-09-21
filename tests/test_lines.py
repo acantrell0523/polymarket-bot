@@ -236,3 +236,38 @@ class TestKalshi:
         assert s.name == "kalshi_cross" and 0 < s.confidence <= 0.6 and s.metadata["edge"] == pytest.approx(0.05)
         c._index["nfl"] = (9e12, {("nfl", "2026-09-21", "nyg", "lar"): {"ml": {"nyg": (0.30, 0.20)}, "spread": {}, "total": {}}})
         assert K.kalshi_cross_signal(_snap("aec-nfl-nyg-lar-2026-09-21", 0.25), None, c).confidence == 0
+
+
+class TestActionNetworkLive:
+    def _game(self, status, rows):
+        return {"status": status, "home_team_id": 1, "away_team_id": 2,
+                "teams": [{"id": 1, "full_name": "Kansas City Chiefs"}, {"id": 2, "full_name": "Indianapolis Colts"}],
+                "start_time": "2026-09-21T00:20:00Z", "odds": rows}
+
+    def test_live_rows_used_in_progress_with_freshness(self):
+        from bot.signals.book_scrapers import ActionNetworkClient
+        import datetime as dt
+        now = dt.datetime(2026, 9, 21, 3, 0, tzinfo=dt.timezone.utc).timestamp()
+        fresh = dt.datetime.fromtimestamp(now - 60, dt.timezone.utc).isoformat()
+        stale = dt.datetime.fromtimestamp(now - 900, dt.timezone.utc).isoformat()
+        rows = [{"type": "game", "book_id": 68, "ml_home": -280, "ml_away": 230, "inserted": stale},
+                {"type": "live", "book_id": 68, "ml_home": -1160, "ml_away": 720, "spread_away": 2.5,
+                 "spread_away_line": -110, "spread_home_line": -110, "total": 57.5, "over": -110, "under": -110, "inserted": fresh},
+                {"type": "live", "book_id": 75, "ml_home": -900, "ml_away": 600, "inserted": stale}]
+        an = ActionNetworkClient()
+        games = an.parse_games([self._game("inprogress", rows)], now)
+        assert len(games) == 1 and games[0]["live"] is True
+        assert [r["book_id"] for r in games[0]["rows"]] == [68]   # stale BetMGM live row dropped, pregame row ignored
+        import time as _t
+        an._cache["americanfootball_nfl"] = (_t.time(), games)   # fresh cache, no network
+        ev = an.get_odds("americanfootball_nfl")
+        assert ev[0]["live"] is True and ev[0]["home_prob"] > 0.85  # -1160/+720 de-vigged = 0.883
+        quotes = list(an.line_quotes("americanfootball_nfl"))
+        assert {q[2]["live"] for q in quotes} == {True} and {q[1] for q in quotes} == {"spread", "total"}
+
+    def test_scheduled_uses_pregame_rows_only(self):
+        from bot.signals.book_scrapers import ActionNetworkClient
+        rows = [{"type": "game", "book_id": 68, "ml_home": -280, "ml_away": 230, "inserted": "2026-09-20T20:00:00+00:00"},
+                {"type": "live", "book_id": 68, "ml_home": -1160, "ml_away": 720, "inserted": "2026-09-20T20:00:00+00:00"}]
+        games = ActionNetworkClient().parse_games([self._game("scheduled", rows)])
+        assert games[0]["live"] is False and games[0]["rows"][0]["ml_home"] == -280

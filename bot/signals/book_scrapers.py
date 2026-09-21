@@ -614,17 +614,22 @@ class MultiBookAggregator:
 
 
 # ---------------------------------------------------------------------------
-# Action Network (pregame multi-book: DraftKings, BetMGM, Caesars, bet365,
-# BetRivers). Unofficial JSON the Action Network app itself loads; no auth.
-# Lines stop updating at kickoff (verified 2026-09-20 during IND@KC), so
-# only `scheduled` games are used — live consensus stays with Pinnacle and
-# FanDuel, which quote in-play.
+# Action Network (multi-book: DraftKings, BetMGM, Caesars, bet365, BetRivers).
+# Unofficial JSON the Action Network app itself loads; no auth. Each game
+# carries per-book odds rows by `type`: "game" (pregame full-game line, frozen
+# at kickoff) and "live" (the in-play line, refreshed through the game —
+# verified on IND@KC 2026-09-20: live rows stamped minutes before the end).
+# Scheduled games use the "game" rows; in-progress games use "live" rows no
+# older than AN_LIVE_MAX_AGE seconds, tagged live=True so the aggregator and
+# LinesCache treat them as in-play quotes.
 # ---------------------------------------------------------------------------
 
 AN_BASE = "https://api.actionnetwork.com/web/v1/scoreboard"
 AN_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
 # FanDuel (69) is excluded: the direct FanDuel client already supplies it (live-aware).
 AN_BOOKS = {68: "an_draftkings", 75: "an_betmgm", 123: "an_caesars", 79: "an_bet365", 71: "an_betrivers"}
+AN_LIVE_MAX_AGE = 150   # seconds; a live row older than this is a stale line, not a quote
+AN_LIVE_TTL = 25        # refetch cadence while any game is in progress
 AN_LEAGUES = {
     "americanfootball_nfl": ("nfl", ""),
     "americanfootball_ncaaf": ("ncaaf", "&division=FBS"),
@@ -667,24 +672,56 @@ class ActionNetworkClient:
                 continue
         return games
 
-    def games(self, sport_key: str) -> List[dict]:
-        """Raw scheduled games with per-book `game` odds rows (cached)."""
-        now = time.time()
-        cached = self._cache.get(sport_key)
-        if cached and now - cached[0] < self.cache_ttl:
-            return cached[1]
+    @staticmethod
+    def _row_age(o: dict, now: float) -> Optional[float]:
+        """Seconds since the row's `inserted` stamp (ISO 8601, UTC)."""
+        import datetime as _dt
+        try:
+            ts = _dt.datetime.fromisoformat(str(o.get("inserted", "")).replace("Z", "+00:00"))
+            return now - ts.timestamp()
+        except (TypeError, ValueError):
+            return None
+
+    def parse_games(self, raw_games: List[dict], now: Optional[float] = None) -> List[dict]:
+        """Normalize raw games: scheduled → `game` rows; in progress → fresh `live` rows."""
+        now = now or time.time()
         out = []
-        for g in self._fetch(sport_key):
-            if g.get("status") != "scheduled":
+        for g in raw_games:
+            status = g.get("status")
+            if status == "scheduled":
+                wanted, live = "game", False
+            elif status == "inprogress":
+                wanted, live = "live", True
+            else:
                 continue
             teams = {t.get("id"): t for t in g.get("teams", [])}
             home = teams.get(g.get("home_team_id"), {}).get("full_name", "")
             away = teams.get(g.get("away_team_id"), {}).get("full_name", "")
             if not home or not away:
                 continue
-            rows = [o for o in g.get("odds", []) if o.get("type") == "game" and o.get("book_id") in AN_BOOKS]
+            rows = []
+            for o in g.get("odds", []):
+                if o.get("type") != wanted or o.get("book_id") not in AN_BOOKS:
+                    continue
+                if live:
+                    age = self._row_age(o, now)
+                    if age is None or age > AN_LIVE_MAX_AGE:
+                        continue  # stale in-play line: no quote is safer than an old one
+                rows.append(o)
             if rows:
-                out.append({"home_team": home, "away_team": away, "start": g.get("start_time", ""), "rows": rows})
+                out.append({"home_team": home, "away_team": away, "start": g.get("start_time", ""),
+                            "live": live, "rows": rows})
+        return out
+
+    def games(self, sport_key: str) -> List[dict]:
+        """Normalized games with per-book odds rows (cached; short TTL while live)."""
+        now = time.time()
+        cached = self._cache.get(sport_key)
+        if cached:
+            ttl = AN_LIVE_TTL if any(g.get("live") for g in cached[1]) else self.cache_ttl
+            if now - cached[0] < ttl:
+                return cached[1]
+        out = self.parse_games(self._fetch(sport_key), now)
         self._cache[sport_key] = (now, out)
         return out
 
@@ -702,7 +739,7 @@ class ActionNetworkClient:
                     continue
                 results.append({"home_team": g["home_team"], "away_team": g["away_team"],
                                 "home_prob": hp / tot, "away_prob": ap / tot,
-                                "book": AN_BOOKS[o["book_id"]], "live": False})
+                                "book": AN_BOOKS[o["book_id"]], "live": g["live"]})
         return results
 
     def line_quotes(self, sport_key: str):
@@ -718,9 +755,9 @@ class ActionNetworkClient:
                 if sa is not None and pa and ph:
                     p_away = american_to_prob(int(pa)); p_home = american_to_prob(int(ph))
                     yield key, "spread", {"book": book, "kind": "spread", "points": float(sa),
-                                          "p": p_away / (p_away + p_home), "main": True, "live": False}
+                                          "p": p_away / (p_away + p_home), "main": True, "live": g["live"]}
                 t, po, pu = o.get("total"), o.get("over"), o.get("under")
                 if t is not None and po and pu:
                     p_o = american_to_prob(int(po)); p_u = american_to_prob(int(pu))
                     yield key, "total", {"book": book, "kind": "total", "points": float(t),
-                                         "p": p_o / (p_o + p_u), "main": True, "live": False}
+                                         "p": p_o / (p_o + p_u), "main": True, "live": g["live"]}
