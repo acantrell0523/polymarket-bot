@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional, Tuple
 
 from bot.signals.odds_api import TEAM_ABBREVS
-from bot.leagues import LEAGUES, scoreboard_url, game_seconds_remaining
+from bot.leagues import LEAGUES, scoreboard_url, game_seconds_remaining, normalize_abbr
 
 
 # All registered leagues. Off-season leagues return zero games from ESPN and
@@ -168,7 +168,10 @@ class GameSchedule:
             competitors = comps.get("competitors", [])
 
             # Match teams
-            abbrs = [c.get("team", {}).get("abbreviation", "").lower() for c in competitors]
+            # Accept ESPN's raw abbreviation or its Polymarket-normalized form
+            # (cfb codes differ entirely; nfl "wsh" → "was").
+            raw = [c.get("team", {}).get("abbreviation", "").lower() for c in competitors]
+            abbrs = raw + [normalize_abbr(sport, a) for a in raw]
             h_known = TEAM_ABBREVS.get(home_abbr, "")
             a_known = TEAM_ABBREVS.get(away_abbr, "")
             names = [c.get("team", {}).get("displayName", "").lower() for c in competitors]

@@ -55,6 +55,8 @@ from utils.models import MarketSnapshot, Signal
 # Only leagues listed here get asc-/tsc- markets admitted into the scan.
 SIGMA: Dict[str, Tuple[float, float]] = {
     "nfl": (13.5, 10.0),
+    "cfb": (16.0, 12.5),   # wider outcomes than the NFL
+    "nhl": (2.4, 2.0),     # low-scoring; the exact-line book blend does most of the work
     "nba": (12.0, 18.0),
     "cbb": (11.0, 14.0),
     "wnba": (11.0, 14.0),

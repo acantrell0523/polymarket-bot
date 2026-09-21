@@ -218,7 +218,7 @@ SHARP_BOOKS = {"pinnacle", "circa"}
 # Paid the-odds-api usage is limited to these sport keys and refreshed at
 # most every ODDS_API_TTL seconds (free tier: 500 requests/month).
 ODDS_API_SPORT_KEYS = {"americanfootball_nfl"}
-ODDS_API_TTL = 1800
+ODDS_API_TTL = 3600
 
 
 class OddsCache:

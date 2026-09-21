@@ -312,7 +312,8 @@ class TradingBot:
             estimator = self.estimator
 
         # Per-league minimum edge (NHL=4%, NCAA=5%, NBA=7%)
-        min_edge = get_league_min_edge(snapshot.slug)
+        min_edge = (getattr(self.config.trading, "league_min_edge_override", 0.0)
+                    or get_league_min_edge(snapshot.slug))
 
         trade_signal = estimator.detect_edge(
             snapshot,
@@ -412,7 +413,8 @@ class TradingBot:
                 signal=trade_signal,
                 snapshot=snapshot,
                 num_books=num_books,
-                open_game_ids=set(open_games) | games_opening,  # dict keys | set
+                open_game_ids=(set() if getattr(tcfg, "allow_multiple_per_game", False)
+                               else set(open_games) | games_opening),  # dict keys | set
                 game_id=game_id,
                 daily_trades=self.risk.daily_trade_count,
                 max_daily_trades=tcfg.max_daily_trades,
@@ -421,6 +423,7 @@ class TradingBot:
                 max_price=tcfg.max_price,
                 min_liquidity_usd=tcfg.min_book_liquidity_usd,
                 max_spread=tcfg.max_spread,
+                league_min_edge_override=getattr(tcfg, "league_min_edge_override", 0.0),
                 min_net_edge=tcfg.min_net_edge,
             )
 
@@ -1036,10 +1039,26 @@ class TradingBot:
             cycle += 1
             try:
                 # Liveness heartbeat — read by the supervisor's stale check
+                _open = self.portfolio.get_open_positions()
                 self.health.beat({
                     "cycle": cycle,
                     "mode": mode,
-                    "open_positions": len(self.portfolio.get_open_positions()),
+                    "profile": os.environ.get("POLYBOT_PROFILE", "baseline"),
+                    "open_positions": len(_open),
+                    "cash": round(self.portfolio.bankroll, 2),
+                    "equity": round(self.portfolio.get_equity() + sum(
+                        getattr(p, "unrealized_pnl", 0.0) or 0.0 for p in _open), 2),
+                    # Open positions with the last mark from check_positions()
+                    # — read by scripts/push_board.py for the live scoreboard.
+                    "positions": [{
+                        "slug": p.slug, "side": p.side,
+                        "entry_price": round(p.entry_price, 4),
+                        "current_price": round(getattr(p, "current_price", 0.0) or 0.0, 4),
+                        "size_usd": round(p.size_usd, 2),
+                        "unrealized_pnl": round(getattr(p, "unrealized_pnl", 0.0) or 0.0, 2),
+                        "estimated_prob": round(getattr(p, "estimated_prob", 0.0) or 0.0, 4),
+                        "entry_time": p.entry_time.isoformat() if getattr(p, "entry_time", None) else None,
+                    } for p in _open],
                     "degraded_sources": [
                         s for s in ("market_data",) if self.health.is_degraded(s)
                     ],

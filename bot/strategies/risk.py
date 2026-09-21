@@ -104,9 +104,10 @@ class RiskManager:
         # resolution payout ($1.00/share) instead of cashing out early.
         # Only stop-loss and resolved can override this.
         is_riding = False
-        if position.side == "buy" and current_price >= LET_IT_RIDE_THRESHOLD:
+        lir = getattr(self.config, "let_it_ride_threshold", LET_IT_RIDE_THRESHOLD)
+        if position.side == "buy" and current_price >= lir:
             is_riding = True
-        elif position.side == "sell" and current_price <= (1.0 - LET_IT_RIDE_THRESHOLD):
+        elif position.side == "sell" and current_price <= (1.0 - lir):
             is_riding = True
 
         if is_riding:

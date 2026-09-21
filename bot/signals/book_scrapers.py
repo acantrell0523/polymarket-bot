@@ -39,6 +39,17 @@ def _normalize_team(name: str) -> str:
 # contains "golden state" (gs) — city-first matching returned the wrong
 # league's abbreviation for all of them.
 LEAGUE_TEAM_FRAGMENTS = {
+    "icehockey_nhl": {
+        # Polymarket US codes (was/nas/veg/mon differ from ESPN's wsh/nsh/vgk/mtl).
+        "ana": "ducks", "bos": "bruins", "buf": "sabres", "car": "hurricanes",
+        "cbj": "blue jackets", "cgy": "flames", "chi": "blackhawks", "col": "avalanche",
+        "dal": "stars", "det": "red wings", "edm": "oilers", "fla": "panthers",
+        "la": "kings", "min": "wild", "mon": "canadiens", "nas": "predators",
+        "nj": "devils", "nyi": "islanders", "nyr": "rangers", "ott": "senators",
+        "phi": "flyers", "pit": "penguins", "sea": "kraken", "sj": "sharks",
+        "stl": "blues", "tb": "lightning", "tor": "maple leafs", "uta": "mammoth",
+        "van": "canucks", "veg": "golden knights", "was": "capitals", "wpg": "jets",
+    },
     "americanfootball_nfl": {
         # Polymarket slug abbreviations (ESPN's "wsh" is "was" here — see
         # bot.leagues.ABBR_MAP). Nicknames are unique within the NFL.
@@ -86,6 +97,15 @@ LEAGUE_TEAM_FRAGMENTS = {
 }
 
 
+# College football fragments = ESPN `location` ("Oregon State", "Miami",
+# "Miami (OH)") from configs/cfb_teams.json. Matching below prefers an exact
+# name, then the LONGEST fragment, so "ohio" never claims "ohio state".
+from bot.leagues import CFB_TEAMS as _CFB_TEAMS
+LEAGUE_TEAM_FRAGMENTS["americanfootball_ncaaf"] = {
+    code: v["location"].lower() for code, v in _CFB_TEAMS.items() if v.get("location")
+}
+
+
 def fighter_code(full_name: str) -> str:
     """Polymarket's UFC fighter code: first 3 of first name + first 3 of last.
 
@@ -113,9 +133,17 @@ def _match_abbr(full_name: str, sport_key: str = "") -> str:
         return fighter_code(full_name)
     league_fragments = LEAGUE_TEAM_FRAGMENTS.get(sport_key)
     if league_fragments:
+        clean = name.replace("é", "e").strip()
         for abbr, fragment in league_fragments.items():
-            if fragment and fragment in name:
+            if fragment and fragment == clean:
                 return abbr
+        best = ""
+        best_len = 0
+        for abbr, fragment in league_fragments.items():
+            if fragment and fragment in clean and len(fragment) > best_len:
+                best, best_len = abbr, len(fragment)
+        if best:
+            return best
     for abbr, fragment in TEAM_ABBREVS.items():
         if fragment and fragment in name:
             return abbr
@@ -138,6 +166,8 @@ FANDUEL_SPORTS = {
     # NFL custom page verified live 2026-09-20: 15 moneylines, 15 spreads,
     # 15 totals, inPlay flag set on in-progress games.
     "americanfootball_nfl": "nfl",
+    # College football page verified 2026-09-20: 58 spreads, inPlay flags.
+    "americanfootball_ncaaf": "ncaaf",
 }
 
 
@@ -251,6 +281,7 @@ class FanDuelClient:
                 "home_prob": home_prob,
                 "away_prob": away_prob,
                 "book": self.name,
+                "live": bool(mkt.get("inPlay")),
             })
 
         return results
@@ -340,7 +371,8 @@ class PinnacleClient:
                 elif p.get("alignment") == "away":
                     away = p.get("name", "")
             if home and away:
-                matchup_map[mid] = {"home_team": home, "away_team": away}
+                matchup_map[mid] = {"home_team": home, "away_team": away,
+                                    "live": bool(m.get("isLive"))}
 
         # Find moneyline markets (type=moneyline, period=0, isAlternate=false)
         ml_odds = {}  # matchup_id → {home_price, away_price}
@@ -387,6 +419,7 @@ class PinnacleClient:
                 "home_prob": home_prob,
                 "away_prob": away_prob,
                 "book": self.name,
+                "live": teams.get("live", False),
             })
 
         return results
@@ -449,9 +482,16 @@ class MultiBookAggregator:
                 continue
             entries = games.setdefault(key, [])
             book = ev.get("book", "unknown")
-            if any(e.get("book", "unknown") == book for e in entries):
-                continue  # dedup: keep the first entry per book
-            entries.append(ev)
+            existing = next((e for e in entries if e.get("book", "unknown") == book), None)
+            if existing is None:
+                entries.append(ev)
+            elif ev.get("live") and not existing.get("live"):
+                # One entry per book, but an IN-PLAY line supersedes the
+                # pregame line: a live quote only exists while the game is
+                # on, and the pregame number is stale the moment it starts.
+                # This is the live moneyline source for leagues ESPN has no
+                # win-probability model for (NHL).
+                entries[entries.index(existing)] = ev
 
         self._cache[cache_key] = (now, games)
         return games

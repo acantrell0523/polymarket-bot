@@ -71,6 +71,15 @@ class TradingConfig:
     # Widest acceptable bid-ask spread (absolute, in price units). A book wider
     # than this cannot be exited cleanly, so we never enter it.
     max_spread: float = 0.10
+    # --- Strategy-profile knobs (2026-09-20, side-by-side paper sessions) ---
+    # Allow a spread/total alongside a moneyline on the same game (the
+    # correlated-game rule rejected 28 candidates on 2026-09-20's 1pm slate).
+    allow_multiple_per_game: bool = False
+    # Replace the per-league minimum-edge table (NHL 4% … NBA 7%) with one
+    # number; 0 keeps the table.
+    league_min_edge_override: float = 0.0
+    # Price at which a winner is held to settlement instead of taken.
+    let_it_ride_threshold: float = 0.70
 
 
 # Default per-market-type weights — must stay in sync with WEIGHTS in estimator.py

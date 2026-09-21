@@ -17,6 +17,8 @@ The `slug` key is the league code Polymarket uses in game slugs
 (aec-{league}-{away}-{home}-{date}) and in per-league minimum-edge rules.
 """
 
+import json
+import os
 from typing import Dict, List, Optional
 
 # ESPN site API root; a league's scoreboard is {ESPN_SITE_API}/{espn_path}/scoreboard
@@ -29,9 +31,6 @@ LEAGUES: Dict[str, Dict] = {
         "odds_api_key": "baseball_mlb",
         # Baseball has no game clock — last-5-minutes blocking doesn't apply.
         "clock": None,
-    },
-    "nfl": {
-        "wsh": "was",   # Washington Commanders (verified: aec-nfl-was-dal-2026-09-20)
     },
     "wnba": {
         "espn_path": "basketball/wnba",
@@ -64,6 +63,16 @@ LEAGUES: Dict[str, Dict] = {
     "nfl": {
         "espn_path": "football/nfl",
         "odds_api_key": "americanfootball_nfl",
+        "clock": {"periods": 4, "minutes": 15, "count_up": False},
+    },
+    "cfb": {
+        # College football. ESPN's default scoreboard only lists a handful of
+        # games; groups=80 (FBS) + limit covers the full Saturday slate.
+        # Polymarket US lists ~100 cfb moneylines per Saturday (verified
+        # 2026-09-20) with its own team codes — see configs/cfb_teams.json.
+        "espn_path": "football/college-football",
+        "espn_query": "groups=80&limit=400",
+        "odds_api_key": "americanfootball_ncaaf",
         "clock": {"periods": 4, "minutes": 15, "count_up": False},
     },
     "epl": {
@@ -106,7 +115,28 @@ ABBR_MAP = {
         "lv":  "las",   # Las Vegas Aces
         "ny":  "nyl",   # New York Liberty
     },
+    "nfl": {
+        "wsh": "was",   # Washington Commanders (verified: aec-nfl-was-dal-2026-09-20)
+    },
+    "nhl": {            # verified against polymarket.us team codes 2026-09-20
+        "wsh": "was",   # Washington Capitals
+        "nsh": "nas",   # Nashville Predators
+        "vgk": "veg",   # Vegas Golden Knights
+        "mtl": "mon",   # Montreal Canadiens
+    },
 }
+
+
+# College football: Polymarket's codes (librty, coast, …) are joined to ESPN's
+# (lib, ccu, …) by scripts/build_cfb_teams.py → configs/cfb_teams.json.
+CFB_TEAMS: Dict[str, Dict] = {}
+try:
+    with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "configs", "cfb_teams.json")) as _fh:
+        CFB_TEAMS = json.load(_fh)
+except (OSError, ValueError):
+    CFB_TEAMS = {}
+ABBR_MAP["cfb"] = {v["espn_abbr"]: code for code, v in CFB_TEAMS.items() if v.get("espn_abbr")}
 
 
 def normalize_abbr(league: str, espn_abbr: str) -> str:
@@ -140,7 +170,10 @@ def scoreboard_url(league: str) -> Optional[str]:
     info = LEAGUES.get(league)
     if not info:
         return None
-    return f"{ESPN_SITE_API}/{info['espn_path']}/scoreboard"
+    url = f"{ESPN_SITE_API}/{info['espn_path']}/scoreboard"
+    if info.get("espn_query"):
+        url += "?" + info["espn_query"]
+    return url
 
 
 def summary_url(league: str) -> Optional[str]:

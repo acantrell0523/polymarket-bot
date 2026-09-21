@@ -1,0 +1,1317 @@
+{
+ "abchr": {
+  "display": "Abilene Christian Wildcats",
+  "espn_abbr": "acu",
+  "location": "Abilene Christian"
+ },
+ "airf": {
+  "display": "Air Force Falcons",
+  "espn_abbr": "af",
+  "location": "Air Force"
+ },
+ "akron": {
+  "display": "Akron Zips",
+  "espn_abbr": "akr",
+  "location": "Akron"
+ },
+ "ala": {
+  "display": "Alabama Crimson Tide",
+  "espn_abbr": "ala",
+  "location": "Alabama"
+ },
+ "alaam": {
+  "display": "Alabama A&M Bulldogs",
+  "espn_abbr": "aamu",
+  "location": "Alabama A&M"
+ },
+ "alast": {
+  "display": "Alabama State Hornets",
+  "espn_abbr": "alst",
+  "location": "Alabama State"
+ },
+ "albny": {
+  "display": "UAlbany Great Danes",
+  "espn_abbr": "ualb",
+  "location": "UAlbany"
+ },
+ "alcst": {
+  "display": "Alcorn State Braves",
+  "espn_abbr": "alcn",
+  "location": "Alcorn State"
+ },
+ "applst": {
+  "display": "App State Mountaineers",
+  "espn_abbr": "app",
+  "location": "Appalachian State"
+ },
+ "ark": {
+  "display": "Arkansas Razorbacks",
+  "espn_abbr": "ark",
+  "location": "Arkansas"
+ },
+ "arkst": {
+  "display": "Arkansas State Red Wolves",
+  "espn_abbr": "arst",
+  "location": "Arkansas State"
+ },
+ "army": {
+  "display": "Army Black Knights",
+  "espn_abbr": "army",
+  "location": "Army"
+ },
+ "arpb": {
+  "display": "Arkansas-Pine Bluff Golden Lions",
+  "espn_abbr": "uapb",
+  "location": "Arkansas-Pine Bluff"
+ },
+ "arz": {
+  "display": "Arizona Wildcats",
+  "espn_abbr": "ariz",
+  "location": "Arizona"
+ },
+ "aubrn": {
+  "display": "Auburn Tigers",
+  "espn_abbr": "aub",
+  "location": "Auburn"
+ },
+ "ausp": {
+  "display": "Austin Peay Governors",
+  "espn_abbr": "apsu",
+  "location": "Austin Peay"
+ },
+ "ballst": {
+  "display": "Ball State Cardinals",
+  "espn_abbr": "ball",
+  "location": "Ball State"
+ },
+ "bayl": {
+  "display": "Baylor Bears",
+  "espn_abbr": "bay",
+  "location": "Baylor"
+ },
+ "bcook": {
+  "display": "Bethune-Cookman Wildcats",
+  "espn_abbr": "bcu",
+  "location": "Bethune-Cookman"
+ },
+ "boise": {
+  "display": "Boise State Broncos",
+  "espn_abbr": "bois",
+  "location": "Boise State"
+ },
+ "boscol": {
+  "display": "Boston College Eagles",
+  "espn_abbr": "bc",
+  "location": "Boston College"
+ },
+ "bowlgr": {
+  "display": "Bowling Green Falcons",
+  "espn_abbr": "bgsu",
+  "location": "Bowling Green"
+ },
+ "brwn": {
+  "display": "Brown Bears",
+  "espn_abbr": "brwn",
+  "location": "Brown"
+ },
+ "bryant": {
+  "display": "Bryant Bulldogs",
+  "espn_abbr": "bry",
+  "location": "Bryant"
+ },
+ "buck": {
+  "display": "Bucknell Bison",
+  "espn_abbr": "buck",
+  "location": "Bucknell"
+ },
+ "buf": {
+  "display": "Buffalo Bulls",
+  "espn_abbr": "buf",
+  "location": "Buffalo"
+ },
+ "but": {
+  "display": "Butler Bulldogs",
+  "espn_abbr": "btlr",
+  "location": "Butler"
+ },
+ "cah": {
+  "display": "California Golden Bears",
+  "espn_abbr": "cal",
+  "location": "California"
+ },
+ "calpol": {
+  "display": "Cal Poly Mustangs",
+  "espn_abbr": "cp",
+  "location": "Cal Poly"
+ },
+ "camp": {
+  "display": "Campbell Fighting Camels",
+  "espn_abbr": "cam",
+  "location": "Campbell"
+ },
+ "cark": {
+  "display": "Central Arkansas Bears",
+  "espn_abbr": "cark",
+  "location": "Central Arkansas"
+ },
+ "cencon": {
+  "display": "Central Connecticut Blue Devils",
+  "espn_abbr": "ccsu",
+  "location": "Central Connecticut State"
+ },
+ "charlt": {
+  "display": "Charlotte 49ers",
+  "espn_abbr": "clt",
+  "location": "Charlotte"
+ },
+ "chat": {
+  "display": "Chattanooga Mocs",
+  "espn_abbr": "utc",
+  "location": "Chattanooga"
+ },
+ "chs": {
+  "display": "Chicago State Cougars",
+  "espn_abbr": "chst",
+  "location": "Chicago State"
+ },
+ "chsou": {
+  "display": "Charleston Southern Buccaneers",
+  "espn_abbr": "chso",
+  "location": "Charleston Southern"
+ },
+ "cin": {
+  "display": "Cincinnati Bearcats",
+  "espn_abbr": "cin",
+  "location": "Cincinnati"
+ },
+ "cita": {
+  "display": "The Citadel Bulldogs",
+  "espn_abbr": "cit",
+  "location": "The Citadel"
+ },
+ "clmb": {
+  "display": "Columbia Lions",
+  "espn_abbr": "colu",
+  "location": "Columbia"
+ },
+ "clmsn": {
+  "display": "Clemson Tigers",
+  "espn_abbr": "clem",
+  "location": "Clemson"
+ },
+ "cmich": {
+  "display": "Central Michigan Chippewas",
+  "espn_abbr": "cmu",
+  "location": "Central Michigan"
+ },
+ "coast": {
+  "display": "Coastal Carolina Chanticleers",
+  "espn_abbr": "ccu",
+  "location": "Coastal Carolina"
+ },
+ "col": {
+  "display": "Colorado Buffaloes",
+  "espn_abbr": "colo",
+  "location": "Colorado"
+ },
+ "colg": {
+  "display": "Colgate Raiders",
+  "espn_abbr": "colg",
+  "location": "Colgate"
+ },
+ "colst": {
+  "display": "Colorado State Rams",
+  "espn_abbr": "csu",
+  "location": "Colorado State"
+ },
+ "cor": {
+  "display": "Cornell Big Red",
+  "espn_abbr": "cor",
+  "location": "Cornell"
+ },
+ "dart": {
+  "display": "Dartmouth Big Green",
+  "espn_abbr": "dart",
+  "location": "Dartmouth"
+ },
+ "dav": {
+  "display": "Davidson Wildcats",
+  "espn_abbr": "dav",
+  "location": "Davidson"
+ },
+ "day": {
+  "display": "Dayton Flyers",
+  "espn_abbr": "day",
+  "location": "Dayton"
+ },
+ "del": {
+  "display": "Delaware Blue Hens",
+  "espn_abbr": "del",
+  "location": "Delaware"
+ },
+ "delst": {
+  "display": "Delaware State Hornets",
+  "espn_abbr": "dsu",
+  "location": "Delaware State"
+ },
+ "drake": {
+  "display": "Drake Bulldogs",
+  "espn_abbr": "drke",
+  "location": "Drake"
+ },
+ "duke": {
+  "display": "Duke Blue Devils",
+  "espn_abbr": "duke",
+  "location": "Duke"
+ },
+ "duq": {
+  "display": "Duquesne Dukes",
+  "espn_abbr": "duq",
+  "location": "Duquesne"
+ },
+ "dxst": {
+  "display": "Utah Tech Trailblazers",
+  "espn_abbr": "utu",
+  "location": "Utah Tech"
+ },
+ "ecar": {
+  "display": "East Carolina Pirates",
+  "espn_abbr": "ecu",
+  "location": "East Carolina"
+ },
+ "eill": {
+  "display": "Eastern Illinois Panthers",
+  "espn_abbr": "eiu",
+  "location": "Eastern Illinois"
+ },
+ "ekent": {
+  "display": "Eastern Kentucky Colonels",
+  "espn_abbr": "eku",
+  "location": "Eastern Kentucky"
+ },
+ "elon": {
+  "display": "Elon Phoenix",
+  "espn_abbr": "elon",
+  "location": "Elon"
+ },
+ "emich": {
+  "display": "Eastern Michigan Eagles",
+  "espn_abbr": "emu",
+  "location": "Eastern Michigan"
+ },
+ "etnst": {
+  "display": "East Tennessee State Buccaneers",
+  "espn_abbr": "etsu",
+  "location": "East Tennessee State"
+ },
+ "ewash": {
+  "display": "Eastern Washington Eagles",
+  "espn_abbr": "ewu",
+  "location": "Eastern Washington"
+ },
+ "fl": {
+  "display": "Florida Gators",
+  "espn_abbr": "fla",
+  "location": "Florida"
+ },
+ "flam": {
+  "display": "Florida A&M Rattlers",
+  "espn_abbr": "famu",
+  "location": "Florida A&M"
+ },
+ "flatl": {
+  "display": "Florida Atlantic Owls",
+  "espn_abbr": "fau",
+  "location": "Florida Atlantic"
+ },
+ "flint": {
+  "display": "Florida International Panthers",
+  "espn_abbr": "fiu",
+  "location": "Florida International"
+ },
+ "flst": {
+  "display": "Florida State Seminoles",
+  "espn_abbr": "fsu",
+  "location": "Florida State"
+ },
+ "fordm": {
+  "display": "Fordham Rams",
+  "espn_abbr": "for",
+  "location": "Fordham"
+ },
+ "frest": {
+  "display": "Fresno State Bulldogs",
+  "espn_abbr": "fres",
+  "location": "Fresno State"
+ },
+ "furman": {
+  "display": "Furman Paladins",
+  "espn_abbr": "fur",
+  "location": "Furman"
+ },
+ "fvsu": {
+  "display": "Fort Valley State Wildcats",
+  "espn_abbr": "fvsu",
+  "location": "Fort Valley State"
+ },
+ "ga": {
+  "display": "Georgia Bulldogs",
+  "espn_abbr": "uga",
+  "location": "Georgia"
+ },
+ "gardwb": {
+  "display": "Gardner-Webb Runnin' Bulldogs",
+  "espn_abbr": "gweb",
+  "location": "Gardner-Webb"
+ },
+ "gas": {
+  "display": "Georgia Southern Eagles",
+  "espn_abbr": "gaso",
+  "location": "Georgia Southern"
+ },
+ "gast": {
+  "display": "Georgia State Panthers",
+  "espn_abbr": "gast",
+  "location": "Georgia State"
+ },
+ "grmbst": {
+  "display": "Grambling Tigers",
+  "espn_abbr": "gram",
+  "location": "Grambling State"
+ },
+ "gtech": {
+  "display": "Georgia Tech Yellow Jackets",
+  "espn_abbr": "gt",
+  "location": "Georgia Tech"
+ },
+ "gtwn": {
+  "display": "Georgetown Hoyas",
+  "espn_abbr": "gtwn",
+  "location": "Georgetown"
+ },
+ "hamp": {
+  "display": "Hampton Pirates",
+  "espn_abbr": "hamp",
+  "location": "Hampton"
+ },
+ "harv": {
+  "display": "Harvard Crimson",
+  "espn_abbr": "harv",
+  "location": "Harvard"
+ },
+ "hawaii": {
+  "display": "Hawai'i Rainbow Warriors",
+  "espn_abbr": "haw",
+  "location": "Hawai'i"
+ },
+ "holy": {
+  "display": "Holy Cross Crusaders",
+  "espn_abbr": "hc",
+  "location": "Holy Cross"
+ },
+ "hou": {
+  "display": "Houston Cougars",
+  "espn_abbr": "hou",
+  "location": "Houston"
+ },
+ "houbap": {
+  "display": "Houston Christian Huskies",
+  "espn_abbr": "hcu",
+  "location": "Houston Christian"
+ },
+ "howrd": {
+  "display": "Howard Bison",
+  "espn_abbr": "how",
+  "location": "Howard"
+ },
+ "idaho": {
+  "display": "Idaho Vandals",
+  "espn_abbr": "idho",
+  "location": "Idaho"
+ },
+ "idhst": {
+  "display": "Idaho State Bengals",
+  "espn_abbr": "idst",
+  "location": "Idaho State"
+ },
+ "ill": {
+  "display": "Illinois Fighting Illini",
+  "espn_abbr": "ill",
+  "location": "Illinois"
+ },
+ "illst": {
+  "display": "Illinois State Redbirds",
+  "espn_abbr": "ilst",
+  "location": "Illinois State"
+ },
+ "incar": {
+  "display": "Incarnate Word Cardinals",
+  "espn_abbr": "uiw",
+  "location": "Incarnate Word"
+ },
+ "ind": {
+  "display": "Indiana Hoosiers",
+  "espn_abbr": "iu",
+  "location": "Indiana"
+ },
+ "indst": {
+  "display": "Indiana State Sycamores",
+  "espn_abbr": "inst",
+  "location": "Indiana State"
+ },
+ "iowa": {
+  "display": "Iowa Hawkeyes",
+  "espn_abbr": "iowa",
+  "location": "Iowa"
+ },
+ "iowast": {
+  "display": "Iowa State Cyclones",
+  "espn_abbr": "isu",
+  "location": "Iowa State"
+ },
+ "jac": {
+  "display": "Lindenwood Lions",
+  "espn_abbr": "lin",
+  "location": "Lindenwood"
+ },
+ "jackst": {
+  "display": "Jackson State Tigers",
+  "espn_abbr": "jkst",
+  "location": "Jackson State"
+ },
+ "jaxst": {
+  "display": "Jacksonville State Gamecocks",
+  "espn_abbr": "jxst",
+  "location": "Jacksonville State"
+ },
+ "jmad": {
+  "display": "James Madison Dukes",
+  "espn_abbr": "jmu",
+  "location": "James Madison"
+ },
+ "kanst": {
+  "display": "Kansas State Wildcats",
+  "espn_abbr": "ksu",
+  "location": "Kansas State"
+ },
+ "kenest": {
+  "display": "Kennesaw State Owls",
+  "espn_abbr": "kenn",
+  "location": "Kennesaw State"
+ },
+ "kentst": {
+  "display": "Kent State Golden Flashes",
+  "espn_abbr": "kent",
+  "location": "Kent State"
+ },
+ "lafay": {
+  "display": "Lafayette Leopards",
+  "espn_abbr": "laf",
+  "location": "Lafayette"
+ },
+ "lamar": {
+  "display": "Lamar Cardinals",
+  "espn_abbr": "lam",
+  "location": "Lamar"
+ },
+ "lamon": {
+  "display": "UL Monroe Warhawks",
+  "espn_abbr": "ulm",
+  "location": "Louisiana-Monroe"
+ },
+ "lehi": {
+  "display": "Lehigh Mountain Hawks",
+  "espn_abbr": "leh",
+  "location": "Lehigh"
+ },
+ "librty": {
+  "display": "Liberty Flames",
+  "espn_abbr": "lib",
+  "location": "Liberty"
+ },
+ "liub": {
+  "display": "Long Island University Sharks",
+  "espn_abbr": "liu",
+  "location": "LIU"
+ },
+ "lou": {
+  "display": "Louisville Cardinals",
+  "espn_abbr": "lou",
+  "location": "Louisville"
+ },
+ "loulaf": {
+  "display": "Louisiana Ragin' Cajuns",
+  "espn_abbr": "ul",
+  "location": "Louisiana"
+ },
+ "lsu": {
+  "display": "LSU Tigers",
+  "espn_abbr": "lsu",
+  "location": "LSU"
+ },
+ "maine": {
+  "display": "Maine Black Bears",
+  "espn_abbr": "me",
+  "location": "Maine"
+ },
+ "marsh": {
+  "display": "Marshall Thundering Herd",
+  "espn_abbr": "mrsh",
+  "location": "Marshall"
+ },
+ "mary": {
+  "display": "Maryland Terrapins",
+  "espn_abbr": "md",
+  "location": "Maryland"
+ },
+ "mcnst": {
+  "display": "McNeese Cowboys",
+  "espn_abbr": "mcn",
+  "location": "McNeese"
+ },
+ "merc": {
+  "display": "Mercer Bears",
+  "espn_abbr": "mer",
+  "location": "Mercer"
+ },
+ "merri": {
+  "display": "Merrimack Warriors",
+  "espn_abbr": "mrmk",
+  "location": "Merrimack"
+ },
+ "mia": {
+  "display": "Miami Hurricanes",
+  "espn_abbr": "mia",
+  "location": "Miami (FL)"
+ },
+ "miaoh": {
+  "display": "Miami (OH) RedHawks",
+  "espn_abbr": "m-oh",
+  "location": "Miami (OH)"
+ },
+ "mich": {
+  "display": "Michigan Wolverines",
+  "espn_abbr": "mich",
+  "location": "Michigan"
+ },
+ "minnst": {
+  "display": "Minnesota Golden Gophers",
+  "espn_abbr": "minn",
+  "location": "Minnesota"
+ },
+ "miss": {
+  "display": "Ole Miss Rebels",
+  "espn_abbr": "miss",
+  "location": "Ole Miss"
+ },
+ "missr": {
+  "display": "Missouri Tigers",
+  "espn_abbr": "miz",
+  "location": "Missouri"
+ },
+ "monm": {
+  "display": "Monmouth Hawks",
+  "espn_abbr": "monm",
+  "location": "Monmouth"
+ },
+ "monst": {
+  "display": "Montana State Bobcats",
+  "espn_abbr": "mtst",
+  "location": "Montana State"
+ },
+ "mont": {
+  "display": "Montana Grizzlies",
+  "espn_abbr": "mont",
+  "location": "Montana"
+ },
+ "more": {
+  "display": "Morehead State Eagles",
+  "espn_abbr": "more",
+  "location": "Morehead State"
+ },
+ "morgst": {
+  "display": "Morgan State Bears",
+  "espn_abbr": "morg",
+  "location": "Morgan State"
+ },
+ "mrcy": {
+  "display": "Mercyhurst Lakers",
+  "espn_abbr": "merc",
+  "location": "Mercyhurst"
+ },
+ "mrst": {
+  "display": "Marist Red Foxes",
+  "espn_abbr": "mrst",
+  "location": "Marist"
+ },
+ "mspst": {
+  "display": "Mississippi State Bulldogs",
+  "espn_abbr": "msst",
+  "location": "Mississippi State"
+ },
+ "msrst": {
+  "display": "Missouri State Bears",
+  "espn_abbr": "most",
+  "location": "Missouri State"
+ },
+ "mst": {
+  "display": "Michigan State Spartans",
+  "espn_abbr": "msu",
+  "location": "Michigan State"
+ },
+ "msvlst": {
+  "display": "Mississippi Valley State Delta Devils",
+  "espn_abbr": "mvsu",
+  "location": "Mississippi Valley State"
+ },
+ "mtnst": {
+  "display": "Middle Tennessee Blue Raiders",
+  "espn_abbr": "mtsu",
+  "location": "Middle Tennessee"
+ },
+ "murst": {
+  "display": "Murray State Racers",
+  "espn_abbr": "mur",
+  "location": "Murray State"
+ },
+ "nal": {
+  "display": "North Alabama Lions",
+  "espn_abbr": "una",
+  "location": "North Alabama"
+ },
+ "narz": {
+  "display": "Northern Arizona Lumberjacks",
+  "espn_abbr": "nau",
+  "location": "Northern Arizona"
+ },
+ "navy": {
+  "display": "Navy Midshipmen",
+  "espn_abbr": "navy",
+  "location": "Navy"
+ },
+ "ncat": {
+  "display": "North Carolina A&T Aggies",
+  "espn_abbr": "ncat",
+  "location": "North Carolina A&T"
+ },
+ "ncc": {
+  "display": "North Carolina Central Eagles",
+  "espn_abbr": "nccu",
+  "location": "North Carolina Central"
+ },
+ "ncol": {
+  "display": "Northern Colorado Bears",
+  "espn_abbr": "unco",
+  "location": "Northern Colorado"
+ },
+ "ncst": {
+  "display": "NC State Wolfpack",
+  "espn_abbr": "ncsu",
+  "location": "NC State"
+ },
+ "nd": {
+  "display": "Notre Dame Fighting Irish",
+  "espn_abbr": "nd",
+  "location": "Notre Dame"
+ },
+ "ndak": {
+  "display": "North Dakota Fighting Hawks",
+  "espn_abbr": "und",
+  "location": "North Dakota"
+ },
+ "ndkst": {
+  "display": "North Dakota State Bison",
+  "espn_abbr": "ndsu",
+  "location": "North Dakota State"
+ },
+ "nebr": {
+  "display": "Nebraska Cornhuskers",
+  "espn_abbr": "neb",
+  "location": "Nebraska"
+ },
+ "nesu": {
+  "display": "Northeastern State RiverHawks",
+  "espn_abbr": "nesu",
+  "location": "Northeastern State"
+ },
+ "nevada": {
+  "display": "Nevada Wolf Pack",
+  "espn_abbr": "nev",
+  "location": "Nevada"
+ },
+ "nhamp": {
+  "display": "New Hampshire Wildcats",
+  "espn_abbr": "unh",
+  "location": "New Hampshire"
+ },
+ "nhc": {
+  "display": "New Haven Chargers",
+  "espn_abbr": "nhvn",
+  "location": "New Haven"
+ },
+ "nichls": {
+  "display": "Nicholls Colonels",
+  "espn_abbr": "nich",
+  "location": "Nicholls"
+ },
+ "nill": {
+  "display": "Northern Illinois Huskies",
+  "espn_abbr": "niu",
+  "location": "Northern Illinois"
+ },
+ "niowa": {
+  "display": "Northern Iowa Panthers",
+  "espn_abbr": "uni",
+  "location": "Northern Iowa"
+ },
+ "nmx": {
+  "display": "New Mexico Lobos",
+  "espn_abbr": "unm",
+  "location": "New Mexico"
+ },
+ "nmxst": {
+  "display": "New Mexico State Aggies",
+  "espn_abbr": "nmsu",
+  "location": "New Mexico State"
+ },
+ "norfst": {
+  "display": "Norfolk State Spartans",
+  "espn_abbr": "norf",
+  "location": "Norfolk State"
+ },
+ "ntx": {
+  "display": "North Texas Mean Green",
+  "espn_abbr": "unt",
+  "location": "North Texas"
+ },
+ "nw": {
+  "display": "Northwestern Wildcats",
+  "espn_abbr": "nu",
+  "location": "Northwestern"
+ },
+ "nwst": {
+  "display": "Northwestern State Demons",
+  "espn_abbr": "nwst",
+  "location": "Northwestern State"
+ },
+ "ohio": {
+  "display": "Ohio Bobcats",
+  "espn_abbr": "ohio",
+  "location": "Ohio"
+ },
+ "ohiost": {
+  "display": "Ohio State Buckeyes",
+  "espn_abbr": "osu",
+  "location": "Ohio State"
+ },
+ "okl": {
+  "display": "Oklahoma Sooners",
+  "espn_abbr": "ou",
+  "location": "Oklahoma"
+ },
+ "okst": {
+  "display": "Oklahoma State Cowboys",
+  "espn_abbr": "okst",
+  "location": "Oklahoma State"
+ },
+ "old": {
+  "display": "Old Dominion Monarchs",
+  "espn_abbr": "odu",
+  "location": "Old Dominion"
+ },
+ "ore": {
+  "display": "Oregon Ducks",
+  "espn_abbr": "ore",
+  "location": "Oregon"
+ },
+ "oregst": {
+  "display": "Oregon State Beavers",
+  "espn_abbr": "orst",
+  "location": "Oregon State"
+ },
+ "penn": {
+  "display": "Pennsylvania Quakers",
+  "espn_abbr": "penn",
+  "location": "Penn"
+ },
+ "pennst": {
+  "display": "Penn State Nittany Lions",
+  "espn_abbr": "psu",
+  "location": "Penn State"
+ },
+ "pitt": {
+  "display": "Pittsburgh Panthers",
+  "espn_abbr": "pitt",
+  "location": "Pittsburgh"
+ },
+ "portst": {
+  "display": "Portland State Vikings",
+  "espn_abbr": "prst",
+  "location": "Portland State"
+ },
+ "presb": {
+  "display": "Presbyterian Blue Hose",
+  "espn_abbr": "pres",
+  "location": "Presbyterian"
+ },
+ "prnce": {
+  "display": "Princeton Tigers",
+  "espn_abbr": "prin",
+  "location": "Princeton"
+ },
+ "pur": {
+  "display": "Purdue Boilermakers",
+  "espn_abbr": "pur",
+  "location": "Purdue"
+ },
+ "pvam": {
+  "display": "Prairie View A&M Panthers",
+  "espn_abbr": "pv",
+  "location": "Prairie View A&M"
+ },
+ "ri": {
+  "display": "Rhode Island Rams",
+  "espn_abbr": "uri",
+  "location": "Rhode Island"
+ },
+ "rice": {
+  "display": "Rice Owls",
+  "espn_abbr": "rice",
+  "location": "Rice"
+ },
+ "rich": {
+  "display": "Richmond Spiders",
+  "espn_abbr": "rich",
+  "location": "Richmond"
+ },
+ "rio": {
+  "display": "Rio Grande",
+  "espn_abbr": null,
+  "location": "Rio Grande"
+ },
+ "robms": {
+  "display": "Robert Morris Colonials",
+  "espn_abbr": "rmu",
+  "location": "Robert Morris"
+ },
+ "rutger": {
+  "display": "Rutgers Scarlet Knights",
+  "espn_abbr": "rutg",
+  "location": "Rutgers"
+ },
+ "sacred": {
+  "display": "Sacred Heart Pioneers",
+  "espn_abbr": "shu",
+  "location": "Sacred Heart"
+ },
+ "sacst": {
+  "display": "Sacramento State Hornets",
+  "espn_abbr": "sac",
+  "location": "Sacramento State"
+ },
+ "sala": {
+  "display": "South Alabama Jaguars",
+  "espn_abbr": "usa",
+  "location": "South Alabama"
+ },
+ "samf": {
+  "display": "Samford Bulldogs",
+  "espn_abbr": "sam",
+  "location": "Samford"
+ },
+ "sc": {
+  "display": "South Carolina Gamecocks",
+  "espn_abbr": "sc",
+  "location": "South Carolina"
+ },
+ "scarst": {
+  "display": "South Carolina State Bulldogs",
+  "espn_abbr": "scst",
+  "location": "South Carolina State"
+ },
+ "sdak": {
+  "display": "South Dakota Coyotes",
+  "espn_abbr": "sdak",
+  "location": "South Dakota"
+ },
+ "sdkst": {
+  "display": "South Dakota State Jackrabbits",
+  "espn_abbr": "sdst",
+  "location": "South Dakota State"
+ },
+ "sdst": {
+  "display": "San Diego State Aztecs",
+  "espn_abbr": "sdsu",
+  "location": "San Diego State"
+ },
+ "selou": {
+  "display": "SE Louisiana Lions",
+  "espn_abbr": "sela",
+  "location": "Southeastern Louisiana"
+ },
+ "semst": {
+  "display": "Southeast Missouri State Redhawks",
+  "espn_abbr": "semo",
+  "location": "Southeast Missouri State"
+ },
+ "sfaus": {
+  "display": "Stephen F. Austin Lumberjacks",
+  "espn_abbr": "sfa",
+  "location": "Stephen F. Austin"
+ },
+ "sfl": {
+  "display": "South Florida Bulls",
+  "espn_abbr": "usf",
+  "location": "South Florida"
+ },
+ "sill": {
+  "display": "Southern Illinois Salukis",
+  "espn_abbr": "siu",
+  "location": "Southern Illinois"
+ },
+ "sjst": {
+  "display": "San Jos\u00e9 State Spartans",
+  "espn_abbr": "sjsu",
+  "location": "San Jose State"
+ },
+ "smho": {
+  "display": "Sam Houston Bearkats",
+  "espn_abbr": "shsu",
+  "location": "Sam Houston"
+ },
+ "smu": {
+  "display": "SMU Mustangs",
+  "espn_abbr": "smu",
+  "location": "SMU"
+ },
+ "soumis": {
+  "display": "Southern Miss Golden Eagles",
+  "espn_abbr": "usm",
+  "location": "Southern Miss"
+ },
+ "south": {
+  "display": "Southern Jaguars",
+  "espn_abbr": "sou",
+  "location": "Southern"
+ },
+ "stan": {
+  "display": "Stanford Cardinal",
+  "espn_abbr": "stan",
+  "location": "Stanford"
+ },
+ "stbr": {
+  "display": "Stony Brook Seawolves",
+  "espn_abbr": "stbk",
+  "location": "Stony Brook"
+ },
+ "stet": {
+  "display": "Stetson Hatters",
+  "espn_abbr": "stet",
+  "location": "Stetson"
+ },
+ "stmn": {
+  "display": "St. Thomas Tommies",
+  "espn_abbr": "stmn",
+  "location": "St. Thomas (MN)"
+ },
+ "stnh": {
+  "display": "Stonehill Skyhawks",
+  "espn_abbr": "sto",
+  "location": "Stonehill"
+ },
+ "sutah": {
+  "display": "Southern Utah Thunderbirds",
+  "espn_abbr": "suu",
+  "location": "Southern Utah"
+ },
+ "syra": {
+  "display": "Syracuse Orange",
+  "espn_abbr": "syr",
+  "location": "Syracuse"
+ },
+ "tarl": {
+  "display": "Tarleton State Texans",
+  "espn_abbr": "tar",
+  "location": "Tarleton State"
+ },
+ "tcu": {
+  "display": "TCU Horned Frogs",
+  "espn_abbr": "tcu",
+  "location": "TCU"
+ },
+ "templ": {
+  "display": "Temple Owls",
+  "espn_abbr": "tem",
+  "location": "Temple"
+ },
+ "tenn": {
+  "display": "Tennessee Volunteers",
+  "espn_abbr": "tenn",
+  "location": "Tennessee"
+ },
+ "tenst": {
+  "display": "Tennessee State Tigers",
+  "espn_abbr": "tnst",
+  "location": "Tennessee State"
+ },
+ "tentch": {
+  "display": "Tennessee Tech Golden Eagles",
+  "espn_abbr": "tntc",
+  "location": "Tennessee Tech"
+ },
+ "tmrt": {
+  "display": "UT Martin Skyhawks",
+  "espn_abbr": "utm",
+  "location": "UT Martin"
+ },
+ "toledo": {
+  "display": "Toledo Rockets",
+  "espn_abbr": "tol",
+  "location": "Toledo"
+ },
+ "tows": {
+  "display": "Towson Tigers",
+  "espn_abbr": "tow",
+  "location": "Towson"
+ },
+ "troy": {
+  "display": "Troy Trojans",
+  "espn_abbr": "troy",
+  "location": "Troy"
+ },
+ "tulane": {
+  "display": "Tulane Green Wave",
+  "espn_abbr": "tuln",
+  "location": "Tulane"
+ },
+ "tulsa": {
+  "display": "Tulsa Golden Hurricane",
+  "espn_abbr": "tlsa",
+  "location": "Tulsa"
+ },
+ "tx": {
+  "display": "Texas Longhorns",
+  "espn_abbr": "tex",
+  "location": "Texas"
+ },
+ "txam": {
+  "display": "Texas A&M Aggies",
+  "espn_abbr": "ta&m",
+  "location": "Texas A&M"
+ },
+ "txamc": {
+  "display": "East Texas A&M Lions",
+  "espn_abbr": "etam",
+  "location": "East Texas A&M"
+ },
+ "txs": {
+  "display": "Texas Southern Tigers",
+  "espn_abbr": "txso",
+  "location": "Texas Southern"
+ },
+ "txst": {
+  "display": "Texas State Bobcats",
+  "espn_abbr": "txst",
+  "location": "Texas State"
+ },
+ "txtech": {
+  "display": "Texas Tech Red Raiders",
+  "espn_abbr": "ttu",
+  "location": "Texas Tech"
+ },
+ "uab": {
+  "display": "UAB Blazers",
+  "espn_abbr": "uab",
+  "location": "UAB"
+ },
+ "ucdv": {
+  "display": "UC Davis Aggies",
+  "espn_abbr": "ucd",
+  "location": "UC Davis"
+ },
+ "ucf": {
+  "display": "UCF Knights",
+  "espn_abbr": "ucf",
+  "location": "UCF"
+ },
+ "ucla": {
+  "display": "UCLA Bruins",
+  "espn_abbr": "ucla",
+  "location": "UCLA"
+ },
+ "uconn": {
+  "display": "UConn Huskies",
+  "espn_abbr": "conn",
+  "location": "UConn"
+ },
+ "uk": {
+  "display": "Kentucky Wildcats",
+  "espn_abbr": "uk",
+  "location": "Kentucky"
+ },
+ "umass": {
+  "display": "Massachusetts Minutemen",
+  "espn_abbr": "mass",
+  "location": "UMass"
+ },
+ "unlv": {
+  "display": "UNLV Rebels",
+  "espn_abbr": "unlv",
+  "location": "UNLV"
+ },
+ "usc": {
+  "display": "USC Trojans",
+  "espn_abbr": "usc",
+  "location": "USC"
+ },
+ "usd": {
+  "display": "San Diego Toreros",
+  "espn_abbr": "usd",
+  "location": "San Diego"
+ },
+ "utah": {
+  "display": "Utah Utes",
+  "espn_abbr": "utah",
+  "location": "Utah"
+ },
+ "utahst": {
+  "display": "Utah State Aggies",
+  "espn_abbr": "usu",
+  "location": "Utah State"
+ },
+ "utep": {
+  "display": "UTEP Miners",
+  "espn_abbr": "utep",
+  "location": "UTEP"
+ },
+ "utrgv": {
+  "display": "UT Rio Grande Valley",
+  "espn_abbr": null,
+  "location": "UT Rio Grande Valley"
+ },
+ "utsa": {
+  "display": "UTSA Roadrunners",
+  "espn_abbr": "utsa",
+  "location": "UTSA"
+ },
+ "uwfl": {
+  "display": "West Florida Argonauts",
+  "espn_abbr": "uwf",
+  "location": "West Florida"
+ },
+ "uwg": {
+  "display": "West Georgia Wolves",
+  "espn_abbr": "wga",
+  "location": "West Georgia"
+ },
+ "valp": {
+  "display": "Valparaiso Beacons",
+  "espn_abbr": "val",
+  "location": "Valparaiso"
+ },
+ "vamil": {
+  "display": "VMI Keydets",
+  "espn_abbr": "vmi",
+  "location": "VMI"
+ },
+ "vand": {
+  "display": "Vanderbilt Commodores",
+  "espn_abbr": "van",
+  "location": "Vanderbilt"
+ },
+ "vill": {
+  "display": "Villanova Wildcats",
+  "espn_abbr": "vill",
+  "location": "Villanova"
+ },
+ "vir": {
+  "display": "Virginia Cavaliers",
+  "espn_abbr": "uva",
+  "location": "Virginia"
+ },
+ "vtech": {
+  "display": "Virginia Tech Hokies",
+  "espn_abbr": "vt",
+  "location": "Virginia Tech"
+ },
+ "wag": {
+  "display": "Wagner Seahawks",
+  "espn_abbr": "wag",
+  "location": "Wagner"
+ },
+ "wake": {
+  "display": "Wake Forest Demon Deacons",
+  "espn_abbr": "wake",
+  "location": "Wake Forest"
+ },
+ "wash": {
+  "display": "Washington Huskies",
+  "espn_abbr": "wash",
+  "location": "Washington"
+ },
+ "washst": {
+  "display": "Washington State Cougars",
+  "espn_abbr": "wsu",
+  "location": "Washington State"
+ },
+ "wcar": {
+  "display": "Western Carolina Catamounts",
+  "espn_abbr": "wcu",
+  "location": "Western Carolina"
+ },
+ "webst": {
+  "display": "Weber State Wildcats",
+  "espn_abbr": "web",
+  "location": "Weber State"
+ },
+ "will": {
+  "display": "Western Illinois Leathernecks",
+  "espn_abbr": "wiu",
+  "location": "Western Illinois"
+ },
+ "wisc": {
+  "display": "Wisconsin Badgers",
+  "espn_abbr": "wis",
+  "location": "Wisconsin"
+ },
+ "wkent": {
+  "display": "Western Kentucky Hilltoppers",
+  "espn_abbr": "wku",
+  "location": "Western Kentucky"
+ },
+ "wm": {
+  "display": "William & Mary Tribe",
+  "espn_abbr": "w&m",
+  "location": "William & Mary"
+ },
+ "wmich": {
+  "display": "Western Michigan Broncos",
+  "espn_abbr": "wmu",
+  "location": "Western Michigan"
+ },
+ "woff": {
+  "display": "Wofford Terriers",
+  "espn_abbr": "wof",
+  "location": "Wofford"
+ },
+ "wvir": {
+  "display": "West Virginia Mountaineers",
+  "espn_abbr": "wvu",
+  "location": "West Virginia"
+ },
+ "wyom": {
+  "display": "Wyoming Cowboys",
+  "espn_abbr": "wyo",
+  "location": "Wyoming"
+ },
+ "yale": {
+  "display": "Yale Bulldogs",
+  "espn_abbr": "yale",
+  "location": "Yale"
+ },
+ "yngst": {
+  "display": "Youngstown State Penguins",
+  "espn_abbr": "ysu",
+  "location": "Youngstown State"
+ }
+}

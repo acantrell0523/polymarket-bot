@@ -192,3 +192,20 @@ class TestLightSnapshot:
         cfg = load_config()
         md = MarketDataClient(cfg.api, None, cfg.filters)
         assert md._book_min_interval >= 2.0
+
+
+class TestLiveBookPreference:
+    def test_live_quote_replaces_pregame_from_same_book(self):
+        from bot.signals.book_scrapers import MultiBookAggregator
+        agg = MultiBookAggregator(cache_ttl=999)
+        pre = {"home_team": "Calgary Flames", "away_team": "Seattle Kraken", "home_prob": 0.6, "away_prob": 0.4, "book": "pinnacle", "live": False}
+        live = {"home_team": "Calgary Flames", "away_team": "Seattle Kraken", "home_prob": 0.8, "away_prob": 0.2, "book": "pinnacle", "live": True}
+        agg.fanduel.get_odds = lambda k: []
+        agg.pinnacle.get_odds = lambda k: [pre, live]
+        games = agg.get_all_odds("icehockey_nhl")
+        assert list(games) == ["sea@cgy"]            # Polymarket codes, league-scoped
+        assert games["sea@cgy"][0]["home_prob"] == 0.8  # the live line won
+
+    def test_nhl_codes_normalize(self):
+        from bot.leagues import normalize_abbr
+        assert normalize_abbr("nhl", "vgk") == "veg" and normalize_abbr("nhl", "wsh") == "was"

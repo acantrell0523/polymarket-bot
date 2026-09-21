@@ -2,6 +2,10 @@
 
 import os
 import time
+import os
+import json
+import fcntl
+import tempfile
 import requests
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone, timedelta
@@ -43,6 +47,17 @@ class MarketDataClient:
         # never 429'd. Book calls get their own, slower limiter.
         self._book_min_interval = 2.0
         self._last_book_call = 0.0
+        # Shared cache for side-by-side strategy processes. When
+        # POLYBOT_SHARED_DIR is set, the market list and every order book
+        # fetched are written there and reused by any other bot process for
+        # a short TTL, and /book calls are serialized across processes with
+        # a file lock so the gateway sees ONE scanner regardless of how many
+        # strategies are running.
+        self.shared_dir = os.environ.get("POLYBOT_SHARED_DIR") or None
+        if self.shared_dir:
+            os.makedirs(os.path.join(self.shared_dir, "books"), exist_ok=True)
+        self.shared_list_ttl = 90.0
+        self.shared_book_ttl = 8.0
 
         self.session = requests.Session()
         retries = Retry(
@@ -63,10 +78,54 @@ class MarketDataClient:
         self._last_call = time.time()
 
     def _book_rate_limit(self):
+        if self.shared_dir:
+            # Cross-process limiter: hold the lock while waiting so the
+            # combined /book cadence of all processes stays at one call per
+            # _book_min_interval.
+            lock_path = os.path.join(self.shared_dir, "book_rate.lock")
+            with open(lock_path, "a+") as fh:
+                fcntl.flock(fh, fcntl.LOCK_EX)
+                try:
+                    fh.seek(0)
+                    last = float(fh.read().strip() or 0)
+                except ValueError:
+                    last = 0.0
+                wait = self._book_min_interval - (time.time() - last)
+                if wait > 0:
+                    time.sleep(wait)
+                fh.seek(0); fh.truncate(); fh.write(str(time.time())); fh.flush()
+                fcntl.flock(fh, fcntl.LOCK_UN)
+            return
         elapsed = time.time() - self._last_book_call
         if elapsed < self._book_min_interval:
             time.sleep(self._book_min_interval - elapsed)
         self._last_book_call = time.time()
+
+    # -- shared cache helpers (no-ops without POLYBOT_SHARED_DIR) ------------
+
+    def _shared_read(self, name: str, ttl: float) -> Optional[Any]:
+        if not self.shared_dir:
+            return None
+        path = os.path.join(self.shared_dir, name)
+        try:
+            if time.time() - os.path.getmtime(path) > ttl:
+                return None
+            with open(path) as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
+
+    def _shared_write(self, name: str, data: Any) -> None:
+        if not self.shared_dir:
+            return
+        path = os.path.join(self.shared_dir, name)
+        try:
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+            with os.fdopen(fd, "w") as fh:
+                json.dump(data, fh)
+            os.replace(tmp, path)  # atomic: readers never see a partial file
+        except OSError:
+            pass
 
     def _get(self, url: str, params: Optional[Dict] = None) -> Optional[Any]:
         if "/book" in url or "/bbo" in url:
@@ -123,6 +182,13 @@ class MarketDataClient:
         offset = 0
         pages = 0
 
+        cached = self._shared_read("markets_list.json", self.shared_list_ttl)
+        if cached:
+            markets = cached
+            offset = max_markets  # skip pagination; counts logged below
+            if self.logger:
+                self.logger.info("markets_list_from_shared_cache", {"raw_markets": len(markets)})
+
         while offset < max_markets:
             params = {"active": "true", "closed": "false",
                       "limit": page_size, "offset": offset}
@@ -147,7 +213,9 @@ class MarketDataClient:
                 break  # last page
             offset += page_size
 
-        if offset >= max_markets:
+        if not cached and markets:
+            self._shared_write("markets_list.json", markets)
+        if offset >= max_markets and not cached:
             if self.logger:
                 self.logger.warning("market_pagination_cap_reached", {
                     "max_markets": max_markets,
@@ -198,6 +266,16 @@ class MarketDataClient:
                     p0 = self._token0_price(m)
                     if p0 is None or not (LINE_MIN_PRICE <= p0 <= LINE_MAX_PRICE):
                         line_out_of_band += 1
+                        continue
+                    # Same time window as moneylines: live (started < 4h ago)
+                    # or starting within sports_window_hours.
+                    gs = self._parse_datetime(game_start_str)
+                    if gs is None:
+                        continue
+                    if gs <= now:
+                        if (now - gs) > max_live_age:
+                            continue
+                    elif gs < min_expiry or gs > sports_cutoff:
                         continue
                     line_candidates.append((parsed, p0, m))
                     continue  # admitted below, capped per game
@@ -307,7 +385,12 @@ class MarketDataClient:
     def get_us_order_book(self, slug: str) -> OrderBook:
         """Fetch order book from Polymarket US API."""
         url = f"{self.us_api_url}/v1/markets/{slug}/book"
-        data = self._get(url)
+        cache_name = os.path.join("books", f"{slug}.json")
+        data = self._shared_read(cache_name, self.shared_book_ttl)
+        if data is None:
+            data = self._get(url)
+            if data:
+                self._shared_write(cache_name, data)
 
         if not data or not isinstance(data, dict):
             return OrderBook()

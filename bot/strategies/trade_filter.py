@@ -18,6 +18,7 @@ LEAGUE_MIN_EDGE = {
     "nba": 0.07,
     "epl": 0.05,
     "nfl": 0.05,
+    "cfb": 0.05,
     "mlb": 0.05,
     "wnba": 0.05,   # thinner books, less efficient than NBA
     "mls": 0.05,
@@ -78,6 +79,7 @@ def validate_trade(
     min_liquidity_usd: float = MIN_LIQUIDITY_USD,
     max_spread: Optional[float] = None,
     min_net_edge: Optional[float] = None,
+    league_min_edge_override: float = 0.0,
 ) -> Optional[str]:
     """Validate a trade against ALL pre-trade checks.
 
@@ -90,7 +92,7 @@ def validate_trade(
         return f"only_{num_books}_books"
 
     # 2. Per-league minimum edge
-    min_edge = get_league_min_edge(signal.slug)
+    min_edge = league_min_edge_override or get_league_min_edge(signal.slug)
     effective_edge = apply_short_bias(signal.edge, signal.side)
     if effective_edge < min_edge:
         return f"edge_{effective_edge*100:.1f}pct_below_{league}_{min_edge*100:.0f}pct_min"
