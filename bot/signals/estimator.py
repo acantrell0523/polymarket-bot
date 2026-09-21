@@ -30,6 +30,7 @@ from bot.signals.cross_market import PredictItCache
 from bot.signals.crypto_api import CryptoCache
 from bot.signals.sports_data import ESPNCache, GameContextAnalyzer
 from bot.signals.lines import is_line_market, spread_total_signal
+from bot.signals.kalshi import kalshi_cross_signal
 
 
 # Market type detection patterns
@@ -65,6 +66,8 @@ WEIGHTS = {
         # Those markets skip odds_value entirely, so this is their only
         # external signal and carries the same weight live_win_prob does.
         "spread_total": 0.55,
+        # Kalshi print for the same outcome (aux; confidence ≤ 0.6, 0 when absent)
+        "kalshi_cross": 0.25,
     },
     "crypto": {
         "crypto_model": 0.45,
@@ -144,6 +147,7 @@ class ProbabilityEstimator:
         onchain_client=None,
         live_cache=None,
         lines_cache=None,
+        kalshi_cache=None,
     ):
         self.config = config
         self.odds_cache = odds_cache
@@ -156,6 +160,7 @@ class ProbabilityEstimator:
         self.live_cache = live_cache
         # LinesCache: spread/total quotes for asc-/tsc- markets
         self.lines_cache = lines_cache
+        self.kalshi_cache = kalshi_cache
 
     def compute_signals(self, snapshot: MarketSnapshot, market_type: str) -> List[Signal]:
         """Compute signals appropriate for the market type."""
@@ -175,8 +180,10 @@ class ProbabilityEstimator:
             # and live_win_prob are all skipped; the lines model is the sole
             # external signal (order-book signals remain as aux).
             signals.append(spread_total_signal(snapshot, self.config, self.lines_cache))
+            signals.append(kalshi_cross_signal(snapshot, self.config, self.kalshi_cache))
         elif market_type == "sports":
             signals.append(odds_value_signal(snapshot, self.config, self.odds_cache))
+            signals.append(kalshi_cross_signal(snapshot, self.config, self.kalshi_cache))
             signals.append(line_movement_signal(snapshot, self.config))
             signals.append(sports_context_signal(
                 snapshot, self.config, self.espn_cache, self.game_context_analyzer

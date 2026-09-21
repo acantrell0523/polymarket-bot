@@ -292,7 +292,7 @@ class TestProbabilityEstimator:
         estimator = ProbabilityEstimator(signal_config)
         signals = estimator.compute_signals(sports_snapshot, "sports")
         # sports → order_book_imbalance, liquidity_imbalance, odds_value, line_movement, sports_context
-        assert len(signals) == 5
+        assert len(signals) == 6  # + kalshi_cross (2026-09-20)
 
     def test_estimate_probability_returns_valid_range(self, signal_config, sample_snapshot):
         estimator = ProbabilityEstimator(signal_config)

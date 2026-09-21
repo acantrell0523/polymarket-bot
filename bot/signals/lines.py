@@ -170,7 +170,7 @@ class LinesCache:
             return cached[1]
         games: Dict[str, Dict[str, List[dict]]] = {}
         sport_key = LEAGUES.get(league, {}).get("odds_api_key", "")
-        for fetch in (self._pinnacle, self._fanduel, self._espn):
+        for fetch in (self._pinnacle, self._fanduel, self._espn, self._actionnetwork):
             try:
                 for key, kind, quote in fetch(league, sport_key):
                     games.setdefault(key, {"spread": [], "total": []})[kind].append(quote)
@@ -306,6 +306,13 @@ class LinesCache:
                 yield key, "total", {"book": "espn_dk", "kind": "total",
                                      "points": float(ou), "p": 0.5,
                                      "main": True, "live": False}
+
+    def _actionnetwork(self, league: str, sport_key: str):
+        """Pregame spreads/totals from DraftKings, BetMGM, Caesars, bet365, BetRivers."""
+        from bot.signals.book_scrapers import ActionNetworkClient
+        if not hasattr(self, "_an"):
+            self._an = ActionNetworkClient(cache_ttl=self.cache_ttl)
+        yield from self._an.line_quotes(sport_key)
 
     # -- pricing -------------------------------------------------------------
 

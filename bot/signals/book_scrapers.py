@@ -439,6 +439,7 @@ class MultiBookAggregator:
     def __init__(self, cache_ttl: int = 300):
         self.fanduel = FanDuelClient(cache_ttl=cache_ttl)
         self.pinnacle = PinnacleClient(cache_ttl=cache_ttl)
+        self.actionnetwork = ActionNetworkClient(cache_ttl=cache_ttl)
         self.cache_ttl = cache_ttl
         self._cache: Dict[str, Tuple[float, dict]] = {}
 
@@ -468,6 +469,12 @@ class MultiBookAggregator:
         try:
             pin = self.pinnacle.get_odds(sport_key)
             all_events.extend(pin)
+        except Exception:
+            pass
+
+        # Action Network: DraftKings / BetMGM / Caesars / bet365 / BetRivers, pregame only
+        try:
+            all_events.extend(self.actionnetwork.get_odds(sport_key))
         except Exception:
             pass
 
@@ -604,3 +611,116 @@ class MultiBookAggregator:
             if (h == home_abbr and a == away_abbr) or (h == away_abbr and a == home_abbr):
                 return game
         return None
+
+
+# ---------------------------------------------------------------------------
+# Action Network (pregame multi-book: DraftKings, BetMGM, Caesars, bet365,
+# BetRivers). Unofficial JSON the Action Network app itself loads; no auth.
+# Lines stop updating at kickoff (verified 2026-09-20 during IND@KC), so
+# only `scheduled` games are used — live consensus stays with Pinnacle and
+# FanDuel, which quote in-play.
+# ---------------------------------------------------------------------------
+
+AN_BASE = "https://api.actionnetwork.com/web/v1/scoreboard"
+AN_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
+# FanDuel (69) is excluded: the direct FanDuel client already supplies it (live-aware).
+AN_BOOKS = {68: "an_draftkings", 75: "an_betmgm", 123: "an_caesars", 79: "an_bet365", 71: "an_betrivers"}
+AN_LEAGUES = {
+    "americanfootball_nfl": ("nfl", ""),
+    "americanfootball_ncaaf": ("ncaaf", "&division=FBS"),
+    "icehockey_nhl": ("nhl", ""),
+}
+
+
+class ActionNetworkClient:
+    """Pregame moneylines, spreads and totals per book from Action Network."""
+
+    def __init__(self, cache_ttl: int = 300):
+        self.cache_ttl = cache_ttl
+        self.name = "actionnetwork"
+        self._cache: Dict[str, Tuple[float, List[dict]]] = {}
+
+    def _fetch(self, sport_key: str) -> List[dict]:
+        league = AN_LEAGUES.get(sport_key)
+        if not league:
+            return []
+        import datetime as _dt
+        path, extra = league
+        games: List[dict] = []
+        # nfl/ncaaf return the whole week for any date in it; nhl is per day.
+        days = [0, 1] if path == "nhl" else [0]
+        seen = set()
+        for d in days:
+            date = (_dt.datetime.utcnow() - _dt.timedelta(hours=5) + _dt.timedelta(days=d)).strftime("%Y%m%d")
+            url = (f"{AN_BASE}/{path}?bookIds={','.join(str(b) for b in AN_BOOKS)}"
+                   f"&date={date}&periods=event{extra}")
+            try:
+                resp = requests.get(url, headers={"User-Agent": AN_UA}, timeout=15)
+                if resp.status_code != 200:
+                    continue
+                for g in resp.json().get("games", []):
+                    if g.get("id") in seen:
+                        continue
+                    seen.add(g.get("id"))
+                    games.append(g)
+            except Exception:
+                continue
+        return games
+
+    def games(self, sport_key: str) -> List[dict]:
+        """Raw scheduled games with per-book `game` odds rows (cached)."""
+        now = time.time()
+        cached = self._cache.get(sport_key)
+        if cached and now - cached[0] < self.cache_ttl:
+            return cached[1]
+        out = []
+        for g in self._fetch(sport_key):
+            if g.get("status") != "scheduled":
+                continue
+            teams = {t.get("id"): t for t in g.get("teams", [])}
+            home = teams.get(g.get("home_team_id"), {}).get("full_name", "")
+            away = teams.get(g.get("away_team_id"), {}).get("full_name", "")
+            if not home or not away:
+                continue
+            rows = [o for o in g.get("odds", []) if o.get("type") == "game" and o.get("book_id") in AN_BOOKS]
+            if rows:
+                out.append({"home_team": home, "away_team": away, "start": g.get("start_time", ""), "rows": rows})
+        self._cache[sport_key] = (now, out)
+        return out
+
+    def get_odds(self, sport_key: str) -> List[dict]:
+        """Moneyline events, one per book per game (same shape as FanDuel/Pinnacle)."""
+        results = []
+        for g in self.games(sport_key):
+            for o in g["rows"]:
+                mh, ma = o.get("ml_home"), o.get("ml_away")
+                if not mh or not ma:
+                    continue
+                hp, ap = american_to_prob(int(mh)), american_to_prob(int(ma))
+                tot = hp + ap
+                if tot <= 0:
+                    continue
+                results.append({"home_team": g["home_team"], "away_team": g["away_team"],
+                                "home_prob": hp / tot, "away_prob": ap / tot,
+                                "book": AN_BOOKS[o["book_id"]], "live": False})
+        return results
+
+    def line_quotes(self, sport_key: str):
+        """(game key, kind, quote) tuples for LinesCache: away spread + total per book."""
+        for g in self.games(sport_key):
+            key_a, key_h = _match_abbr(g["away_team"], sport_key), _match_abbr(g["home_team"], sport_key)
+            if not key_a or not key_h:
+                continue
+            key = f"{key_a}@{key_h}"
+            for o in g["rows"]:
+                book = AN_BOOKS[o["book_id"]]
+                sa, pa, ph = o.get("spread_away"), o.get("spread_away_line"), o.get("spread_home_line")
+                if sa is not None and pa and ph:
+                    p_away = american_to_prob(int(pa)); p_home = american_to_prob(int(ph))
+                    yield key, "spread", {"book": book, "kind": "spread", "points": float(sa),
+                                          "p": p_away / (p_away + p_home), "main": True, "live": False}
+                t, po, pu = o.get("total"), o.get("over"), o.get("under")
+                if t is not None and po and pu:
+                    p_o = american_to_prob(int(po)); p_u = american_to_prob(int(pu))
+                    yield key, "total", {"book": book, "kind": "total", "points": float(t),
+                                         "p": p_o / (p_o + p_u), "main": True, "live": False}

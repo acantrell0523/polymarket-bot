@@ -209,3 +209,30 @@ class TestLiveBookPreference:
     def test_nhl_codes_normalize(self):
         from bot.leagues import normalize_abbr
         assert normalize_abbr("nhl", "vgk") == "veg" and normalize_abbr("nhl", "wsh") == "was"
+
+
+class TestKalshi:
+    def test_ticker_parsing_and_lookup(self):
+        from bot.signals import kalshi as K
+        t = K._parse_ticker("KXNFLGAME-26SEP21NYGLAR-NYG")
+        assert t["date"] == "2026-09-21" and (t["away"], t["home"]) == ("NYG", "LAR")
+        t = K._parse_ticker("KXNFLSPREAD-26SEP27LARDEN-LAR8")
+        assert (t["away"], t["home"], t["outcome"]) == ("LAR", "DEN", "LAR")
+        c = K.KalshiCache(cache_ttl=999)
+        c._index["nfl"] = (9e12, {("nfl", "2026-09-21", "nyg", "lar"): {
+            "ml": {"nyg": (0.265, 0.01), "lar": (0.735, 0.01)},
+            "spread": {("lar", 6.5): (0.52, 0.02)},
+            "total": {47.5: (0.5, 0.02)}}})
+        assert c.quote_for_slug("aec-nfl-nyg-lar-2026-09-21")["prob"] == 0.265
+        assert c.quote_for_slug("asc-nfl-nyg-lar-2026-09-21-pos-6pt5")["prob"] == pytest.approx(0.48)
+        assert c.quote_for_slug("tsc-nfl-nyg-lar-2026-09-21-total-47pt5")["prob"] == 0.5
+        assert c.quote_for_slug("aec-nfl-kc-den-2026-09-21") is None
+
+    def test_signal_is_aux_and_width_gated(self):
+        from bot.signals import kalshi as K
+        c = K.KalshiCache(cache_ttl=999)
+        c._index["nfl"] = (9e12, {("nfl", "2026-09-21", "nyg", "lar"): {"ml": {"nyg": (0.30, 0.01)}, "spread": {}, "total": {}}})
+        s = K.kalshi_cross_signal(_snap("aec-nfl-nyg-lar-2026-09-21", 0.25), None, c)
+        assert s.name == "kalshi_cross" and 0 < s.confidence <= 0.6 and s.metadata["edge"] == pytest.approx(0.05)
+        c._index["nfl"] = (9e12, {("nfl", "2026-09-21", "nyg", "lar"): {"ml": {"nyg": (0.30, 0.20)}, "spread": {}, "total": {}}})
+        assert K.kalshi_cross_signal(_snap("aec-nfl-nyg-lar-2026-09-21", 0.25), None, c).confidence == 0

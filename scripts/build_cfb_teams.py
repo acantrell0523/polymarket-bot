@@ -70,12 +70,23 @@ def main():
             if not q:
                 continue
             seen += 1
+            # Polymarket's displayAbbreviation (CCAR, LIB, RUTG) is what Kalshi
+            # uses in its tickers; keep it for the cross-venue join.
+            disp = {}
+            for side in m.get("marketSides", []):
+                t = side.get("team") or {}
+                if t.get("abbreviation") and t.get("displayAbbreviation"):
+                    disp[t["abbreviation"]] = t["displayAbbreviation"].lower()
             for code, loc in ((parts[2], q.group(1).strip()), (parts[3], q.group(2).strip())):
                 e = espn.get(norm(loc)) or espn.get(norm(loc).replace(" state", " st"))
                 entry = {"location": loc, "espn_abbr": e["espn_abbr"] if e else None,
-                         "display": e["display"] if e else loc}
-                if code not in teams or (entry["espn_abbr"] and not teams[code].get("espn_abbr")):
-                    teams[code] = entry
+                         "display": e["display"] if e else loc, "display_abbr": disp.get(code)}
+                # Merge: keep known fields, fill anything newly learned.
+                merged = dict(teams.get(code, {}))
+                for k, v in entry.items():
+                    if v and not merged.get(k):
+                        merged[k] = v
+                teams[code] = merged
         if len(ms) < 500:
             break
         off += 500

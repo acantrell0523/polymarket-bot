@@ -184,6 +184,10 @@ class TradingBot:
         from bot.signals.lines import LinesCache
         self.lines_cache = LinesCache(cache_ttl=120, game_schedule=self.game_schedule)
 
+        # Kalshi prints for the same games (aux cross-venue signal)
+        from bot.signals.kalshi import KalshiCache
+        self.kalshi_cache = KalshiCache(cache_ttl=60)
+
         # Liveness + API health tracking (heartbeat file read by supervisor)
         self._data_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
         self.health = HealthMonitor(
@@ -208,6 +212,7 @@ class TradingBot:
             config.signals, self.odds_cache, self.predictit_cache, self.crypto_cache,
             self.espn_cache, self.game_context, onchain_client=self.onchain_client,
             live_cache=self.live_cache, lines_cache=self.lines_cache,
+            kalshi_cache=self.kalshi_cache,
         )
 
         self.portfolio = Portfolio(
@@ -245,6 +250,7 @@ class TradingBot:
             live_signal_config, self.odds_cache, self.predictit_cache, self.crypto_cache,
             self.espn_cache, self.game_context, onchain_client=self.onchain_client,
             live_cache=self.live_cache, lines_cache=self.lines_cache,
+            kalshi_cache=self.kalshi_cache,
         )
 
         # Live-game trading overrides — use same edge threshold as config
