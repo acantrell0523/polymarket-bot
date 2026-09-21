@@ -58,6 +58,7 @@ class MarketDataClient:
             os.makedirs(os.path.join(self.shared_dir, "books"), exist_ok=True)
         self.shared_list_ttl = 90.0
         self.shared_book_ttl = 8.0
+        self.book_feed = None   # attached by the trading loop when the websocket feed is on
 
         self.session = requests.Session()
         retries = Retry(
@@ -386,7 +387,19 @@ class MarketDataClient:
         """Fetch order book from Polymarket US API."""
         url = f"{self.us_api_url}/v1/markets/{slug}/book"
         cache_name = os.path.join("books", f"{slug}.json")
-        data = self._shared_read(cache_name, self.shared_book_ttl)
+        # 1. streamed book (websocket feed, zero REST calls) — same payload
+        #    shape as REST, so the parser below handles both
+        data = None
+        feed = getattr(self, "book_feed", None)
+        if feed is not None:
+            payload = feed.get_book(slug)
+            if payload is not None:
+                data = {"marketData": payload}
+                self.books_from_feed = getattr(self, "books_from_feed", 0) + 1
+        # 2. shared cache (a sibling process or the feed leader wrote it)
+        if data is None:
+            data = self._shared_read(cache_name, self.shared_book_ttl)
+        # 3. REST, rate-limited
         if data is None:
             data = self._get(url)
             if data:

@@ -271,3 +271,31 @@ class TestActionNetworkLive:
                 {"type": "live", "book_id": 68, "ml_home": -1160, "ml_away": 720, "inserted": "2026-09-20T20:00:00+00:00"}]
         games = ActionNetworkClient().parse_games([self._game("scheduled", rows)])
         assert games[0]["live"] is False and games[0]["rows"][0]["ml_home"] == -280
+
+
+class TestBookFeed:
+    def test_feed_book_replaces_rest_and_expires(self):
+        from bot.book_feed import BookFeed
+        from bot.market_data import MarketDataClient
+        from utils.config import load_config
+        cfg = load_config(); md = MarketDataClient(cfg.api, None, cfg.filters)
+        feed = BookFeed("k", "s"); md.book_feed = feed
+        md._get = lambda url, params=None: (_ for _ in ()).throw(AssertionError("REST called"))
+        feed.handle_market_data({"marketData": {"marketSlug": "aec-nfl-a-b-2026-09-21",
+                                                 "bids": [{"px": {"value": "0.45"}, "qty": "120"}],
+                                                 "offers": [{"px": {"value": "0.47"}, "qty": "80"}]}})
+        ob = md.get_us_order_book("aec-nfl-a-b-2026-09-21")
+        assert ob.bids[0].price == 0.45 and ob.asks[0].price == 0.47 and md.books_from_feed == 1
+        feed.books["aec-nfl-a-b-2026-09-21"] = (0.0, feed.books["aec-nfl-a-b-2026-09-21"][1])  # ancient
+        assert feed.get_book("aec-nfl-a-b-2026-09-21") is None   # stale → caller falls back to REST
+
+    def test_feed_disabled_without_key(self):
+        from bot.book_feed import BookFeed
+        f = BookFeed("", ""); f.start()
+        assert not f.enabled and f.status()["disabled_reason"] == "no_api_key" and f._thread is None
+
+    def test_set_slugs_bumps_version_only_on_change(self):
+        from bot.book_feed import BookFeed
+        f = BookFeed("k", "s"); v0 = f._slugs_version
+        f.set_slugs(["b", "a", "a"]); assert f._slugs == ["a", "b"] and f._slugs_version == v0 + 1
+        f.set_slugs(["a", "b"]); assert f._slugs_version == v0 + 1

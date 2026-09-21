@@ -184,6 +184,17 @@ class TradingBot:
         from bot.signals.lines import LinesCache
         self.lines_cache = LinesCache(cache_ttl=120, game_schedule=self.game_schedule)
 
+        # Streaming order books (websocket). Leader profile only
+        # (POLYBOT_BOOK_FEED=1); siblings get the books via the shared cache.
+        self.book_feed = None
+        if os.environ.get("POLYBOT_BOOK_FEED") == "1":
+            from bot.book_feed import BookFeed
+            self.book_feed = BookFeed(config.wallet.key_id, config.wallet.secret_key, logger=self.logger,
+                                      shared_dir=os.environ.get("POLYBOT_SHARED_DIR") or None)
+            self.market_data.book_feed = self.book_feed
+            self.book_feed.start()
+            self.logger.info("book_feed_starting", self.book_feed.status())
+
         # Kalshi prints for the same games (aux cross-venue signal)
         from bot.signals.kalshi import KalshiCache
         self.kalshi_cache = KalshiCache(cache_ttl=60)
@@ -914,6 +925,8 @@ class TradingBot:
             self.health.record_success("market_data")
         self._cached_markets = markets
         self._last_full_scan = time.time()
+        if self.book_feed is not None:
+            self.book_feed.set_slugs([m.get("slug", "") for m in markets])
         return markets
 
     def _prescreen(self, markets: List[Dict], label: str) -> List[Dict]:
@@ -1068,6 +1081,7 @@ class TradingBot:
                     "degraded_sources": [
                         s for s in ("market_data",) if self.health.is_degraded(s)
                     ],
+                    "book_feed": self.book_feed.status() if self.book_feed else None,
                 })
 
                 # Check supervisor kill switch / pause
