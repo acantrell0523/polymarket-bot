@@ -41,7 +41,8 @@ class RiskManager:
     def is_daily_limit_breached(self) -> bool:
         return self.daily_pnl <= -self.config.daily_loss_limit_usd
 
-    def check_position(self, position: Position, current_price: float, estimated_prob: float) -> Optional[str]:
+    def check_position(self, position: Position, current_price: float,
+                       estimated_prob: float, allow_quote_resolution: bool = True) -> Optional[str]:
         """Check if a position should be closed.
 
         Exit hierarchy:
@@ -55,6 +56,7 @@ class RiskManager:
             return None
 
         position.current_price = current_price
+        risk_basis = position.risk_per_contract
 
         if position.side == "buy":
             pnl_per_unit = current_price - position.entry_price
@@ -62,7 +64,7 @@ class RiskManager:
             pnl_per_unit = position.entry_price - current_price
 
         position.unrealized_pnl = pnl_per_unit * position.quantity
-        gain_pct = pnl_per_unit / position.entry_price if position.entry_price > 0 else 0
+        gain_pct = pnl_per_unit / risk_basis if risk_basis > 0 else 0
 
         # Track peak favorable price for trailing stop
         if position.side == "buy":
@@ -78,11 +80,11 @@ class RiskManager:
         # The exchange marks markets as resolved — we check that in the trading loop,
         # not here. We only trigger "resolved" at the absolute extremes (0.00 or 1.00)
         # which indicate actual settlement.
-        if current_price <= 0.001 or current_price >= 0.999:
+        if allow_quote_resolution and (current_price <= 0.001 or current_price >= 0.999):
             return "resolved"
 
         # 2. Stop-loss (25%) — always exit immediately
-        loss_pct = -pnl_per_unit / position.entry_price if position.entry_price > 0 else 0
+        loss_pct = -pnl_per_unit / risk_basis if risk_basis > 0 else 0
         if loss_pct >= self.config.stop_loss_threshold:
             return "stop_loss"
 
@@ -122,11 +124,11 @@ class RiskManager:
         # 4. Trailing stop: was up 15%+, dropped 10% from peak
         if position.peak_price > 0 and position.entry_price > 0:
             if position.side == "buy":
-                peak_gain = (position.peak_price - position.entry_price) / position.entry_price
-                drop_from_peak = (position.peak_price - current_price) / position.entry_price
+                peak_gain = (position.peak_price - position.entry_price) / risk_basis
+                drop_from_peak = (position.peak_price - current_price) / risk_basis
             else:
-                peak_gain = (position.entry_price - position.peak_price) / position.entry_price
-                drop_from_peak = (current_price - position.peak_price) / position.entry_price
+                peak_gain = (position.entry_price - position.peak_price) / risk_basis
+                drop_from_peak = (current_price - position.peak_price) / risk_basis
 
             if peak_gain >= self.config.trailing_stop_activation_pct:
                 if drop_from_peak >= self.config.trailing_stop_pct:
@@ -135,7 +137,11 @@ class RiskManager:
         # 5. Take-profit: edge converged, min $5 profit
         edge_remaining = abs(estimated_prob - current_price)
         if edge_remaining <= self.config.take_profit_threshold:
-            if position.unrealized_pnl < self.config.minimum_take_profit_usd:
+            from bot.strategies.fees import booked_fee_usd
+            net_exit_pnl = (position.unrealized_pnl - position.entry_fees
+                            - booked_fee_usd(position.quantity, current_price,
+                                             position.fee_coefficient))
+            if net_exit_pnl < self.config.minimum_take_profit_usd:
                 pass  # Under $5 profit — hold
             elif pnl_per_unit <= 0:
                 pass  # Not in profit

@@ -49,6 +49,7 @@ def compute_exit_proximity(position, current_price: float, estimated_prob: float
         let_it_ride_distance_pct     – favorable_price − LET_IT_RIDE_THRESHOLD
     """
     entry_price = position.entry_price
+    risk_basis = position.risk_per_contract
 
     # Degenerate guard: no valid entry price → return zeros
     if not entry_price or entry_price <= 0:
@@ -65,7 +66,7 @@ def compute_exit_proximity(position, current_price: float, estimated_prob: float
     else:
         pnl_per_unit = entry_price - current_price
 
-    gain_pct = pnl_per_unit / entry_price
+    gain_pct = pnl_per_unit / risk_basis
     loss_pct = -gain_pct  # positive when losing
 
     # ── 1. stop_loss ──────────────────────────────────────────────────────────
@@ -93,11 +94,11 @@ def compute_exit_proximity(position, current_price: float, estimated_prob: float
     peak_price = getattr(position, "peak_price", 0)
     if peak_price and peak_price > 0 and entry_price > 0:
         if position.side == "buy":
-            peak_gain = (peak_price - entry_price) / entry_price
-            drop_from_peak = (peak_price - current_price) / entry_price
+            peak_gain = (peak_price - entry_price) / risk_basis
+            drop_from_peak = (peak_price - current_price) / risk_basis
         else:
-            peak_gain = (entry_price - peak_price) / entry_price
-            drop_from_peak = (current_price - peak_price) / entry_price
+            peak_gain = (entry_price - peak_price) / risk_basis
+            drop_from_peak = (current_price - peak_price) / risk_basis
 
         if peak_gain >= config.trailing_stop_activation_pct:
             # Trailing stop is armed — compute distance to trigger.
@@ -234,6 +235,7 @@ class TradingBot:
             paper_mode=config.trading.paper_trading,
             initial_bankroll=config.backtest.initial_bankroll_usd,
             restore_state=True,  # survive restarts: entry_time/prob/telemetry
+            fee_coefficient=config.trading.taker_fee_coefficient,
         )
         self.logger.info("portfolio_initialized", {
             "paper_mode": config.trading.paper_trading,
@@ -466,7 +468,7 @@ class TradingBot:
             trade_signal._question = snapshot.question
             trade_signal._is_live = snapshot.is_live
 
-            trade = self.executor.execute_trade(trade_signal)
+            trade = self.executor.execute_trade(trade_signal, order_book=snapshot.order_book)
             if trade:
                 self.portfolio.open_position(trade_signal, trade)
                 self.risk.record_trade_opened()
@@ -750,7 +752,18 @@ class TradingBot:
             if slug in self._settled_slugs:
                 continue
 
-            live_price = self.market_data.get_live_price(slug)
+            paper_exit_level = None
+            if self.config.trading.paper_trading:
+                from bot.paper import executable_level
+                book = self.market_data.get_us_order_book(slug)
+                paper_exit_level = executable_level(
+                    book, "sell" if position.side == "buy" else "buy")
+                if paper_exit_level is None:
+                    self.logger.warning("paper_exit_no_executable_book", {"slug": slug})
+                    continue
+                live_price = paper_exit_level[0]
+            else:
+                live_price = self.market_data.get_live_price(slug)
 
             if live_price is not None:
                 position.current_price = live_price
@@ -761,7 +774,7 @@ class TradingBot:
                 pnl_per_unit = position.current_price - position.entry_price
             else:
                 pnl_per_unit = position.entry_price - position.current_price
-            pnl_pct = pnl_per_unit / position.entry_price if position.entry_price > 0 else 0
+            pnl_pct = pnl_per_unit / position.risk_per_contract if position.risk_per_contract > 0 else 0
             edge_remaining = abs(position.estimated_prob - position.current_price)
 
             # --- Exit telemetry: update running P&L extremes each cycle ---
@@ -794,13 +807,17 @@ class TradingBot:
 
             # Check risk thresholds (also updates position.peak_price)
             close_reason = self.risk.check_position(
-                position, position.current_price, position.estimated_prob
+                position, position.current_price, position.estimated_prob,
+                allow_quote_resolution=not self.config.trading.paper_trading,
             )
+            if self.config.trading.paper_trading:
+                self.portfolio.persist_position_state(position)
 
             # Persist bot-owned state so peak/extremes/estimated_prob survive
             # scan reconstruction and restarts (audit: state used to reset
             # every cycle, silently disabling min-hold/trailing/take-profit).
-            if telemetry_changed or close_reason == "let_it_ride" or position.peak_price > 0:
+            if (not self.config.trading.paper_trading and
+                    (telemetry_changed or close_reason == "let_it_ride" or position.peak_price > 0)):
                 self.portfolio.persist_position_state(position)
 
             # Let winners ride — don't close, alert instead
@@ -830,6 +847,12 @@ class TradingBot:
                 continue
 
             if close_reason:
+                if paper_exit_level is not None and paper_exit_level[1] < position.quantity:
+                    self.logger.warning("paper_exit_insufficient_depth", {
+                        "slug": slug, "required": position.quantity,
+                        "available": paper_exit_level[1],
+                    })
+                    continue
                 # Submit close order to the exchange
                 closed_on_exchange = self.executor.close_position(position)
                 if closed_on_exchange:
@@ -858,11 +881,11 @@ class TradingBot:
                     try:
                         sl_frac = self.risk.config.stop_loss_threshold
                         if position.side == "buy":
-                            sl_boundary = position.entry_price * (1.0 - sl_frac)
-                            _etd = (position.current_price - sl_boundary) / position.entry_price
+                            sl_boundary = position.entry_price - position.risk_per_contract * sl_frac
+                            _etd = (position.current_price - sl_boundary) / position.risk_per_contract
                         else:
-                            sl_boundary = position.entry_price * (1.0 + sl_frac)
-                            _etd = (sl_boundary - position.current_price) / position.entry_price
+                            sl_boundary = position.entry_price + position.risk_per_contract * sl_frac
+                            _etd = (sl_boundary - position.current_price) / position.risk_per_contract
                         exit_threshold_distance = max(_etd, 0.0)
                     except Exception:
                         exit_threshold_distance = 0.0
@@ -1062,11 +1085,11 @@ class TradingBot:
                 self.health.beat({
                     "cycle": cycle,
                     "mode": mode,
+                    "accounting_version": 2 if self.config.trading.paper_trading else 1,
                     "profile": os.environ.get("POLYBOT_PROFILE", "baseline"),
                     "open_positions": len(_open),
                     "cash": round(self.portfolio.bankroll, 2),
-                    "equity": round(self.portfolio.get_equity() + sum(
-                        getattr(p, "unrealized_pnl", 0.0) or 0.0 for p in _open), 2),
+                    "equity": round(self.portfolio.get_equity(), 2),
                     # Open positions with the last mark from check_positions()
                     # — read by scripts/push_board.py for the live scoreboard.
                     "positions": [{

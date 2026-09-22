@@ -24,12 +24,14 @@ class Portfolio:
 
     def __init__(self, exchange_client=None, logger: Optional[TradingLogger] = None,
                  alerter=None, alert_config=None, paper_mode: bool = True,
-                 initial_bankroll: float = 0.0, restore_state: bool = False):
+                 initial_bankroll: float = 0.0, restore_state: bool = False,
+                 fee_coefficient: float = 0.06):
         self._client = exchange_client
         self.logger = logger
         self.alerter = alerter
         self.alert_config = alert_config
         self.paper_mode = paper_mode
+        self.fee_coefficient = fee_coefficient
 
         # Paper mode fallback — only used when no exchange client
         self._paper_bankroll = initial_bankroll
@@ -56,8 +58,25 @@ class Portfolio:
         # reset entry_time / estimated_prob / peak / telemetry (which would
         # break min-hold, take-profit, trailing stops, and let-it-ride).
         # Opt-in so unit tests stay hermetic; the trading loop passes True.
-        if restore_state:
+        if self.paper_mode:
+            trade_db.init_db()
+        if restore_state and self.paper_mode:
+            saved = trade_db.load_paper_portfolio()
+            if saved is not None:
+                self._paper_bankroll = saved["cash"]
+                self.initial_bankroll = saved["initial_bankroll"]
+                for row in saved["positions"]:
+                    row["entry_time"] = datetime.fromisoformat(row["entry_time"])
+                    self._paper_positions.append(Position(**row))
+                self._bot_positions.update(p.slug for p in self._paper_positions)
+            else:
+                self._persist_paper_state()
+        elif restore_state:
             self._restore_position_state()
+
+    def _persist_paper_state(self, closed_trade=None):
+        trade_db.save_paper_portfolio(self._paper_bankroll, self.initial_bankroll,
+                                     self._paper_positions, closed_trade)
 
     def _restore_position_state(self):
         """Reload persisted bot-owned positions (see trade_db.live_position_state)."""
@@ -118,6 +137,8 @@ class Portfolio:
         counters survive scan reconstruction and restarts. Never fatal.
         """
         try:
+            if self.paper_mode:
+                self._persist_paper_state()
             from bot.trade_db import upsert_position_state
             upsert_position_state(position)
         except Exception as e:
@@ -270,7 +291,12 @@ class Portfolio:
     def get_equity(self) -> float:
         """Total account value: cash + position value, from the exchange."""
         if self.paper_mode or not self._client:
-            return self._paper_bankroll
+            from bot.strategies.fees import booked_fee_usd
+            return self._paper_bankroll + sum(
+                p.size_usd + self._calculate_pnl(p, p.current_price, "mark")
+                - booked_fee_usd(p.quantity, p.current_price, p.fee_coefficient)
+                for p in self._get_paper_positions()
+            )
 
         self._refresh_cache()
         cash = self._balance_cache or 0
@@ -297,6 +323,8 @@ class Portfolio:
 
     def open_position(self, signal: TradeSignal, trade: Trade) -> Position:
         """Record a new position opened by the bot."""
+        if self.paper_mode and trade.size_usd + trade.fees > self._paper_bankroll:
+            raise ValueError("Paper trade exceeds available cash including fees")
         position = Position(
             market_id=signal.market_id,
             token_id=signal.token_id,
@@ -308,18 +336,26 @@ class Portfolio:
             entry_time=trade.timestamp,
             current_price=trade.price,
             slug=signal.slug,
+            entry_fees=trade.fees,
+            fee_coefficient=self.fee_coefficient,
         )
+
+        if self.paper_mode:
+            self._paper_positions.append(position)
+            self._paper_bankroll -= trade.size_usd + trade.fees
+            try:
+                self._persist_paper_state()
+            except Exception:
+                self._paper_positions.remove(position)
+                self._paper_bankroll += trade.size_usd + trade.fees
+                raise
+            self.trades.append(trade)
 
         self._bot_positions.add(signal.slug)
         self.invalidate_cache()
         # Durable from birth: risk logic depends on entry_time/estimated_prob
         # surviving scan reconstruction and restarts.
         self.persist_position_state(position)
-
-        if self.paper_mode:
-            self._paper_positions.append(position)
-            self._paper_bankroll -= trade.fees
-            self.trades.append(trade)
 
         if self.logger:
             self.logger.info("position_opened", {
@@ -358,6 +394,14 @@ class Portfolio:
 
         # Calculate P&L locally as fallback
         calculated_pnl = self._calculate_pnl(position, current_price, reason)
+        exit_fees = 0.0
+        if self.paper_mode:
+            from bot.strategies.fees import booked_fee_usd
+            exit_fees = (0.0 if reason == "resolved" else booked_fee_usd(
+                position.quantity, current_price, position.fee_coefficient))
+            calculated_pnl -= position.entry_fees + exit_fees
+            # A paper ledger can never borrow unrelated real-account P&L.
+            exchange_pnl = None
 
         if exchange_pnl is not None:
             # Exchange P&L is source of truth
@@ -374,22 +418,44 @@ class Portfolio:
         else:
             realized_pnl = calculated_pnl
 
+        prior_position = vars(position).copy()
         position.status = "closed"
         position.close_reason = reason
         position.close_price = current_price
         position.close_time = close_time
         position.realized_pnl = realized_pnl
 
+        if self.paper_mode:
+            # Entry fee was already debited at open; return collateral plus
+            # gross price P&L minus exit fee, while reports show BOTH fees.
+            credit = position.size_usd + realized_pnl + position.entry_fees
+            self._paper_bankroll += credit
+            slug = position.slug or position.market_id
+            try:
+                self._persist_paper_state(closed_trade=dict(
+                    slug=slug, market_id=position.market_id, side=position.side,
+                    entry_price=position.entry_price, close_price=current_price,
+                    quantity=position.quantity, size_usd=position.size_usd,
+                    realized_pnl=realized_pnl, close_reason=reason,
+                    market_type=("spread" if slug.startswith("asc-") else
+                                 "totals" if slug.startswith("tsc-") else "moneyline"),
+                    entry_time=position.entry_time, close_time=close_time,
+                    entry_fees=position.entry_fees, exit_fees=exit_fees,
+                    accounting_version=2,
+                ))
+            except Exception:
+                self._paper_bankroll -= credit
+                vars(position).update(prior_position)
+                raise
+
         # State row is only for OPEN positions — drop it so a future market
         # reusing the slug (or a restart) can't resurrect stale state.
         try:
             from bot.trade_db import delete_position_state
-            delete_position_state(getattr(position, "slug", "") or position.market_id)
+            if not self.paper_mode:
+                delete_position_state(getattr(position, "slug", "") or position.market_id)
         except Exception:
             pass
-
-        if self.paper_mode:
-            self._paper_bankroll += realized_pnl
 
         if self.logger:
             self.logger.info("position_closed", {
@@ -423,20 +489,21 @@ class Portfolio:
                 market_type = "totals"
             else:
                 market_type = "moneyline"
-            trade_db.insert_trade(
-                slug=slug,
-                market_id=position.market_id,
-                side=position.side,
-                entry_price=position.entry_price,
-                close_price=current_price,
-                quantity=position.quantity,
-                size_usd=position.size_usd,
-                realized_pnl=realized_pnl,
-                close_reason=reason,
-                market_type=market_type,
-                entry_time=position.entry_time,
-                close_time=close_time,
-            )
+            if not self.paper_mode:
+                trade_db.insert_trade(
+                    slug=slug,
+                    market_id=position.market_id,
+                    side=position.side,
+                    entry_price=position.entry_price,
+                    close_price=current_price,
+                    quantity=position.quantity,
+                    size_usd=position.size_usd,
+                    realized_pnl=realized_pnl,
+                    close_reason=reason,
+                    market_type=market_type,
+                    entry_time=position.entry_time,
+                    close_time=close_time,
+                )
         except Exception:
             pass
 
