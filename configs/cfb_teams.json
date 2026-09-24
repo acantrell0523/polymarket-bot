@@ -83,6 +83,12 @@
   "espn_abbr": "ariz",
   "location": "Arizona"
  },
+ "arzst": {
+  "display": "Arizona State Sun Devils",
+  "display_abbr": "asu",
+  "espn_abbr": "asu",
+  "location": "Arizona State"
+ },
  "aubrn": {
   "display": "Auburn Tigers",
   "display_abbr": "aub",
@@ -160,6 +166,12 @@
   "display_abbr": "but",
   "espn_abbr": "btlr",
   "location": "Butler"
+ },
+ "byu": {
+  "display": "BYU Cougars",
+  "display_abbr": "byu",
+  "espn_abbr": "byu",
+  "location": "BYU"
  },
  "cah": {
   "display": "California Golden Bears",
@@ -587,6 +599,12 @@
   "espn_abbr": "jmu",
   "location": "James Madison"
  },
+ "kan": {
+  "display": "Kansas Jayhawks",
+  "display_abbr": "ku",
+  "espn_abbr": "ku",
+  "location": "Kansas"
+ },
  "kanst": {
   "display": "Kansas State Wildcats",
   "display_abbr": "ksu",
@@ -652,6 +670,12 @@
   "display_abbr": "ull",
   "espn_abbr": "ul",
   "location": "Louisiana"
+ },
+ "loutch": {
+  "display": "Louisiana Tech Bulldogs",
+  "display_abbr": "lt",
+  "espn_abbr": "lt",
+  "location": "Louisiana Tech"
  },
  "lsu": {
   "display": "LSU Tigers",
@@ -760,6 +784,12 @@
   "display_abbr": "morg",
   "espn_abbr": "morg",
   "location": "Morgan State"
+ },
+ "mphs": {
+  "display": "Memphis Tigers",
+  "display_abbr": "mem",
+  "espn_abbr": "mem",
+  "location": "Memphis"
  },
  "mrcy": {
   "display": "Mercyhurst Lakers",
