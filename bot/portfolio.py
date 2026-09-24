@@ -74,9 +74,9 @@ class Portfolio:
         elif restore_state:
             self._restore_position_state()
 
-    def _persist_paper_state(self, closed_trade=None):
+    def _persist_paper_state(self, closed_trade=None, delete_state=True):
         trade_db.save_paper_portfolio(self._paper_bankroll, self.initial_bankroll,
-                                     self._paper_positions, closed_trade)
+                                     self._paper_positions, closed_trade, delete_state)
 
     def _restore_position_state(self):
         """Reload persisted bot-owned positions (see trade_db.live_position_state)."""
@@ -380,12 +380,74 @@ class Portfolio:
 
         return position
 
+    def close_partial(self, position: Position, quantity: float, price: float,
+                      reason: str, exit_fees: float,
+                      timestamp: Optional[datetime] = None) -> float:
+        """Paper only: close `quantity` contracts at `price`, keep the rest open.
+
+        Used when a simulated sweep finds less visible depth than the
+        position holds. The closed slice gets its own trade row (reason
+        "<reason>_partial") with a pro-rated entry fee plus the sweep's exit
+        fee; collateral, size and entry fees of the remainder shrink in
+        proportion. Cash, the open remainder and the trade row commit in one
+        transaction. Returns the slice's net realized P&L.
+        """
+        if not self.paper_mode or position.status != "open" or quantity <= 0:
+            return 0.0
+        if quantity >= position.quantity - 1e-9:
+            return self.close_position(position, price, reason, timestamp=timestamp,
+                                       exit_fees=exit_fees)
+        close_time = timestamp or datetime.now(timezone.utc)
+        fraction = quantity / position.quantity
+        collateral = position.risk_per_contract * quantity
+        entry_fee_part = round(position.entry_fees * fraction, 2)
+        per_contract = (price - position.entry_price) if position.side == "buy" \
+            else (position.entry_price - price)
+        gross = per_contract * quantity
+        realized = gross - entry_fee_part - exit_fees
+        prior = vars(position).copy()
+        position.quantity -= quantity
+        position.size_usd -= collateral
+        position.entry_fees = round(position.entry_fees - entry_fee_part, 2)
+        credit = collateral + gross - exit_fees   # entry fee was debited at open
+        self._paper_bankroll += credit
+        slug = position.slug or position.market_id
+        try:
+            self._persist_paper_state(closed_trade=dict(
+                slug=slug, market_id=position.market_id, side=position.side,
+                entry_price=position.entry_price, close_price=price,
+                quantity=quantity, size_usd=collateral,
+                realized_pnl=realized, close_reason=f"{reason}_partial",
+                market_type=("spread" if slug.startswith("asc-") else
+                             "totals" if slug.startswith("tsc-") else "moneyline"),
+                entry_time=position.entry_time, close_time=close_time,
+                entry_fees=entry_fee_part, exit_fees=exit_fees,
+                accounting_version=2,
+            ), delete_state=False)
+        except Exception:
+            self._paper_bankroll -= credit
+            vars(position).update(prior)
+            raise
+        self.invalidate_cache()
+        if self.logger:
+            self.logger.info("position_partially_closed", {
+                "slug": slug, "reason": reason, "closed_qty": round(quantity, 2),
+                "remaining_qty": round(position.quantity, 2), "price": round(price, 4),
+                "pnl": round(realized, 2), "bankroll": round(self.bankroll, 2),
+            })
+        return realized
+
     def close_position(self, position: Position, current_price: float,
                        reason: str, timestamp: Optional[datetime] = None,
                        exchange_pnl: Optional[float] = None,
                        exit_threshold_distance: float = 0.0,
-                       exit_proximity: Optional[dict] = None) -> float:
-        """Record a position close. P&L comes from the exchange when available."""
+                       exit_proximity: Optional[dict] = None,
+                       exit_fees: Optional[float] = None) -> float:
+        """Record a position close. P&L comes from the exchange when available.
+
+        Paper mode: `exit_fees` is the fee actually booked by the simulated
+        sweep (summed per level); when omitted it is computed at current_price.
+        Settlement ("resolved") never pays an exit fee."""
         if position.status != "open":
             return 0.0
 
@@ -394,11 +456,16 @@ class Portfolio:
 
         # Calculate P&L locally as fallback
         calculated_pnl = self._calculate_pnl(position, current_price, reason)
+        provided_exit_fees = exit_fees
         exit_fees = 0.0
         if self.paper_mode:
             from bot.strategies.fees import booked_fee_usd
-            exit_fees = (0.0 if reason == "resolved" else booked_fee_usd(
-                position.quantity, current_price, position.fee_coefficient))
+            if reason == "resolved":
+                exit_fees = 0.0
+            elif provided_exit_fees is not None:
+                exit_fees = float(provided_exit_fees)
+            else:
+                exit_fees = booked_fee_usd(position.quantity, current_price, position.fee_coefficient)
             calculated_pnl -= position.entry_fees + exit_fees
             # A paper ledger can never borrow unrelated real-account P&L.
             exchange_pnl = None

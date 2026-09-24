@@ -181,9 +181,142 @@ def test_actual_loop_closes_at_bid_and_books_fees():
     assert pos.realized_pnl < (.35-.52)*pos.quantity
 
 
-@pytest.mark.parametrize('exit_book', [OrderBook(), book(.35,.39,depth=1)])
-def test_actual_loop_cannot_close_without_executable_depth(exit_book):
-    bot, pos = bot_with_position(exit_book)
+def test_actual_loop_cannot_close_without_a_book():
+    bot, pos = bot_with_position(OrderBook())
     bot.check_positions()
     assert pos.status == 'open'
     assert trade_db.get_recent_trades() == []
+
+
+def test_thin_book_closes_the_visible_slice_and_keeps_the_rest():
+    bot, pos = bot_with_position(book(.35, .39, depth=1))
+    qty = pos.quantity
+    bot.check_positions()
+    assert pos.status == 'open' and pos.quantity == pytest.approx(qty - 1)
+    rows = trade_db.get_recent_trades()
+    assert len(rows) == 1 and rows[0]['quantity'] == pytest.approx(1)
+    assert rows[0]['close_reason'] == 'stop_loss_partial'
+
+
+# ── Additions on top of the Codex patch (2026-09-23) ──────────────────────
+
+from bot.paper import sweep
+
+
+def ladder(bids, asks):
+    return OrderBook([OrderBookLevel(p, q) for p, q in bids],
+                     [OrderBookLevel(p, q) for p, q in asks])
+
+
+def test_sweep_walks_levels_with_per_level_fees():
+    from bot.strategies.fees import booked_fee_usd
+    b = ladder([(.40, 30), (.39, 50), (.35, 500)], [(.42, 10)])
+    fill = sweep(b, 'sell', 100)
+    assert fill['filled'] == pytest.approx(100) and fill['levels'] == 3
+    assert fill['vwap'] == pytest.approx((.40*30 + .39*50 + .35*20) / 100)
+    assert fill['fees'] == pytest.approx(round(booked_fee_usd(30, .40) + booked_fee_usd(50, .39)
+                                               + booked_fee_usd(20, .35), 2))
+    short_cover = sweep(b, 'buy', 25)
+    assert short_cover['filled'] == pytest.approx(10) and short_cover['vwap'] == pytest.approx(.42)
+    assert sweep(ladder([(.6, 5)], [(.5, 5)]), 'sell', 1) is None   # crossed book
+
+
+def test_loop_exit_uses_book_depth_beyond_top_level():
+    exit_book = ladder([(.35, 40), (.34, 100)], [(.39, 100)])
+    bot, pos = bot_with_position(exit_book)
+    qty = pos.quantity
+    bot.check_positions()
+    assert pos.status == 'closed'
+    assert pos.close_price == pytest.approx((.35*40 + .34*(qty-40)) / qty)
+    row = trade_db.get_recent_trades()[0]
+    assert row['close_reason'] == 'stop_loss' and row['exit_fees'] > 0
+
+
+def test_partial_close_cash_and_restart_consistency():
+    p, pos, trade = opened()
+    start_cash = p.bankroll
+    qty = pos.quantity
+    pnl = p.close_partial(pos, 40, .45, 'stop_loss', exit_fees=0.74)
+    frac = 40 / qty
+    entry_part = round(trade.fees * frac, 2)
+    assert pnl == pytest.approx((.45 - .52) * 40 - entry_part - 0.74)
+    assert p.bankroll == pytest.approx(start_cash + .52 * 40 + (.45 - .52) * 40 - 0.74)
+    assert pos.quantity == qty - 40 and pos.size_usd == pytest.approx(.52 * (qty - 40))
+    restarted = Portfolio(initial_bankroll=1000, restore_state=True)
+    assert restarted.bankroll == pytest.approx(p.bankroll)
+    again = restarted.get_open_positions()[0]
+    assert again.quantity == qty - 40 and again.entry_fees == pytest.approx(pos.entry_fees)
+    final = restarted.close_position(again, .60, 'take_profit')
+    rows = trade_db.get_recent_trades()
+    assert {r['close_reason'] for r in rows} == {'stop_loss_partial', 'take_profit'}
+    total_net = sum(r['realized_pnl'] for r in rows)
+    assert restarted.bankroll == pytest.approx(1000 + total_net)
+
+
+class FakeResolutions:
+    def __init__(self, values):
+        self.values = values
+        self.calls = []
+
+    def __call__(self, slugs):
+        self.calls.append(list(slugs))
+        return {s: v for s, v in self.values.items() if s in slugs}
+
+
+@pytest.mark.parametrize('side,settle,won', [('buy', 1.0, True), ('buy', 0.0, False), ('sell', 0.0, True)])
+def test_finished_game_settles_at_exchange_result_without_exit_fee(side, settle, won):
+    if side == 'buy':
+        bot, pos = bot_with_position(book(.99, .995))
+    else:
+        p, pos, _ = opened('sell', .80, 20, .80, .82)
+        bot, _ = bot_with_position(book(.004, .006))
+        bot.portfolio = p
+    slug = pos.slug
+    bot.market_data.active_slugs = set()          # gone from a complete active list
+    bot.market_data.active_slugs_complete = True
+    bot.market_data.get_market_resolutions = FakeResolutions({slug: settle})
+    bot.check_positions()
+    assert pos.status == 'closed' and pos.close_reason == 'resolved'
+    row = trade_db.get_recent_trades()[0]
+    assert row['exit_fees'] == 0 and row['close_price'] == settle
+    assert (row['realized_pnl'] > 0) == won
+
+
+def test_settlement_is_not_polled_for_fresh_normal_positions():
+    bot, pos = bot_with_position(book(.50, .52))
+    bot.market_data.active_slugs = {pos.slug}
+    bot.market_data.active_slugs_complete = True
+    fake = FakeResolutions({})
+    bot.market_data.get_market_resolutions = fake
+    bot.check_positions()
+    assert fake.calls == []
+    # once the book disappears the next cycle asks, but at most once a minute
+    bot.market_data.get_us_order_book.return_value = OrderBook()
+    bot.check_positions(); bot.check_positions(); bot.check_positions()
+    assert fake.calls == [[pos.slug]]
+
+
+def test_market_resolution_lookup_parses_settlement_and_fallback():
+    from bot.market_data import MarketDataClient
+    from utils.config import load_config
+    cfg = load_config()
+    md = MarketDataClient(cfg.api, None, cfg.filters)
+    listing = {"markets": [
+        {"slug": "aec-nfl-a-b-2026-09-20", "status": "MARKET_STATUS_RESOLVED", "outcomePrices": '["1","0"]'},
+        {"slug": "tsc-nfl-a-b-2026-09-20-total-40pt5", "status": "MARKET_STATUS_RESOLVED", "outcomePrices": '["0","1"]'},
+        {"slug": "aec-nfl-c-d-2026-09-27", "status": "MARKET_STATUS_OPEN", "outcomePrices": '["0.4","0.6"]'},
+    ]}
+    calls = []
+    def fake_get(url, params=None):
+        calls.append((url, params))
+        if url.endswith("/v1/markets"):
+            return listing
+        if "aec-nfl-a-b" in url:
+            return {"slug": "aec-nfl-a-b-2026-09-20", "settlement": 1}
+        return None   # settlement endpoint down → fall back to outcomePrices
+    md._get = fake_get
+    out = md.get_market_resolutions(["aec-nfl-a-b-2026-09-20", "tsc-nfl-a-b-2026-09-20-total-40pt5",
+                                     "aec-nfl-c-d-2026-09-27"])
+    assert out == {"aec-nfl-a-b-2026-09-20": 1.0, "tsc-nfl-a-b-2026-09-20-total-40pt5": 0.0}
+    assert calls[0][1]["slug"] == ["aec-nfl-a-b-2026-09-20", "tsc-nfl-a-b-2026-09-20-total-40pt5",
+                                   "aec-nfl-c-d-2026-09-27"]

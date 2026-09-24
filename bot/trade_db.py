@@ -292,8 +292,11 @@ def load_paper_portfolio():
         conn.close()
 
 
-def save_paper_portfolio(cash, initial_bankroll, positions, closed_trade=None):
-    """Commit cash, open positions and a close record in one SQLite transaction."""
+def save_paper_portfolio(cash, initial_bankroll, positions, closed_trade=None, delete_state=True):
+    """Commit cash, open positions and a close record in one SQLite transaction.
+
+    delete_state=False keeps the slug's live_position_state row (partial exit:
+    the rest of the position is still open)."""
     state = {"accounting_version": 2, "cash": cash, "initial_bankroll": initial_bankroll,
              "positions": [asdict(p) for p in positions if p.status == "open"]}
     payload = json.dumps(state, default=lambda value: value.isoformat(), allow_nan=False)
@@ -304,8 +307,9 @@ def save_paper_portfolio(cash, initial_bankroll, positions, closed_trade=None):
                          (payload,))
             if closed_trade:
                 insert_trade(**closed_trade, _conn=conn)
-                conn.execute("DELETE FROM live_position_state WHERE slug=?",
-                             (closed_trade["slug"],))
+                if delete_state:
+                    conn.execute("DELETE FROM live_position_state WHERE slug=?",
+                                 (closed_trade["slug"],))
     finally:
         conn.close()
 

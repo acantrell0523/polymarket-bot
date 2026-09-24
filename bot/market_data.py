@@ -59,6 +59,11 @@ class MarketDataClient:
         self.shared_list_ttl = 90.0
         self.shared_book_ttl = 8.0
         self.book_feed = None   # attached by the trading loop when the websocket feed is on
+        # Every slug in the latest raw active-market list, and whether that
+        # list is complete (not truncated by a cap). A held market missing
+        # from a complete list has closed, which triggers a settlement check.
+        self.active_slugs: set = set()
+        self.active_slugs_complete = False
 
         self.session = requests.Session()
         retries = Retry(
@@ -129,7 +134,7 @@ class MarketDataClient:
             pass
 
     def _get(self, url: str, params: Optional[Dict] = None) -> Optional[Any]:
-        if "/book" in url or "/bbo" in url:
+        if "/book" in url or "/bbo" in url or "/settlement" in url:
             self._book_rate_limit()
         else:
             self._rate_limit()
@@ -216,6 +221,8 @@ class MarketDataClient:
 
         if not cached and markets:
             self._shared_write("markets_list.json", markets)
+        self.active_slugs = {m.get("slug") for m in markets if m.get("slug")}
+        self.active_slugs_complete = bool(markets) and len(markets) < max_markets
         if offset >= max_markets and not cached:
             if self.logger:
                 self.logger.warning("market_pagination_cap_reached", {
@@ -363,6 +370,51 @@ class MarketDataClient:
             return dt
         except (ValueError, TypeError):
             return None
+
+    def get_market_resolutions(self, slugs: List[str]) -> Dict[str, float]:
+        """Settlement values for any of `slugs` whose market has RESOLVED.
+
+        One /v1/markets call per 50 slugs (the list endpoint accepts repeated
+        `slug` params and returns closed markets too). The value is what token
+        0 (the long side: away team / away spread / Over) paid: 1.0 or 0.0.
+        Source of truth is /v1/markets/{slug}/settlement; outcomePrices[0] of
+        the resolved market is the fallback (outcomePrices follow marketSides,
+        long side first, and read "1"/"0" once resolved — verified 2026-09-23).
+        Unresolved or unknown markets are simply absent from the result.
+        """
+        out: Dict[str, float] = {}
+        wanted = [s for s in dict.fromkeys(slugs) if s]
+        for i in range(0, len(wanted), 50):
+            chunk = wanted[i:i + 50]
+            data = self._get(f"{self.us_api_url}/v1/markets", {"slug": chunk, "limit": len(chunk)})
+            markets = data.get("markets", []) if isinstance(data, dict) else (data or [])
+            for m in markets:
+                slug = m.get("slug")
+                if slug not in chunk or m.get("status") != "MARKET_STATUS_RESOLVED":
+                    continue
+                value = self._settlement_value(slug, m)
+                if value is not None:
+                    out[slug] = value
+        return out
+
+    def _settlement_value(self, slug: str, market: Dict) -> Optional[float]:
+        data = self._get(f"{self.us_api_url}/v1/markets/{slug}/settlement")
+        if isinstance(data, dict) and data.get("settlement") is not None:
+            try:
+                value = float(data["settlement"])
+                if 0.0 <= value <= 1.0:
+                    return value
+            except (TypeError, ValueError):
+                pass
+        raw = market.get("outcomePrices")
+        try:
+            if isinstance(raw, str):
+                import json as _json
+                raw = _json.loads(raw)
+            value = float(raw[0])
+        except Exception:
+            return None
+        return value if value in (0.0, 1.0) else None
 
     def get_live_price(self, slug: str) -> Optional[float]:
         """Fetch current price for a market via the BBO endpoint."""

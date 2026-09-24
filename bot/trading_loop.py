@@ -743,6 +743,23 @@ class TradingBot:
 
         open_positions = self.portfolio.get_open_positions()
         log_diagnostics = (cycle % 10 == 0) and cycle > 0 and open_positions
+        paper = self.config.trading.paper_trading
+
+        # Paper settlement. A finished game's market resolves on the exchange,
+        # but its last quotes sit at 0.5c / 99.5c, so quote-based resolution
+        # never fired and held positions stayed open for days (17 on
+        # 2026-09-23). Ask the exchange directly, batched, for positions that
+        # look finished (market gone from the active list, no usable book,
+        # price pinned near 0 or 1) or that have been held 2h+.
+        resolutions: Dict[str, float] = {}
+        if paper and open_positions:
+            due = [p.slug or p.market_id for p in open_positions if self._settlement_due(p)]
+            if due:
+                try:
+                    found = self.market_data.get_market_resolutions(due)
+                    resolutions = found if isinstance(found, dict) else {}
+                except Exception as e:
+                    self.logger.warning("settlement_check_failed", {"error": str(e)[:200]})
 
         for position in open_positions:
             # Fetch live price from the exchange
@@ -752,16 +769,24 @@ class TradingBot:
             if slug in self._settled_slugs:
                 continue
 
+            if paper and slug in resolutions:
+                self._close_paper_resolved(position, slug, resolutions[slug])
+                continue
+
             paper_exit_level = None
-            if self.config.trading.paper_trading:
+            paper_book = None
+            if paper:
                 from bot.paper import executable_level
-                book = self.market_data.get_us_order_book(slug)
+                paper_book = self.market_data.get_us_order_book(slug)
                 paper_exit_level = executable_level(
-                    book, "sell" if position.side == "buy" else "buy")
+                    paper_book, "sell" if position.side == "buy" else "buy")
                 if paper_exit_level is None:
+                    self._settle_suspects().add(slug)
                     self.logger.warning("paper_exit_no_executable_book", {"slug": slug})
                     continue
                 live_price = paper_exit_level[0]
+                if live_price <= 0.02 or live_price >= 0.98:
+                    self._settle_suspects().add(slug)
             else:
                 live_price = self.market_data.get_live_price(slug)
 
@@ -847,12 +872,30 @@ class TradingBot:
                 continue
 
             if close_reason:
-                if paper_exit_level is not None and paper_exit_level[1] < position.quantity:
-                    self.logger.warning("paper_exit_insufficient_depth", {
-                        "slug": slug, "required": position.quantity,
-                        "available": paper_exit_level[1],
-                    })
-                    continue
+                paper_fill = None
+                if paper:
+                    # Walk the visible book like the live sweeping IOC close.
+                    # Short of depth → close what is visible, keep the rest.
+                    from bot.paper import sweep
+                    exit_side = "sell" if position.side == "buy" else "buy"
+                    paper_fill = sweep(paper_book, exit_side, position.quantity,
+                                       position.fee_coefficient)
+                    if paper_fill is None:
+                        self.logger.warning("paper_exit_no_executable_book", {"slug": slug})
+                        continue
+                    if position.quantity - paper_fill["filled"] >= 1.0:
+                        part_pnl = self.portfolio.close_partial(
+                            position, paper_fill["filled"], paper_fill["vwap"],
+                            close_reason, paper_fill["fees"])
+                        self.risk.record_pnl(part_pnl)
+                        self._enforce_daily_loss_pause()
+                        self.logger.warning("paper_exit_partial", {
+                            "slug": slug, "reason": close_reason,
+                            "filled": round(paper_fill["filled"], 2),
+                            "remaining": round(position.quantity, 2),
+                            "vwap": round(paper_fill["vwap"], 4),
+                        })
+                        continue
                 # Submit close order to the exchange
                 closed_on_exchange = self.executor.close_position(position)
                 if closed_on_exchange:
@@ -904,10 +947,13 @@ class TradingBot:
                         exit_proximity = {}
 
                     self.portfolio.close_position(
-                        position, position.current_price, close_reason,
+                        position,
+                        paper_fill["vwap"] if paper_fill else position.current_price,
+                        close_reason,
                         exchange_pnl=exchange_pnl,
                         exit_threshold_distance=exit_threshold_distance,
                         exit_proximity=exit_proximity,
+                        exit_fees=paper_fill["fees"] if paper_fill else None,
                     )
                     self.risk.record_pnl(position.realized_pnl)
                     # Durable halt if this loss pushed us past the daily limit
@@ -917,7 +963,7 @@ class TradingBot:
                         "reason": close_reason,
                         "side": position.side,
                         "entry": position.entry_price,
-                        "exit": position.current_price,
+                        "exit": position.close_price or position.current_price,
                         "pnl": round(position.realized_pnl, 2),
                         "exchange_pnl": round(exchange_pnl, 2) if exchange_pnl is not None else None,
                     })
@@ -934,6 +980,58 @@ class TradingBot:
 
         if has_live_games:
             self.risk.config.take_profit_threshold = original_tp
+
+    # ── Paper settlement helpers ──────────────────────────────────────────
+
+    def _settle_suspects(self) -> set:
+        """Slugs whose last cycle showed a finished-game symptom."""
+        if not hasattr(self, "_settle_suspect_set"):
+            self._settle_suspect_set = set()
+        return self._settle_suspect_set
+
+    def _settlement_due(self, position) -> bool:
+        """Should this cycle ask the exchange whether the market resolved?
+
+        Every 60s while the market looks finished (missing from a complete
+        active list, no usable book, price pinned within 2c of 0 or 1);
+        every 15 min for any position held 2h+ as a backstop; never for a
+        fresh, normally priced position. One batched call covers them all.
+        """
+        slug = position.slug or position.market_id
+        checked = getattr(self, "_settle_checked", None)
+        if checked is None:
+            checked = self._settle_checked = {}
+        active = getattr(self.market_data, "active_slugs", None)
+        complete = getattr(self.market_data, "active_slugs_complete", False) is True
+        price = position.current_price or 0.0
+        suspicious = (slug in self._settle_suspects()
+                      or (complete and isinstance(active, set) and slug not in active)
+                      or price <= 0.02 or price >= 0.98)
+        age_h = 0.0
+        entry = position.entry_time
+        if entry is not None:
+            if entry.tzinfo is None:
+                entry = entry.replace(tzinfo=timezone.utc)
+            age_h = (datetime.now(timezone.utc) - entry).total_seconds() / 3600
+        interval = 60 if suspicious else (900 if age_h >= 2.0 else None)
+        now = time.time()
+        if interval is None or now - checked.get(slug, 0.0) < interval:
+            return False
+        checked[slug] = now
+        return True
+
+    def _close_paper_resolved(self, position, slug: str, value: float):
+        """Book a paper position at its settlement value (no exit fee)."""
+        position.current_price = value
+        self.portfolio.close_position(position, value, "resolved")
+        self.risk.record_pnl(position.realized_pnl)
+        self._enforce_daily_loss_pause()
+        self._settle_suspects().discard(slug)
+        self.logger.info("position_exit_complete", {
+            "slug": slug, "reason": "resolved", "side": position.side,
+            "entry": position.entry_price, "exit": value,
+            "pnl": round(position.realized_pnl, 2), "exchange_pnl": None,
+        })
 
     def _do_full_scan(self) -> List[Dict]:
         """Full market scan — fetches all markets, processes everything.
@@ -1086,6 +1184,7 @@ class TradingBot:
                     "cycle": cycle,
                     "mode": mode,
                     "accounting_version": 2 if self.config.trading.paper_trading else 1,
+                    "initial_bankroll": round(float(getattr(self.portfolio, "initial_bankroll", 0.0) or 0.0), 2),
                     "profile": os.environ.get("POLYBOT_PROFILE", "baseline"),
                     "open_positions": len(_open),
                     "cash": round(self.portfolio.bankroll, 2),
