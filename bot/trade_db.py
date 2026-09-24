@@ -2,6 +2,8 @@
 
 import sqlite3
 import os
+import json
+from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
@@ -135,7 +137,19 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_decision_log_ts ON decision_log(timestamp);
         CREATE INDEX IF NOT EXISTS idx_decision_log_slug ON decision_log(slug);
         CREATE INDEX IF NOT EXISTS idx_decision_log_decision ON decision_log(decision);
+
+        CREATE TABLE IF NOT EXISTS paper_portfolio (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            state_json TEXT NOT NULL
+        );
     """)
+    # Preserve old rows explicitly as legacy, gross-P&L observations.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
+    for name, declaration in (("entry_fees", "REAL DEFAULT 0"),
+                              ("exit_fees", "REAL DEFAULT 0"),
+                              ("accounting_version", "INTEGER DEFAULT 1")):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE trades ADD COLUMN {name} {declaration}")
     conn.commit()
     conn.close()
 
@@ -241,19 +255,63 @@ def insert_trade(
     close_price: float, quantity: float, size_usd: float,
     realized_pnl: float, close_reason: str, market_type: str,
     entry_time: datetime, close_time: datetime,
+    entry_fees: float = 0.0, exit_fees: float = 0.0,
+    accounting_version: int = 1, _conn=None,
 ):
-    conn = _get_conn()
+    conn = _conn if _conn is not None else _get_conn()
     conn.execute(
         """INSERT INTO trades
            (slug, market_id, side, entry_price, close_price, quantity, size_usd,
-            realized_pnl, close_reason, market_type, entry_time, close_time)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            realized_pnl, close_reason, market_type, entry_time, close_time,
+            entry_fees, exit_fees, accounting_version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (slug, market_id, side, entry_price, close_price, quantity, size_usd,
          realized_pnl, close_reason, market_type, entry_time.isoformat(),
-         close_time.isoformat()),
+         close_time.isoformat(), entry_fees, exit_fees, accounting_version),
     )
-    conn.commit()
-    conn.close()
+    if _conn is None:
+        conn.commit()
+        conn.close()
+
+
+def load_paper_portfolio():
+    """Load the authoritative paper ledger. Never reset a legacy account."""
+    conn = _get_conn()
+    try:
+        row = conn.execute("SELECT state_json FROM paper_portfolio WHERE id=1").fetchone()
+        if row:
+            return json.loads(row[0])
+        legacy = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        legacy += conn.execute("SELECT COUNT(*) FROM live_position_state").fetchone()[0]
+        if legacy:
+            raise ValueError("Legacy paper history has no reliable cash ledger. Preserve this "
+                             "database and use a fresh checkout/database for forward validation; "
+                             "do not mix legacy results with accounting version 2.")
+        return None
+    finally:
+        conn.close()
+
+
+def save_paper_portfolio(cash, initial_bankroll, positions, closed_trade=None, delete_state=True):
+    """Commit cash, open positions and a close record in one SQLite transaction.
+
+    delete_state=False keeps the slug's live_position_state row (partial exit:
+    the rest of the position is still open)."""
+    state = {"accounting_version": 2, "cash": cash, "initial_bankroll": initial_bankroll,
+             "positions": [asdict(p) for p in positions if p.status == "open"]}
+    payload = json.dumps(state, default=lambda value: value.isoformat(), allow_nan=False)
+    conn = _get_conn()
+    try:
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO paper_portfolio(id,state_json) VALUES(1,?)",
+                         (payload,))
+            if closed_trade:
+                insert_trade(**closed_trade, _conn=conn)
+                if delete_state:
+                    conn.execute("DELETE FROM live_position_state WHERE slug=?",
+                                 (closed_trade["slug"],))
+    finally:
+        conn.close()
 
 
 def get_trades_since(since: datetime) -> List[Dict[str, Any]]:

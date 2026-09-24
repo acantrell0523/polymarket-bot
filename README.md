@@ -66,6 +66,12 @@ from today: game prices plus de-vigged sportsbook consensus per game.
   (up to 5 min) with a single alert per outage, instead of hammering a dead API.
 - **Paper mode** — full pipeline with simulated fills; no credentials needed.
 
+Paper results use the [v2 validation ledger](docs/paper-validation.md): executable
+book prices, visible depth, collateral, both fees, and restart-safe cash.
+Existing paper databases lack that ledger and are intentionally rejected on
+startup. Preserve them for read-only analysis and use an empty database for a
+new forward evaluation. Paper execution still cannot establish live profit.
+
 ## Setup
 
 ```bash
@@ -104,6 +110,7 @@ python -m backtest.runner --sweep    # parameter sensitivity sweep
 # Post-hoc analysis
 python scripts/analyze_exits.py --days 30
 python scripts/inspect_historical.py
+python scripts/audit_paper.py --profile baseline=/path/to/trades.db
 ```
 
 ### Configuration

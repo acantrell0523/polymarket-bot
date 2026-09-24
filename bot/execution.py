@@ -47,7 +47,8 @@ class ExecutionEngine:
                         "message": "POLYMARKET_KEY_ID and POLYMARKET_SECRET_KEY required for live trading"
                     })
 
-    def execute_trade(self, signal: TradeSignal, trade_type: str = "entry") -> Optional[Trade]:
+    def execute_trade(self, signal: TradeSignal, trade_type: str = "entry",
+                      order_book=None) -> Optional[Trade]:
         """
         Execute a trade based on a signal.
 
@@ -55,24 +56,40 @@ class ExecutionEngine:
         In live mode, submits an order via Polymarket US SDK.
         """
         if self.config.paper_trading:
-            return self._paper_execute(signal, trade_type)
+            return self._paper_execute(signal, trade_type, order_book)
         else:
             return self._live_execute(signal, trade_type)
 
-    def _paper_execute(self, signal: TradeSignal, trade_type: str) -> Trade:
-        """Simulate trade execution."""
-        price = signal.market_price
+    def _paper_execute(self, signal: TradeSignal, trade_type: str, order_book=None) -> Optional[Trade]:
+        """Simulate an IOC at the executable limit, capped by visible depth.
+
+        The budget is collateral INCLUDING the entry fee. For a short the
+        collateral is (1 - price), not the proceeds (price). Never invent a
+        midpoint fill or liquidity when a book is unavailable.
+        """
+        from bot.paper import executable_level
+        level = executable_level(order_book, signal.side)
+        price = signal.exec_price
         size_usd = signal.position_size_usd
-
-        if size_usd <= 0:
-            size_usd = self.config.min_position_size_usd
-
-        quantity = size_usd / price if price > 0 else 0
+        if level is None or price <= 0 or size_usd <= 0:
+            return None
+        book_price, depth = level
+        if ((signal.side == "buy" and book_price > price)
+                or (signal.side == "sell" and book_price < price)):
+            return None
+        price = book_price
 
         # Simulate fees on the US quadratic schedule, banker's-rounded like
         # the exchange books them (single source: bot/strategies/fees.py)
-        from bot.strategies.fees import booked_fee_usd
+        from bot.strategies.fees import booked_fee_usd, fee_per_contract
         coef = getattr(self.config, "taker_fee_coefficient", 0.06)
+        collateral = price if signal.side == "buy" else 1.0 - price
+        quantity = min(int(size_usd / (collateral + fee_per_contract(price, coef))), int(depth))
+        while quantity > 0 and quantity * collateral + booked_fee_usd(quantity, price, coef) > size_usd:
+            quantity -= 1
+        if quantity <= 0:
+            return None
+        size_usd = quantity * collateral
         fees = booked_fee_usd(quantity, price, coef)
 
         trade = Trade(

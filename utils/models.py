@@ -114,6 +114,13 @@ class Position:
     max_favorable_pnl_usd: float = 0.0   # highest positive unrealized P&L seen ($)
     max_adverse_pnl_usd: float = 0.0     # most negative unrealized P&L seen ($, e.g. -6.20)
     let_it_ride_count: int = 0           # number of cycles let_it_ride was triggered
+    entry_fees: float = 0.0
+    fee_coefficient: float = 0.06
+
+    @property
+    def risk_per_contract(self):
+        """Capital at risk per contract, including short collateral."""
+        return self.size_usd / self.quantity if self.quantity > 0 else self.entry_price
 
 
 @dataclass

@@ -48,7 +48,13 @@ class Supervisor:
             webhook_url=self.config.alerts.slack_webhook_url,
             enabled=self.config.alerts.enabled,
         )
-        self._starting_value = self._get_account_value() or self.config.backtest.initial_bankroll_usd
+        if self.config.trading.paper_trading:
+            trade_db.init_db()
+            saved = trade_db.load_paper_portfolio()
+            self._starting_value = (saved["initial_bankroll"] if saved else
+                                    self.config.backtest.initial_bankroll_usd)
+        else:
+            self._starting_value = self._get_account_value() or self.config.backtest.initial_bankroll_usd
 
         self.logger.info("supervisor_initialized", {
             "starting_value": self._starting_value,
@@ -60,6 +66,8 @@ class Supervisor:
     # ------------------------------------------------------------------
 
     def _get_client(self):
+        if self.config.trading.paper_trading:
+            return None
         try:
             from polymarket_us import PolymarketUS
             return PolymarketUS(
@@ -71,6 +79,8 @@ class Supervisor:
             return None
 
     def _get_account_value(self) -> Optional[float]:
+        if self.config.trading.paper_trading:
+            return self._paper_heartbeat().get("equity")
         client = self._get_client()
         if not client:
             return None
@@ -90,6 +100,8 @@ class Supervisor:
             return None
 
     def _get_exchange_balance(self) -> float:
+        if self.config.trading.paper_trading:
+            return self._paper_heartbeat().get("cash", 0.0)
         client = self._get_client()
         if not client:
             return 0
@@ -100,6 +112,12 @@ class Supervisor:
             return 0
 
     def _get_open_positions(self) -> Dict[str, Any]:
+        if self.config.trading.paper_trading:
+            return {p["slug"]: {
+                "netPosition": 1 if p["side"] == "buy" else -1,
+                "cost": {"value": p["size_usd"]},
+                "cashValue": {"value": p["size_usd"] + p["unrealized_pnl"]},
+            } for p in self._paper_heartbeat().get("positions", [])}
         client = self._get_client()
         if not client:
             return {}
@@ -115,6 +133,24 @@ class Supervisor:
     # ------------------------------------------------------------------
     # Market type classification
     # ------------------------------------------------------------------
+
+    def _paper_heartbeat(self):
+        """Never compare a real wallet with simulated starting capital."""
+        import json
+        import math
+        import time
+        path = os.path.join(os.path.dirname(KILL_SWITCH_PATH), "heartbeat.json")
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            age = time.time() - float(data["timestamp"])
+            if (data.get("mode") != "PAPER" or data.get("accounting_version") != 2
+                    or not 0 <= age <= 180
+                    or not all(math.isfinite(float(data[k])) for k in ("cash", "equity"))):
+                return {}
+            return data
+        except (OSError, ValueError, TypeError, KeyError):
+            return {}
 
     @staticmethod
     def _classify_market_type(slug: str) -> str:

@@ -201,6 +201,7 @@ class TestLiveBookPreference:
         pre = {"home_team": "Calgary Flames", "away_team": "Seattle Kraken", "home_prob": 0.6, "away_prob": 0.4, "book": "pinnacle", "live": False}
         live = {"home_team": "Calgary Flames", "away_team": "Seattle Kraken", "home_prob": 0.8, "away_prob": 0.2, "book": "pinnacle", "live": True}
         agg.fanduel.get_odds = lambda k: []
+        agg.actionnetwork.get_odds = lambda k: []   # hermetic: no live Action Network call
         agg.pinnacle.get_odds = lambda k: [pre, live]
         games = agg.get_all_odds("icehockey_nhl")
         assert list(games) == ["sea@cgy"]            # Polymarket codes, league-scoped

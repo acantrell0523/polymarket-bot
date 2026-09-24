@@ -67,8 +67,11 @@ def profile(name, root):
          "positions": [], "trades": 0, "wins": 0, "realized": 0.0, "avg_hold_min": 0.0, "exposure": 0.0,
          "decisions": 0, "executed": 0, "by_kind": {}, "closed": [], "rejections": [],
          "settings": settings(name)}
+    hb_v2 = None
     try:
         h = json.load(open(f"{root}/data/heartbeat.json"))
+        if h.get("accounting_version") == 2:
+            hb_v2 = h
         age = time.time() - h.get("timestamp", 0)
         p.update(hb_age_s=int(age), alive=age < 300, cycle=h.get("cycle"), cash=h.get("cash"),
                  equity=h.get("equity"), positions=h.get("positions", []))
@@ -105,14 +108,35 @@ def profile(name, root):
                 "from decision_log where decision='rejected' group by r order by 2 desc limit 8")]
         finally:
             c.close()
+    p["fees"] = 0.0
+    if os.path.exists(db):
+        c = sqlite3.connect(db)
+        try:
+            cols = {r[1] for r in c.execute("PRAGMA table_info(trades)")}
+            if "entry_fees" in cols:
+                p["fees"] = round(c.execute("select coalesce(sum(entry_fees + exit_fees),0) from trades").fetchone()[0], 2)
+        finally:
+            c.close()
+    if hb_v2 is not None:
+        # Accounting v2 (executable fills, both fees, persisted cash): the
+        # bot's own heartbeat is the source of truth. Equity = cash + open
+        # collateral + mark-to-exit value net of the exit fee.
+        p["bankroll"] = float(hb_v2.get("initial_bankroll") or 1000.0)
+        p["cash"] = round(float(hb_v2.get("cash", 0.0)), 2)
+        p["equity"] = round(float(hb_v2.get("equity", 0.0)), 2)
+        p["total"] = round(p["equity"] - p["bankroll"], 2)
+        p["unrealized"] = round(p["total"] - p["realized"], 2)
+        p["accounting"] = "v2"
+        return p
     unreal = round(sum(x.get("unrealized_pnl", 0) for x in p["positions"]), 2)
     p["unrealized"] = unreal
     p["total"] = round(p["realized"] + unreal, 2)
-    # Paper cash resets to the configured bankroll on every restart, so
-    # equity is rebuilt from the ledger: bankroll + realized + unrealized.
+    # Legacy ledgers reset paper cash on restart, so equity is rebuilt from
+    # the ledger: bankroll + realized + unrealized.
     p["bankroll"] = 1000.0
     p["equity"] = round(1000.0 + p["realized"] + unreal, 2)
     p["cash"] = round(1000.0 + p["realized"] - p["exposure"], 2)
+    p["accounting"] = "legacy"
     return p
 
 

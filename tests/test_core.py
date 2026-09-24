@@ -679,8 +679,8 @@ class TestPortfolio:
         assert len(p1.get_open_positions()) == 1
         assert len(p2.get_open_positions()) == 0
 
-        # p1 bankroll was decremented by the fee; p2 bankroll is unchanged
-        assert p1.bankroll == pytest.approx(499.0)  # 500 - 1.0 fee
+        # p1 reserves collateral and the entry fee; p2 stays unchanged
+        assert p1.bankroll == pytest.approx(449.0)  # 500 - 50 collateral - 1 fee
         assert p2.bankroll == pytest.approx(1000.0)
 
     def test_portfolio_stats(self):
@@ -947,7 +947,7 @@ class TestExitTelemetry:
         assert kw["max_adverse_pnl_usd"] == pytest.approx(-2.0)
         assert kw["let_it_ride_triggered"] is False
         assert kw["entry_estimated_prob"] == pytest.approx(0.65)
-        assert kw["realized_pnl"] == pytest.approx(5.0)  # (0.55-0.50)*100
+        assert kw["realized_pnl"] == pytest.approx(3.52)  # gross $5 minus $1.48 exit fee
 
     def test_exit_log_records_let_it_ride_triggered_true(self):
         """let_it_ride_triggered must be True when let_it_ride_count > 0 at close."""
@@ -3532,7 +3532,7 @@ class TestPositionStatePersistence:
         """Restarted paper bot must keep managing its open positions with the
         ORIGINAL entry_time — otherwise the 10-min hold gate re-arms forever."""
         tdb = self._tmp_db(tmp_path, monkeypatch)
-        tdb.upsert_position_state(self._position(minutes_ago=45))
+        tdb.save_paper_portfolio(990, 1000, [self._position(minutes_ago=45)])
 
         portfolio = Portfolio(paper_mode=True, initial_bankroll=1000,
                               restore_state=True)
