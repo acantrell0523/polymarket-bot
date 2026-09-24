@@ -255,3 +255,13 @@ def test_feed_leader_streams_every_profiles_held_markets(tmp_path, monkeypatch):
     monkeypatch.setenv("POLYBOT_PROFILE", "no_trail")
     bot._publish_held()
     assert json.loads((held / "no_trail.json").read_text())["slugs"] == ["aec-nhl-c-d-2026-09-27"]
+
+
+def test_recorder_tries_the_utc_kickoff_date_for_night_games():
+    from scripts.ingest_historical import candidate_slugs
+    night = candidate_slugs({"league": "nfl", "away_abbr": "atl", "home_abbr": "gb",
+                             "date": "20260924", "start_time": "2026-09-25T00:15Z"})
+    assert night[:2] == ["nfl-atl-gb-2026-09-24", "nfl-atl-gb-2026-09-25"]
+    day = candidate_slugs({"league": "nfl", "away_abbr": "car", "home_abbr": "atl",
+                           "date": "20260920", "start_time": "2026-09-20T17:00Z"})
+    assert "nfl-car-atl-2026-09-21" not in day

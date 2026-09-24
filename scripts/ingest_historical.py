@@ -218,6 +218,13 @@ def candidate_slugs(game: Dict) -> List[str]:
     slugs = [f"{league}-{away_pm}-{home_pm}-{date_iso}"]
     if (away_pm, home_pm) != (away, home):
         slugs.append(f"{league}-{away}-{home}-{date_iso}")
+    # Gamma dates game slugs by the UTC kickoff date: an 8:15 PM ET game on
+    # 2026-09-24 is nfl-atl-gb-2026-09-25 (verified 2026-09-23). ESPN's
+    # scoreboard date is local, so every night game (TNF/SNF/MNF, late
+    # college and NHL games) missed. Try the UTC date too.
+    utc_date = str(game.get("start_time") or "")[:10]
+    if len(utc_date) == 10 and utc_date != date_iso:
+        slugs.insert(1, f"{league}-{away_pm}-{home_pm}-{utc_date}")
 
     if league in SOCCER_LEAGUES:
         base = f"atc-{league}-{away_pm}-{home_pm}-{date_iso}"
