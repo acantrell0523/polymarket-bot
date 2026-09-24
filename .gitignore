@@ -35,3 +35,4 @@ data/heartbeat.json
 # runtime caches
 data/shared/
 reports/
+data/archive/
