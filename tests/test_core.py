@@ -3997,8 +3997,9 @@ class TestBookDedup:
             {"book": "pinnacle", "home_team": "Boston Red Sox",
              "away_team": "New York Yankees", "home_prob": 0.58, "away_prob": 0.42},
         ]
-        agg.fanduel.get_odds = lambda sk: events[:2]
-        agg.pinnacle.get_odds = lambda sk: events[2:]
+        agg.fanduel.get_odds = lambda sk, **kw: events[:2]
+        agg.actionnetwork.get_odds = lambda sk, **kw: []   # hermetic
+        agg.pinnacle.get_odds = lambda sk, **kw: events[2:]
         consensus = agg.get_consensus("baseball_mlb")
         assert len(consensus) == 1
         assert consensus[0]["num_books"] == 2          # not 3
@@ -4043,8 +4044,9 @@ class TestUFCSupport:
     def test_aggregator_matches_fight_by_codes(self):
         from bot.signals.book_scrapers import MultiBookAggregator
         agg = MultiBookAggregator(cache_ttl=999)
-        agg.fanduel.get_odds = lambda sk: []
-        agg.pinnacle.get_odds = lambda sk: [{
+        agg.fanduel.get_odds = lambda sk, **kw: []
+        agg.actionnetwork.get_odds = lambda sk, **kw: []   # hermetic
+        agg.pinnacle.get_odds = lambda sk, **kw: [{
             "book": "pinnacle", "home_team": "Max Holloway",
             "away_team": "Conor McGregor", "home_prob": 0.70, "away_prob": 0.30,
         }]

@@ -558,6 +558,28 @@ class OddsCache:
                     return True
         return False
 
+    LIVE_MAX_AGE = 20.0   # seconds; in-play quotes older than this are refetched
+
+    def get_live_probability_for_slug(self, slug: str) -> Optional[Dict]:
+        """In-play sportsbook consensus for token 0 of a full-game moneyline.
+
+        Only live quotes count (see MultiBookAggregator.live_consensus); the
+        paid the-odds-api snapshot (1h cache) and ESPN's pregame line are
+        never used in-game. Returns {"prob", "num_books", "books",
+        "sharp_prob", "spread"} or None.
+        """
+        parts = slug.split("-")
+        if len(parts) != 7 or parts[0] != "aec":
+            return None
+        sport_key, token0, other = self._parse_slug(slug)   # parts[2] is token 0 (away)
+        if not sport_key:
+            return None
+        try:
+            return self._get_multi_book().live_consensus(sport_key, token0, other,
+                                                         max_age=self.LIVE_MAX_AGE)
+        except Exception:
+            return None
+
     def get_probability_for_slug(self, slug: str) -> Optional[Tuple[float, int]]:
         """Get the consensus probability for the outcome a Polymarket slug represents.
 

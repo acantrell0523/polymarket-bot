@@ -30,7 +30,7 @@ trading:
   fixed_fraction: 0.15
   kelly_fraction: 0.25
   max_position_size_usd: 50.0
-  max_daily_trades: 5
+  max_daily_trades: 15
   min_position_size_usd: 5.0
   max_portfolio_exposure_usd: 500.0
   stop_loss_threshold: 0.25
@@ -40,8 +40,12 @@ trading:
   trailing_stop_activation_pct: 0.15
   trailing_stop_pct: 0.1
   daily_loss_limit_usd: 75.0
-  max_open_positions: 5
+  max_open_positions: 8
   paper_trading: true
+  # --- 2026-09-23 strategy review (all profiles) ---
+  trailing_stop_enabled: true     # the no_trail profile turns this off
+  require_round_trip_edge: true   # net edge must also cover exit fee + half spread
+  reentry_after_stop: false       # never re-enter a market after a stop loss
   # --- Cost-aware edge accounting ---
   # US fee schedule (effective 2026-07-01): fee = coef * contracts * p * (1-p)
   # Takers pay 0.06 (peaks at 3% of notional at 50c, shrinks toward extremes).
@@ -67,6 +71,11 @@ signals:
   #             so the current 4-7% edge thresholds almost never fire.
   #             Recalibrate thresholds before switching this on.
   combination_method: linear
+  # In-game moneylines: live sportsbook consensus is primary ("books");
+  # ESPN's win-probability model supports at espn_support_weight. The
+  # espn_live profile sets "espn" as the control arm.
+  live_primary: books
+  espn_support_weight: 0.15
   # Per-market-type weights used by ProbabilityEstimator.
   # These values exactly match the hardcoded defaults — edit here to tune behavior.
   # onchain_flow is a no-op unless onchain.enabled is true.
@@ -105,6 +114,7 @@ filters:
   # Time-to-resolution windows enforced by the market scanner:
   sports_window_hours: 24     # only scan games starting within 24h
   nonsports_window_days: 14   # only scan non-sports markets resolving within 14d
+  leagues: nfl,cfb,nhl        # league allowlist (MLB/WNBA/soccer/UFC excluded)
   min_price_history_length: 10
   include_categories: []
   exclude_categories: []

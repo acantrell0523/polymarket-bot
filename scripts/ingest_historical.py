@@ -853,7 +853,9 @@ def run_ingest(
 
     init_tables()
     session = requests.Session()
-    session.headers.update({"User-Agent": "polymarket-bot-historical/1.0"})
+    # No custom User-Agent: ESPN's CDN answers 403 to it (and to a bare
+    # "Mozilla/5.0"), which made the daily recorder capture zero games from
+    # 2026-09-20 on. The default python-requests agent gets 200.
     conn = get_conn()
     last_call = 0.0
 
@@ -1044,7 +1046,9 @@ def main() -> None:
     if args.consensus_only:
         init_tables()
         session = requests.Session()
-        session.headers.update({"User-Agent": "polymarket-bot-historical/1.0"})
+        # No custom User-Agent: ESPN's CDN answers 403 to it (and to a bare
+    # "Mozilla/5.0"), which made the daily recorder capture zero games from
+    # 2026-09-20 on. The default python-requests agent gets 200.
         conn = get_conn()
         m_updated, s_updated, _ = run_consensus_backfill(
             session, conn, args.consensus_window_days, 0.0

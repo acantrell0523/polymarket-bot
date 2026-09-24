@@ -200,9 +200,9 @@ class TestLiveBookPreference:
         agg = MultiBookAggregator(cache_ttl=999)
         pre = {"home_team": "Calgary Flames", "away_team": "Seattle Kraken", "home_prob": 0.6, "away_prob": 0.4, "book": "pinnacle", "live": False}
         live = {"home_team": "Calgary Flames", "away_team": "Seattle Kraken", "home_prob": 0.8, "away_prob": 0.2, "book": "pinnacle", "live": True}
-        agg.fanduel.get_odds = lambda k: []
-        agg.actionnetwork.get_odds = lambda k: []   # hermetic: no live Action Network call
-        agg.pinnacle.get_odds = lambda k: [pre, live]
+        agg.fanduel.get_odds = lambda k, **kw: []
+        agg.actionnetwork.get_odds = lambda k, **kw: []   # hermetic: no live Action Network call
+        agg.pinnacle.get_odds = lambda k, **kw: [pre, live]
         games = agg.get_all_odds("icehockey_nhl")
         assert list(games) == ["sea@cgy"]            # Polymarket codes, league-scoped
         assert games["sea@cgy"][0]["home_prob"] == 0.8  # the live line won
@@ -300,3 +300,36 @@ class TestBookFeed:
         f = BookFeed("k", "s"); v0 = f._slugs_version
         f.set_slugs(["b", "a", "a"]); assert f._slugs == ["a", "b"] and f._slugs_version == v0 + 1
         f.set_slugs(["a", "b"]); assert f._slugs_version == v0 + 1
+
+
+class TestFeedLiveness:
+    def test_quiet_market_book_stays_valid_while_connection_alive(self):
+        import time as _t
+        from bot.book_feed import BookFeed
+        f = BookFeed("k", "s")
+        f.handle_market_data({"marketData": {"marketSlug": "aec-nfl-a-b-2026-09-27", "bids": [], "offers": []}})
+        f.books["aec-nfl-a-b-2026-09-27"] = (_t.time() - 600, f.books["aec-nfl-a-b-2026-09-27"][1])  # quiet 10 min
+        assert f.get_book("aec-nfl-a-b-2026-09-27") is None          # no connection: stale
+        f.connected, f.last_msg_at, f._subscribed = True, _t.time(), {"aec-nfl-a-b-2026-09-27"}
+        assert f.get_book("aec-nfl-a-b-2026-09-27") is not None      # alive + subscribed: current
+        f._subscribed = set()
+        assert f.get_book("aec-nfl-a-b-2026-09-27") is None          # unsubscribed: never served old
+
+    def test_sibling_trusts_mirrored_book_only_under_live_leader(self, tmp_path, monkeypatch):
+        import json as _json, os as _os, time as _t
+        from bot.market_data import MarketDataClient
+        from utils.config import load_config
+        monkeypatch.setenv("POLYBOT_SHARED_DIR", str(tmp_path))
+        cfg = load_config(); md = MarketDataClient(cfg.api, None, cfg.filters)
+        (tmp_path / "books").mkdir(exist_ok=True)
+        book = tmp_path / "books" / "aec-nfl-a-b-2026-09-27.json"
+        book.write_text(_json.dumps({"marketData": {"bids": [{"px": {"value": "0.4"}, "qty": "9"}],
+                                                    "offers": [{"px": {"value": "0.42"}, "qty": "9"}]}}))
+        old = _t.time() - 300
+        _os.utime(book, (old, old))
+        assert md.get_cached_book("aec-nfl-a-b-2026-09-27") is None
+        (tmp_path / "feed_status.json").write_text(_json.dumps({"t": _t.time(), "alive": True,
+                                                                "slugs": ["aec-nfl-a-b-2026-09-27"]}))
+        md._feed_status_memo = None
+        ob = md.get_cached_book("aec-nfl-a-b-2026-09-27")
+        assert ob is not None and ob.best_bid == 0.4

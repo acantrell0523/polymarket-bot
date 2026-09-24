@@ -253,6 +253,15 @@ class TradingBot:
         self._settled_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "settled_slugs.txt")
         self._settled_slugs: set = self._load_settled_slugs()
 
+        # Markets the bot will not re-enter (stop loss there; persisted)
+        self._reentry_blocked: set = set()
+        try:
+            from bot.trade_db import init_db, load_reentry_blocks
+            init_db()
+            self._reentry_blocked = load_reentry_blocks()
+        except Exception as e:
+            self.logger.warning("reentry_blocks_load_failed", {"error": str(e)[:200]})
+
         # Live-game estimator with aggressive weights
         live_signal_config = copy.deepcopy(config.signals)
         live_signal_config.odds_value_weight = 0.40
@@ -368,6 +377,8 @@ class TradingBot:
                 continue
             if slug in self._settled_slugs:
                 continue
+            if slug in getattr(self, "_reentry_blocked", ()):
+                continue
 
             cooldown_until = self._slug_cooldowns.get(slug, 0)
             if _time.time() < cooldown_until:
@@ -400,8 +411,11 @@ class TradingBot:
             # Get number of books for this market. Spread/total markets
             # carry their own book count on the spread_total signal.
             line_sig = next((s for s in trade_signal.signals if s.name == "spread_total"), None)
+            odds_sig = next((s for s in trade_signal.signals if s.name == "odds_value"), None)
             if line_sig is not None:
                 num_books = int(line_sig.metadata.get("num_books", 0))
+            elif odds_sig is not None and odds_sig.metadata.get("live"):
+                num_books = int(odds_sig.metadata.get("num_books", 0))  # live in-play books
             else:
                 consensus = self.odds_cache.get_consensus_odds(trade_signal.slug)
                 num_books = consensus.get("num_books", 0) if consensus else 0
@@ -444,6 +458,8 @@ class TradingBot:
                 max_spread=tcfg.max_spread,
                 league_min_edge_override=getattr(tcfg, "league_min_edge_override", 0.0),
                 min_net_edge=tcfg.min_net_edge,
+                round_trip=bool(getattr(tcfg, "require_round_trip_edge", False)),
+                fee_coefficient=tcfg.taker_fee_coefficient,
             )
 
             if rejection:
@@ -888,6 +904,8 @@ class TradingBot:
                             position, paper_fill["filled"], paper_fill["vwap"],
                             close_reason, paper_fill["fees"])
                         self.risk.record_pnl(part_pnl)
+                        if close_reason == "stop_loss":
+                            self._block_reentry(slug, "stop_loss")
                         self._enforce_daily_loss_pause()
                         self.logger.warning("paper_exit_partial", {
                             "slug": slug, "reason": close_reason,
@@ -967,8 +985,11 @@ class TradingBot:
                         "pnl": round(position.realized_pnl, 2),
                         "exchange_pnl": round(exchange_pnl, 2) if exchange_pnl is not None else None,
                     })
-                    # Smart re-entry: loss = 10min cooldown, win (>$2) = immediate
+                    # Smart re-entry: loss = 10min cooldown, win (>$2) = immediate.
+                    # A stop loss blocks the market for good (reentry_after_stop).
                     import time as _time
+                    if close_reason == "stop_loss":
+                        self._block_reentry(slug, "stop_loss")
                     if position.realized_pnl < 2.0:
                         self._slug_cooldowns[slug] = _time.time() + self._cooldown_seconds
                 else:
@@ -980,6 +1001,72 @@ class TradingBot:
 
         if has_live_games:
             self.risk.config.take_profit_threshold = original_tp
+
+    # ── Re-entry blocks and shared feed subscription ──────────────────────
+
+    def _block_reentry(self, slug: str, reason: str):
+        """Never re-enter `slug` after a stop loss there (unless configured)."""
+        if getattr(self.config.trading, "reentry_after_stop", True):
+            return
+        blocked = getattr(self, "_reentry_blocked", None)
+        if blocked is None:
+            blocked = self._reentry_blocked = set()
+        if slug in blocked:
+            return
+        blocked.add(slug)
+        try:
+            from bot.trade_db import block_reentry
+            block_reentry(slug, reason)
+        except Exception as e:
+            self.logger.warning("reentry_block_persist_failed", {"slug": slug, "error": str(e)[:200]})
+        self.logger.info("reentry_blocked", {"slug": slug, "reason": reason})
+
+    def _shared_held_dir(self) -> Optional[str]:
+        shared = os.environ.get("POLYBOT_SHARED_DIR")
+        return os.path.join(shared, "held") if shared else None
+
+    def _publish_held(self):
+        """Write this profile's open markets for the feed leader to stream."""
+        folder = self._shared_held_dir()
+        if not folder:
+            return
+        try:
+            import json as _json
+            import tempfile as _tempfile
+            os.makedirs(folder, exist_ok=True)
+            slugs = sorted({p.slug for p in self.portfolio.get_open_positions() if p.slug})
+            fd, tmp = _tempfile.mkstemp(dir=folder, prefix=".held-")
+            with os.fdopen(fd, "w") as fh:
+                _json.dump({"t": time.time(), "slugs": slugs}, fh)
+            os.replace(tmp, os.path.join(folder, os.environ.get("POLYBOT_PROFILE", "baseline") + ".json"))
+        except Exception:
+            pass
+
+    def _refresh_feed_subscription(self):
+        """Leader only: stream the scan universe plus every profile's open
+        markets, so exits for positions whose market left the universe (a
+        line drifting out of the 30-70c band) still read streamed books
+        instead of the 0.5-calls-per-second REST budget."""
+        if getattr(self, "book_feed", None) is None:
+            return
+        slugs = {m.get("slug", "") for m in (self._cached_markets or [])}
+        slugs |= {p.slug for p in self.portfolio.get_open_positions() if p.slug}
+        folder = self._shared_held_dir()
+        if folder and os.path.isdir(folder):
+            import json as _json
+            for name in os.listdir(folder):
+                if not name.endswith(".json"):
+                    continue
+                try:
+                    with open(os.path.join(folder, name)) as fh:
+                        data = _json.load(fh)
+                    if time.time() - float(data.get("t", 0)) <= 900:
+                        slugs |= set(data.get("slugs") or [])
+                except (OSError, ValueError, TypeError):
+                    continue
+        slugs.discard("")
+        self.book_feed.set_slugs(sorted(slugs))
+        self.book_feed.write_status()
 
     # ── Paper settlement helpers ──────────────────────────────────────────
 
@@ -1046,8 +1133,7 @@ class TradingBot:
             self.health.record_success("market_data")
         self._cached_markets = markets
         self._last_full_scan = time.time()
-        if self.book_feed is not None:
-            self.book_feed.set_slugs([m.get("slug", "") for m in markets])
+        self._refresh_feed_subscription()
         return markets
 
     def _prescreen(self, markets: List[Dict], label: str) -> List[Dict]:
@@ -1066,6 +1152,8 @@ class TradingBot:
             slug = market.get("slug", "")
             if slug in open_slugs:
                 keep.append(market)
+                continue
+            if slug in getattr(self, "_reentry_blocked", ()):
                 continue
             light = self.market_data.build_snapshot(market, fetch_book=False)
             if not light:
@@ -1316,6 +1404,8 @@ class TradingBot:
                     )
                     last_summary_date = today_str
 
+                self._publish_held()
+                self._refresh_feed_subscription()
                 time.sleep(self.live_scan_interval)
 
             except Exception as e:

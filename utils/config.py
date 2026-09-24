@@ -80,6 +80,16 @@ class TradingConfig:
     league_min_edge_override: float = 0.0
     # Price at which a winner is held to settlement instead of taken.
     let_it_ride_threshold: float = 0.70
+    # --- 2026-09-23 strategy review (defaults = prior behavior; the YAML
+    # turns the new rules on) ---
+    # Trailing stop on/off (one profile tests running without it).
+    trailing_stop_enabled: bool = True
+    # Require the net edge to clear the EXIT costs too (exit fee + half the
+    # spread), not just the entry: early exits pay ~6% round trip at 50c.
+    require_round_trip_edge: bool = False
+    # False = never re-enter a market after a stop loss in it (re-entries
+    # lost $404 over 78 trades in the first three days).
+    reentry_after_stop: bool = True
 
 
 # Default per-market-type weights — must stay in sync with WEIGHTS in estimator.py
@@ -140,6 +150,15 @@ class SignalConfig:
     #               nothing ever clears min_edge_threshold. EXPERIMENTAL:
     #               requires recalibrating every edge threshold before use.
     combination_method: str = "linear"
+    # In-game primary signal for moneylines:
+    #   "books" — live sportsbook consensus (in-play quotes from Pinnacle,
+    #             FanDuel, DraftKings, BetMGM, Caesars, bet365, BetRivers;
+    #             >=2 fresh live books or no trade). ESPN's win-probability
+    #             model only supports, at espn_support_weight.
+    #   "espn"  — ESPN's model is primary (pre-2026-09-23 behavior; entries
+    #             it drove lost $476 over 69 trades in the first three days).
+    live_primary: str = "espn"
+    espn_support_weight: float = 0.15
     weights: Dict[str, Dict[str, float]] = field(
         default_factory=lambda: {
             market: dict(signal_weights)
@@ -161,6 +180,9 @@ class FilterConfig:
     # (max_hours_to_expiry above is legacy and superseded by these two.)
     sports_window_hours: float = 24.0
     nonsports_window_days: float = 14.0
+    # Comma-separated league allowlist ("nfl,cfb,nhl"); empty = every
+    # registered league. Also selects the /v1/events universe by league tag.
+    leagues: str = ""
     include_categories: List[str] = field(default_factory=list)
     exclude_categories: List[str] = field(default_factory=list)
 

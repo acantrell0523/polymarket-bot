@@ -179,40 +179,31 @@ class FanDuelClient:
         self._cache: Dict[str, Tuple[float, List[dict]]] = {}
         self.name = "fanduel"
 
-    def _fetch(self, sport_id: str) -> Optional[dict]:
-        try:
-            resp = requests.get(
-                FANDUEL_BASE,
-                params={
-                    "page": "CUSTOM",
-                    "customPageId": sport_id,
-                    "_ak": "FhMFpcPWXMeyZxOx",
-                },
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=15,
-            )
-            if resp.status_code != 200:
-                return None
-            return json.loads(resp.text, strict=False)
-        except Exception:
-            return None
+    def _fetch(self, sport_id: str, max_age: float = 300.0) -> Optional[dict]:
+        from bot.http_cache import get_json
+        return get_json(FANDUEL_BASE,
+                        params={"page": "CUSTOM", "customPageId": sport_id,
+                                "_ak": "FhMFpcPWXMeyZxOx"},
+                        headers={"User-Agent": "Mozilla/5.0"}, max_age=max_age)
 
-    def get_odds(self, sport_key: str) -> List[dict]:
+    def get_odds(self, sport_key: str, max_age: Optional[float] = None) -> List[dict]:
         """Get moneyline odds for a sport. Returns list of event dicts.
 
-        Each dict: {home_team, away_team, home_prob, away_prob, book}
+        Each dict: {home_team, away_team, home_prob, away_prob, book, live}.
+        max_age (seconds) overrides the cache TTL — in-play callers pass ~20.
         """
+        ttl = self.cache_ttl if max_age is None else max_age
         now = time.time()
         if sport_key in self._cache:
             ts, data = self._cache[sport_key]
-            if now - ts < self.cache_ttl:
+            if now - ts < ttl:
                 return data
 
         fd_sport = FANDUEL_SPORTS.get(sport_key)
         if not fd_sport:
             return []
 
-        raw = self._fetch(fd_sport)
+        raw = self._fetch(fd_sport, ttl)
         if not raw:
             return []
 
@@ -243,6 +234,8 @@ class FanDuelClient:
         for mid, mkt in markets.items():
             if mkt.get("marketName", "").lower() not in ("moneyline", "money line"):
                 continue
+            if mkt.get("marketStatus") not in (None, "OPEN"):
+                continue  # suspended (common in-play after big plays): no quote
             event_id = str(mkt.get("eventId", ""))
             ev_info = event_map.get(event_id)
             if not ev_info:
@@ -254,6 +247,8 @@ class FanDuelClient:
 
             team_probs = {}
             for runner in runners:
+                if runner.get("runnerStatus") not in (None, "ACTIVE"):
+                    continue
                 name = runner.get("runnerName", "")
                 odds_data = runner.get("winRunnerOdds", {})
                 am_odds = odds_data.get("americanDisplayOdds", {}).get("americanOdds")
@@ -315,25 +310,18 @@ class PinnacleClient:
         self._cache: Dict[str, Tuple[float, List[dict]]] = {}
         self.name = "pinnacle"
 
-    def _get(self, url: str) -> Optional[dict]:
-        try:
-            resp = requests.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                return resp.json()
-        except Exception:
-            pass
-        return None
+    def _get(self, url: str, max_age: float = 300.0) -> Optional[dict]:
+        from bot.http_cache import get_json
+        return get_json(url, headers={"User-Agent": "Mozilla/5.0"}, max_age=max_age)
 
-    def get_odds(self, sport_key: str) -> List[dict]:
-        """Get moneyline odds. Returns list of event dicts."""
+    def get_odds(self, sport_key: str, max_age: Optional[float] = None) -> List[dict]:
+        """Get moneyline odds. Returns list of event dicts (live=True for
+        in-play child matchups). max_age overrides the cache TTL."""
+        ttl = self.cache_ttl if max_age is None else max_age
         now = time.time()
         if sport_key in self._cache:
             ts, data = self._cache[sport_key]
-            if now - ts < self.cache_ttl:
+            if now - ts < ttl:
                 return data
 
         league_id = PINNACLE_LEAGUES.get(sport_key)
@@ -341,12 +329,12 @@ class PinnacleClient:
             return []
 
         # Fetch matchups
-        matchups_raw = self._get(f"{PINNACLE_BASE}/leagues/{league_id}/matchups")
+        matchups_raw = self._get(f"{PINNACLE_BASE}/leagues/{league_id}/matchups", ttl)
         if not matchups_raw:
             return []
 
         # Fetch markets
-        markets_raw = self._get(f"{PINNACLE_BASE}/leagues/{league_id}/markets/straight")
+        markets_raw = self._get(f"{PINNACLE_BASE}/leagues/{league_id}/markets/straight", ttl)
         if not markets_raw:
             return []
 
@@ -383,6 +371,8 @@ class PinnacleClient:
                 continue
             if mkt.get("isAlternate", False):
                 continue
+            if mkt.get("status") not in (None, "open"):
+                continue  # suspended in-play
 
             mid = mkt.get("matchupId")
             prices = mkt.get("prices", [])
@@ -443,38 +433,41 @@ class MultiBookAggregator:
         self.cache_ttl = cache_ttl
         self._cache: Dict[str, Tuple[float, dict]] = {}
 
-    def get_all_odds(self, sport_key: str) -> Dict[str, List[dict]]:
+    def get_all_odds(self, sport_key: str, max_age: Optional[float] = None) -> Dict[str, List[dict]]:
         """Fetch odds from all books for a sport.
 
         Returns: {game_key: [odds_from_each_book]}
-        where game_key is a normalized "away @ home" string.
+        where game_key is a normalized "away @ home" string. max_age (s)
+        overrides the cache TTL for every source (in-play callers pass ~20).
         """
+        ttl = self.cache_ttl if max_age is None else max_age
         now = time.time()
         cache_key = f"all_{sport_key}"
         if cache_key in self._cache:
             ts, data = self._cache[cache_key]
-            if now - ts < self.cache_ttl:
+            if now - ts < ttl:
                 return data
 
         all_events: List[dict] = []
 
         # FanDuel
         try:
-            fd = self.fanduel.get_odds(sport_key)
+            fd = self.fanduel.get_odds(sport_key, max_age=max_age)
             all_events.extend(fd)
         except Exception:
             pass
 
         # Pinnacle
         try:
-            pin = self.pinnacle.get_odds(sport_key)
+            pin = self.pinnacle.get_odds(sport_key, max_age=max_age)
             all_events.extend(pin)
         except Exception:
             pass
 
-        # Action Network: DraftKings / BetMGM / Caesars / bet365 / BetRivers, pregame only
+        # Action Network: DraftKings / BetMGM / Caesars / bet365 / BetRivers
+        # (pregame rows before kickoff, in-play rows during the game)
         try:
-            all_events.extend(self.actionnetwork.get_odds(sport_key))
+            all_events.extend(self.actionnetwork.get_odds(sport_key, max_age=max_age))
         except Exception:
             pass
 
@@ -502,6 +495,45 @@ class MultiBookAggregator:
 
         self._cache[cache_key] = (now, games)
         return games
+
+    def live_consensus(self, sport_key: str, token0_abbr: str, other_abbr: str,
+                       max_age: float = 20.0) -> Optional[dict]:
+        """In-play consensus that `token0_abbr` wins, from LIVE quotes only.
+
+        Polymarket's aec- token 0 is the away team (slug parts[2]); books key
+        games away@home, so a reversed match (neutral site) reads home_prob.
+        Only entries flagged live count (Pinnacle live child matchups,
+        FanDuel inPlay markets, Action Network in-play rows under 150s old);
+        a pregame line during a game is stale and never used. Sources are
+        refetched when older than max_age. Pinnacle counts 1.5x.
+        """
+        games = self.get_all_odds(sport_key, max_age=max_age)
+        direct, flipped = f"{token0_abbr}@{other_abbr}", f"{other_abbr}@{token0_abbr}"
+        flip = False
+        entries = games.get(direct)
+        if not entries:
+            entries, flip = games.get(flipped), True
+        if not entries:
+            return None
+        live = [e for e in entries if e.get("live")]
+        if not live:
+            return None
+        weighted, weight_sum, sharp, probs = 0.0, 0.0, [], []
+        for e in live:
+            p = e["home_prob"] if flip else e["away_prob"]
+            w = self.SHARP_WEIGHT if e.get("book") in self.SHARP_BOOKS else 1.0
+            weighted += w * p
+            weight_sum += w
+            probs.append(p)
+            if e.get("book") in self.SHARP_BOOKS:
+                sharp.append(p)
+        return {
+            "prob": weighted / weight_sum,
+            "num_books": len(live),
+            "books": [e.get("book", "unknown") for e in live],
+            "sharp_prob": (sum(sharp) / len(sharp)) if sharp else None,
+            "spread": (max(probs) - min(probs)) if len(probs) > 1 else 0.0,
+        }
 
     def get_consensus(self, sport_key: str) -> List[dict]:
         """Get consensus odds across all books.
@@ -645,7 +677,8 @@ class ActionNetworkClient:
         self.name = "actionnetwork"
         self._cache: Dict[str, Tuple[float, List[dict]]] = {}
 
-    def _fetch(self, sport_key: str) -> List[dict]:
+    def _fetch(self, sport_key: str, max_age: float = 300.0) -> List[dict]:
+        from bot.http_cache import get_json
         league = AN_LEAGUES.get(sport_key)
         if not league:
             return []
@@ -660,10 +693,10 @@ class ActionNetworkClient:
             url = (f"{AN_BASE}/{path}?bookIds={','.join(str(b) for b in AN_BOOKS)}"
                    f"&date={date}&periods=event{extra}")
             try:
-                resp = requests.get(url, headers={"User-Agent": AN_UA}, timeout=15)
-                if resp.status_code != 200:
+                payload = get_json(url, headers={"User-Agent": AN_UA}, max_age=max_age)
+                if not isinstance(payload, dict):
                     continue
-                for g in resp.json().get("games", []):
+                for g in payload.get("games", []):
                     if g.get("id") in seen:
                         continue
                     seen.add(g.get("id"))
@@ -713,25 +746,35 @@ class ActionNetworkClient:
                             "live": live, "rows": rows})
         return out
 
-    def games(self, sport_key: str) -> List[dict]:
+    def games(self, sport_key: str, max_age: Optional[float] = None) -> List[dict]:
         """Normalized games with per-book odds rows (cached; short TTL while live)."""
         now = time.time()
         cached = self._cache.get(sport_key)
-        if cached:
-            ttl = AN_LIVE_TTL if any(g.get("live") for g in cached[1]) else self.cache_ttl
-            if now - cached[0] < ttl:
-                return cached[1]
-        out = self.parse_games(self._fetch(sport_key), now)
+        if max_age is not None:
+            ttl = max_age
+        elif cached and any(g.get("live") for g in cached[1]):
+            ttl = AN_LIVE_TTL
+        else:
+            ttl = self.cache_ttl
+        if cached and now - cached[0] < ttl:
+            return cached[1]
+        out = self.parse_games(self._fetch(sport_key, ttl), now)
         self._cache[sport_key] = (now, out)
         return out
 
-    def get_odds(self, sport_key: str) -> List[dict]:
+    @staticmethod
+    def _suspended(o: dict, *fields) -> bool:
+        """Action Network flags an unavailable line with line_status 2."""
+        status = o.get("line_status") or {}
+        return any(status.get(f) == 2 for f in fields)
+
+    def get_odds(self, sport_key: str, max_age: Optional[float] = None) -> List[dict]:
         """Moneyline events, one per book per game (same shape as FanDuel/Pinnacle)."""
         results = []
-        for g in self.games(sport_key):
+        for g in self.games(sport_key, max_age=max_age):
             for o in g["rows"]:
                 mh, ma = o.get("ml_home"), o.get("ml_away")
-                if not mh or not ma:
+                if not mh or not ma or self._suspended(o, "ml_home", "ml_away"):
                     continue
                 hp, ap = american_to_prob(int(mh)), american_to_prob(int(ma))
                 tot = hp + ap
@@ -742,9 +785,9 @@ class ActionNetworkClient:
                                 "book": AN_BOOKS[o["book_id"]], "live": g["live"]})
         return results
 
-    def line_quotes(self, sport_key: str):
+    def line_quotes(self, sport_key: str, max_age: Optional[float] = None):
         """(game key, kind, quote) tuples for LinesCache: away spread + total per book."""
-        for g in self.games(sport_key):
+        for g in self.games(sport_key, max_age=max_age):
             key_a, key_h = _match_abbr(g["away_team"], sport_key), _match_abbr(g["home_team"], sport_key)
             if not key_a or not key_h:
                 continue
@@ -752,12 +795,12 @@ class ActionNetworkClient:
             for o in g["rows"]:
                 book = AN_BOOKS[o["book_id"]]
                 sa, pa, ph = o.get("spread_away"), o.get("spread_away_line"), o.get("spread_home_line")
-                if sa is not None and pa and ph:
+                if sa is not None and pa and ph and not self._suspended(o, "spread_away", "spread_home"):
                     p_away = american_to_prob(int(pa)); p_home = american_to_prob(int(ph))
                     yield key, "spread", {"book": book, "kind": "spread", "points": float(sa),
                                           "p": p_away / (p_away + p_home), "main": True, "live": g["live"]}
                 t, po, pu = o.get("total"), o.get("over"), o.get("under")
-                if t is not None and po and pu:
+                if t is not None and po and pu and not self._suspended(o, "over", "under"):
                     p_o = american_to_prob(int(po)); p_u = american_to_prob(int(pu))
                     yield key, "total", {"book": book, "kind": "total", "points": float(t),
                                          "p": p_o / (p_o + p_u), "main": True, "live": g["live"]}

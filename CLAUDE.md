@@ -4,7 +4,30 @@ This document is a comprehensive reference for AI assistants (and human develope
 
 ---
 
-## Latest Changes — 2026-09-20 (football restart: spreads/totals, live lines, gateway limits)
+## Latest Changes — 2026-09-23 (paper v2, settlement, strategy review, event universe)
+
+A review of the first three days (167 closed paper trades across four
+profiles) found every profile net negative after fees, and four paper-engine
+defects that distorted the numbers. Legacy ledgers are archived under each
+profile's `data/archive/2026-09-23-legacy/`; all profiles restarted on empty
+v2 ledgers.
+
+| Area | Change |
+|------|--------|
+| **Paper v2 accounting (PR #2, Codex)** | Entries fill at the executable top-of-book price within visible depth (integer contracts); shorts reserve collateral `(1 - price)`; both fees in net realized P&L; cash/positions/closes persist in the `paper_portfolio` table; legacy DBs are refused at startup (archive them, never mix). The supervisor reads the paper heartbeat in paper mode and never the real account (it had tripped the kill switch on a $0.26 real balance every 15 min from 2026-09-22 10:44 ET). |
+| **Settlement** | Quotes on finished games stop at 0.5c/99.5c, so quote-based resolution never fired; 17 positions sat open on finished games. `check_positions` now batches `/v1/markets?slug=...` (repeatable `slug`) for positions that look finished (missing from a complete active list, no usable book, price within 2c of 0/1) or held 2h+, and closes RESOLVED markets at `/v1/markets/{slug}/settlement` (fallback: `outcomePrices[0]`, which follows marketSides long-first) with no exit fee. |
+| **Exits** | `bot.paper.sweep` walks the visible book like the live sweeping IOC (fees per level). When depth runs short the visible slice closes via `Portfolio.close_partial` (trade row `<reason>_partial`, pro-rated entry fee) and the remainder stays open. |
+| **In-game signal** | `signals.live_primary: books` — in-game moneylines price off LIVE sportsbook quotes only (`MultiBookAggregator.live_consensus`: Pinnacle live child matchups, FanDuel inPlay markets, Action Network in-play rows under 150 s; suspended markets skipped; >=2 live books or no trade; refetched at 20 s). ESPN's model supports at `espn_support_weight: 0.15`. ESPN-primary entries lost $476 over 69 trades. `live_primary: espn` restores the old behavior (espn_live profile). |
+| **Entry/exit rules** | `trading.require_round_trip_edge: true` (net edge must also clear exit fee + half spread, ~7% gross at 50c); `trading.reentry_after_stop: false` (market blocked for good after a stop loss, persisted in `reentry_blocks`; re-entries lost $404 over 78 trades); `trading.trailing_stop_enabled`; caps 8 open / 15 per day. |
+| **Universe** | `filters.leagues: nfl,cfb,nhl`. Markets come from `/v1/events?tagSlug=<league>&startTimeMin/Max` with markets embedded (1.2 s, complete) instead of paging 45k+ markets under a 40k cap that cut off part of Saturday's college slate; slimmed to full-game moneylines/spreads/totals and shared-cached 240 s. Pagination remains the fallback. |
+| **Fresh prices** | Snapshot price = book midpoint when a two-sided book is available (list prices were up to 3 min old in-game); light prescreen snapshots use the streamed/shared-cache book (no REST), else the list's bestBid/bestAsk. |
+| **Shared caching** | `bot/http_cache.py`: cross-process GET cache for Pinnacle/FanDuel/Action Network/ESPN lines (caller max_age; live callers 20 s). Every profile publishes its open markets to `data/shared/held/`, and the websocket leader streams universe ∪ all held markets. |
+| **Recorder** | `scripts/ingest_historical.py` sent a custom User-Agent that ESPN answers with 403, so the 05:30 recorder captured zero games from 2026-09-20; removed. |
+| **Profiles** | `scripts/profiles.py` is the single source (`--install` writes plists): baseline (control, websocket leader), no_trail, ride (hold to settlement), espn_live (old signal as control). aggressive and balanced retired (low edge bar is ruled out by round-trip costs). |
+
+---
+
+## Changes — 2026-09-20 (football restart: spreads/totals, live lines, gateway limits)
 
 Restored from GitHub after the local checkout was lost (~2026-08-29); runs
 from `~/Projects/polymarket-bot` via the two launchd jobs. Paper mode.

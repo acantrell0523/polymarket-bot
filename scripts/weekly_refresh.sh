@@ -7,6 +7,6 @@ cd "$(dirname "$0")/.."
 echo "== $(date '+%Y-%m-%d %H:%M:%S')"
 ./venv/bin/python scripts/build_cfb_teams.py
 bash scripts/sync_profiles.sh
-for j in bot bot.aggressive bot.ride bot.balanced; do
+for j in bot $(for n in $(./venv/bin/python scripts/profiles.py --names); do printf "bot.%s " "$n"; done); do
   launchctl kickstart -k "gui/$(id -u)/com.polymarket.$j" && echo "restarted $j"
 done

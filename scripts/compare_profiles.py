@@ -14,12 +14,10 @@ import sqlite3
 import sys
 import time
 
-PROFILES = {
-    "baseline":   os.path.expanduser("~/Projects/polymarket-bot"),
-    "aggressive": os.path.expanduser("~/Projects/polybot-profiles/aggressive"),
-    "ride":       os.path.expanduser("~/Projects/polybot-profiles/ride"),
-    "balanced":       os.path.expanduser("~/Projects/polybot-profiles/balanced"),
-}
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from profiles import PROFILES as _PROFILES, root as _root  # noqa: E402
+
+PROFILES = {name: _root(name) for name in _PROFILES}
 
 
 def stats(root):

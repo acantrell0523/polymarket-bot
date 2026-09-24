@@ -80,6 +80,8 @@ def validate_trade(
     max_spread: Optional[float] = None,
     min_net_edge: Optional[float] = None,
     league_min_edge_override: float = 0.0,
+    round_trip: bool = False,
+    fee_coefficient: float = 0.06,
 ) -> Optional[str]:
     """Validate a trade against ALL pre-trade checks.
 
@@ -130,9 +132,17 @@ def validate_trade(
     # signal.net_edge is set by compute_edge_breakdown (executable price with
     # taker fee); if the caller never computed it, skip the check.
     if min_net_edge is not None and signal.exec_price > 0:
-        if signal.net_edge < min_net_edge:
+        required = min_net_edge
+        if round_trip:
+            # net_edge already pays the entry spread and entry fee. An exit
+            # before settlement pays the exit fee plus about half the spread
+            # again; the edge must clear those too, with min_net_edge left
+            # over. At 50c with a 2c spread that is ~7% gross edge vs mid.
+            from bot.strategies.fees import fee_per_contract
+            required += fee_per_contract(signal.exec_price, fee_coefficient) + max(signal.spread, 0.0) / 2
+        if signal.net_edge < required:
             return (f"net_edge_{signal.net_edge*100:.1f}pct_below_"
-                    f"{min_net_edge*100:.1f}pct_min_after_costs")
+                    f"{required*100:.1f}pct_min_after_{'round_trip_' if round_trip else ''}costs")
 
     return None  # All checks passed
 

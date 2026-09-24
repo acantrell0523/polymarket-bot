@@ -17,23 +17,25 @@ import urllib.request
 from datetime import datetime, timezone
 
 HOME = os.path.expanduser("~")
-PROFILES = {
-    "baseline":   f"{HOME}/Projects/polymarket-bot",
-    "aggressive": f"{HOME}/Projects/polybot-profiles/aggressive",
-    "ride":       f"{HOME}/Projects/polybot-profiles/ride",
-    "balanced":       f"{HOME}/Projects/polybot-profiles/balanced",
-}
-KNOBS = ["MIN_EDGE_THRESHOLD", "LEAGUE_MIN_EDGE_OVERRIDE", "MIN_NET_EDGE", "KELLY_FRACTION",
-         "MAX_POSITION_SIZE_USD", "MAX_OPEN_POSITIONS", "MAX_DAILY_TRADES", "MIN_PRICE", "MAX_PRICE",
-         "ALLOW_MULTIPLE_PER_GAME", "AGGRESSIVE_EXIT_PCT", "TRAILING_STOP_ACTIVATION_PCT",
-         "TRAILING_STOP_PCT", "TAKE_PROFIT_THRESHOLD", "STOP_LOSS_THRESHOLD", "LET_IT_RIDE_THRESHOLD",
-         "DAILY_LOSS_LIMIT_USD"]
-DEFAULTS = {"MIN_EDGE_THRESHOLD": "0.05", "LEAGUE_MIN_EDGE_OVERRIDE": "league table", "MIN_NET_EDGE": "0.02",
-            "KELLY_FRACTION": "0.25", "MAX_POSITION_SIZE_USD": "50", "MAX_OPEN_POSITIONS": "5",
-            "MAX_DAILY_TRADES": "5", "MIN_PRICE": "0.15", "MAX_PRICE": "0.85", "ALLOW_MULTIPLE_PER_GAME": "false",
-            "AGGRESSIVE_EXIT_PCT": "0.30", "TRAILING_STOP_ACTIVATION_PCT": "0.15", "TRAILING_STOP_PCT": "0.10",
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from profiles import PROFILES as _PROFILES, root as _root, plist_path as _plist_path  # noqa: E402
+
+PROFILES = {name: _root(name) for name in _PROFILES}
+# (config section, field) shown on the board; values from each profile's
+# plist overrides, else the configs/config.yaml default below.
+KNOBS = [("TRADING", k) for k in (
+    "MIN_EDGE_THRESHOLD", "MIN_NET_EDGE", "REQUIRE_ROUND_TRIP_EDGE", "KELLY_FRACTION",
+    "MAX_POSITION_SIZE_USD", "MAX_OPEN_POSITIONS", "MAX_DAILY_TRADES", "MIN_PRICE", "MAX_PRICE",
+    "REENTRY_AFTER_STOP", "AGGRESSIVE_EXIT_PCT", "TRAILING_STOP_ENABLED",
+    "TRAILING_STOP_ACTIVATION_PCT", "TRAILING_STOP_PCT", "TAKE_PROFIT_THRESHOLD",
+    "STOP_LOSS_THRESHOLD", "LET_IT_RIDE_THRESHOLD", "DAILY_LOSS_LIMIT_USD")] + [("SIGNALS", "LIVE_PRIMARY")]
+DEFAULTS = {"MIN_EDGE_THRESHOLD": "0.05", "MIN_NET_EDGE": "0.02", "REQUIRE_ROUND_TRIP_EDGE": "true",
+            "KELLY_FRACTION": "0.25", "MAX_POSITION_SIZE_USD": "50", "MAX_OPEN_POSITIONS": "8",
+            "MAX_DAILY_TRADES": "15", "MIN_PRICE": "0.15", "MAX_PRICE": "0.85",
+            "REENTRY_AFTER_STOP": "false", "AGGRESSIVE_EXIT_PCT": "0.30", "TRAILING_STOP_ENABLED": "true",
+            "TRAILING_STOP_ACTIVATION_PCT": "0.15", "TRAILING_STOP_PCT": "0.10",
             "TAKE_PROFIT_THRESHOLD": "0.05", "STOP_LOSS_THRESHOLD": "0.25", "LET_IT_RIDE_THRESHOLD": "0.70",
-            "DAILY_LOSS_LIMIT_USD": "75"}
+            "DAILY_LOSS_LIMIT_USD": "75", "LIVE_PRIMARY": "books"}
 
 
 def load_env():
@@ -49,21 +51,20 @@ def load_env():
 
 
 def settings(name):
-    label = "com.polymarket.bot" + ("" if name == "baseline" else f".{name}")
     try:
-        pl = plistlib.load(open(f"{HOME}/Library/LaunchAgents/{label}.plist", "rb"))
+        pl = plistlib.load(open(_plist_path(name), "rb"))
         env = pl.get("EnvironmentVariables", {})
     except Exception:
         env = {}
     out = {}
-    for k in KNOBS:
-        v = env.get(f"POLYBOT_TRADING__{k}")
+    for section, k in KNOBS:
+        v = env.get(f"POLYBOT_{section}__{k}")
         out[k.lower()] = {"value": v if v is not None else DEFAULTS[k], "overridden": v is not None}
     return out
 
 
 def profile(name, root):
-    p = {"name": name, "alive": False, "hb_age_s": None, "cycle": None, "cash": None, "equity": None,
+    p = {"name": name, "description": _PROFILES.get(name, {}).get("description", ""), "alive": False, "hb_age_s": None, "cycle": None, "cash": None, "equity": None,
          "positions": [], "trades": 0, "wins": 0, "realized": 0.0, "avg_hold_min": 0.0, "exposure": 0.0,
          "decisions": 0, "executed": 0, "by_kind": {}, "closed": [], "rejections": [],
          "settings": settings(name)}

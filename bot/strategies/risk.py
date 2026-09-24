@@ -122,7 +122,8 @@ class RiskManager:
             return "aggressive_exit"
 
         # 4. Trailing stop: was up 15%+, dropped 10% from peak
-        if position.peak_price > 0 and position.entry_price > 0:
+        if (getattr(self.config, "trailing_stop_enabled", True)
+                and position.peak_price > 0 and position.entry_price > 0):
             if position.side == "buy":
                 peak_gain = (position.peak_price - position.entry_price) / risk_basis
                 drop_from_peak = (position.peak_price - current_price) / risk_basis

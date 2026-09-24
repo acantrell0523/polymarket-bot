@@ -57,6 +57,7 @@ class MarketDataClient:
         if self.shared_dir:
             os.makedirs(os.path.join(self.shared_dir, "books"), exist_ok=True)
         self.shared_list_ttl = 90.0
+        self.shared_universe_ttl = 240.0   # event universe; prices come from books
         self.shared_book_ttl = 8.0
         self.book_feed = None   # attached by the trading loop when the websocket feed is on
         # Every slug in the latest raw active-market list, and whether that
@@ -164,25 +165,134 @@ class MarketDataClient:
             return None
 
     def get_active_markets(self, page_size: int = 500, max_markets: int = 40000) -> List[Dict]:
-        """Fetch ALL active markets from Polymarket US API, filtered by time window.
+        """Tradeable game markets for the allowed leagues, filtered by time window.
 
-        PAGINATED: the gateway lists thousands of active markets (measured
-        live 2026-07-11: 6,000+, with WNBA game markets first appearing at
-        offset ~2,500 and MLB at ~3,500). A single limit=500 request never
-        sees a single tradeable game, so we page with limit+offset until a
-        short page or the max_markets safety cap.
-
-        Failure semantics: if the FIRST page fails we return [] (degraded
-        mode handles it); if a later page fails we keep what we have and log,
-        so a mid-scan blip degrades coverage instead of blanking the scan.
+        Universe source, in order:
+          1. /v1/events filtered by league tag and start time (games started
+             up to 4h ago through filters.sports_window_hours ahead), with
+             each game's markets embedded. Complete for those leagues and a
+             handful of requests, versus paging 45,000+ active markets: the
+             old 40,000 cap cut off part of Saturday's college slate.
+          2. Fallback: page through /v1/markets (legacy path) when the events
+             call fails or no league allowlist is configured.
 
         Sports markets (with gameStartTime):
           - Upcoming: included if game starts within 24 hours
           - Live: included if game started up to 4 hours ago (currently in progress)
           - Stale: excluded if game started more than 4 hours ago (probably over)
-        Non-sports markets: included if endDate is within 14 days.
-        Both types (upcoming only): excluded if resolving in under min_hours_to_expiry.
+        Non-sports markets: excluded when a league allowlist is set; otherwise
+        included if endDate is within 14 days.
         """
+        allowed = self.allowed_leagues()
+        markets = self._event_markets(allowed) if allowed else None
+        if markets is None:
+            markets = self._paginated_markets(page_size, max_markets)
+            if markets is None:
+                return []
+        return self._filter_markets(markets, allowed)
+
+    def allowed_leagues(self) -> Optional[set]:
+        """filters.leagues as a set ("nfl,cfb,nhl"), or None for every league."""
+        raw = getattr(self.filters, "leagues", "") or ""
+        if isinstance(raw, (list, tuple, set)):
+            codes = {str(x).strip().lower() for x in raw}
+        else:
+            codes = {x.strip().lower() for x in str(raw).split(",")}
+        codes.discard("")
+        return codes or None
+
+    @staticmethod
+    def _slim_market(m: Dict, event: Dict) -> Optional[Dict]:
+        """Keep only full-game moneyline/spread/total markets, trimmed.
+
+        Event payloads embed every prop, half and quarter market (a Saturday
+        college page is ~57 MB); the scanner needs a few fields of the
+        game-level ones.
+        """
+        slug = str(m.get("slug", ""))
+        if not slug or m.get("closed") or m.get("active") is False:
+            return None
+        parts = slug.split("-")
+        family = parts[0]
+        if family == "aec":
+            if len(parts) != 7:
+                return None
+        elif family == "atc":
+            if len(parts) != 8:
+                return None
+        elif family in ("asc", "tsc"):
+            if parse_line_slug(slug) is None:
+                return None
+        else:
+            return None
+        sides = []
+        for side in m.get("marketSides") or []:
+            team = side.get("team") or {}
+            sides.append({
+                "identifier": side.get("identifier"), "long": side.get("long"),
+                "price": side.get("price"), "description": side.get("description"),
+                "team": ({"abbreviation": team.get("abbreviation"), "name": team.get("name")}
+                         if team else None),
+            })
+        keep = {k: m.get(k) for k in (
+            "id", "slug", "question", "gameStartTime", "endDate", "active", "closed",
+            "status", "outcomePrices", "outcomes", "sportsMarketType",
+            "bestBidQuote", "bestAskQuote", "volume", "liquidity", "category")}
+        keep["marketSides"] = sides
+        if not keep.get("gameStartTime"):
+            keep["gameStartTime"] = event.get("startTime")
+        return keep
+
+    def _event_markets(self, leagues: set) -> Optional[List[Dict]]:
+        """Game-level markets for `leagues` via /v1/events (shared-cached).
+
+        Returns None on any request failure so the caller falls back to
+        pagination rather than silently scanning a partial universe.
+        """
+        key = "universe_" + "-".join(sorted(leagues)) + ".json"
+        cached = self._shared_read(key, self.shared_universe_ttl)
+        if cached is not None:
+            self.active_slugs = {m.get("slug") for m in cached if m.get("slug")}
+            self.active_slugs_complete = True
+            return cached
+        now = datetime.now(timezone.utc)
+        window = getattr(self.filters, "sports_window_hours", 24.0)
+        start_min = (now - timedelta(hours=4)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        start_max = (now + timedelta(hours=window)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        out: List[Dict] = []
+        events_seen = 0
+        for tag in sorted(leagues):
+            offset = 0
+            while offset < 3000:
+                data = self._get(f"{self.us_api_url}/v1/events", {
+                    "active": "true", "closed": "false", "tagSlug": tag,
+                    "startTimeMin": start_min, "startTimeMax": start_max,
+                    "limit": 100, "offset": offset,
+                })
+                if not isinstance(data, dict):
+                    if self.logger:
+                        self.logger.warning("event_universe_failed", {"tag": tag, "offset": offset})
+                    return None
+                events = data.get("events", []) or []
+                events_seen += len(events)
+                for event in events:
+                    for m in event.get("markets") or []:
+                        slim = self._slim_market(m, event)
+                        if slim:
+                            out.append(slim)
+                if len(events) < 100:
+                    break
+                offset += 100
+        self._shared_write(key, out)
+        self.active_slugs = {m.get("slug") for m in out if m.get("slug")}
+        self.active_slugs_complete = True
+        if self.logger:
+            self.logger.info("event_universe_fetched", {
+                "leagues": sorted(leagues), "events": events_seen, "markets": len(out)})
+        return out
+
+    def _paginated_markets(self, page_size: int, max_markets: int) -> Optional[List[Dict]]:
+        """Legacy universe: page through every active market (capped)."""
         url = f"{self.us_api_url}/v1/markets"
         markets: List[Dict] = []
         offset = 0
@@ -206,7 +316,7 @@ class MarketDataClient:
                 page = data
             else:
                 if offset == 0:
-                    return []  # total failure — nothing to scan
+                    return None  # total failure — nothing to scan
                 if self.logger:
                     self.logger.warning("market_pagination_partial_failure", {
                         "offset": offset, "markets_so_far": len(markets),
@@ -231,7 +341,10 @@ class MarketDataClient:
                 })
         if self.logger:
             self.logger.info("markets_paginated", {"pages": pages, "raw_markets": len(markets)})
+        return markets
 
+    def _filter_markets(self, markets: List[Dict], allowed: Optional[set] = None) -> List[Dict]:
+        """Time window, market family, league and price-band filters."""
         now = datetime.now(timezone.utc)
         min_expiry = now + timedelta(hours=self.filters.min_hours_to_expiry)
         # Windows are config-driven (filters.sports_window_hours /
@@ -247,6 +360,7 @@ class MarketDataClient:
         live_count = 0
         non_moneyline = 0
         unregistered = 0
+        league_excluded = 0
         line_out_of_band = 0
         line_candidates = []  # (parsed, token0 price, market)
         for m in markets:
@@ -270,6 +384,9 @@ class MarketDataClient:
                     parsed = parse_line_slug(slug)
                     if not parsed or parsed["league"] not in SUPPORTED_LEAGUES:
                         non_moneyline += 1
+                        continue
+                    if allowed and parsed["league"] not in allowed:
+                        league_excluded += 1
                         continue
                     p0 = self._token0_price(m)
                     if p0 is None or not (LINE_MIN_PRICE <= p0 <= LINE_MAX_PRICE):
@@ -297,6 +414,9 @@ class MarketDataClient:
                 if len(parts) < 2 or parts[1] not in LEAGUES:
                     unregistered += 1
                     continue
+                if allowed and parts[1] not in allowed:
+                    league_excluded += 1
+                    continue
                 # Full-game slug only: aec-{lg}-{away}-{home}-{y}-{m}-{d} is
                 # 7 parts (atc- adds the outcome: 8). Period variants such as
                 # aec-nfl-car-atl-2026-09-20-1h are separate markets.
@@ -318,7 +438,10 @@ class MarketDataClient:
                     if game_start < min_expiry or game_start > sports_cutoff:
                         continue
             else:
-                # Non-sports market: filter by endDate
+                # Non-sports market: out of scope under a league allowlist
+                if allowed:
+                    league_excluded += 1
+                    continue
                 ref_time = self._parse_datetime(end_date_str)
                 if ref_time is None:
                     continue
@@ -351,6 +474,7 @@ class MarketDataClient:
                 "live_games": live_count,
                 "dropped_non_moneyline": non_moneyline,
                 "dropped_unregistered_league": unregistered,
+                "dropped_league_not_allowed": league_excluded,
                 "dropped_line_out_of_band": line_out_of_band,
                 "line_markets_kept": line_kept,
                 "sports_window_hours": sports_window_hours,
@@ -435,50 +559,90 @@ class MarketDataClient:
                     pass
         return None
 
-    def get_us_order_book(self, slug: str) -> OrderBook:
-        """Fetch order book from Polymarket US API."""
-        url = f"{self.us_api_url}/v1/markets/{slug}/book"
-        cache_name = os.path.join("books", f"{slug}.json")
-        # 1. streamed book (websocket feed, zero REST calls) — same payload
-        #    shape as REST, so the parser below handles both
-        data = None
+    @staticmethod
+    def _book_mid(book: OrderBook) -> Optional[float]:
+        bid, ask = book.best_bid, book.best_ask
+        if bid is None or ask is None or not (0 < bid <= ask < 1):
+            return None
+        return (bid + ask) / 2
+
+    @staticmethod
+    def _quote_mid(market: Dict) -> Optional[float]:
+        """Midpoint of the list payload's bestBidQuote/bestAskQuote, if sane."""
+        def val(q):
+            if isinstance(q, dict):
+                q = q.get("value")
+            try:
+                return float(q)
+            except (TypeError, ValueError):
+                return None
+        bid, ask = val(market.get("bestBidQuote")), val(market.get("bestAskQuote"))
+        if bid is None or ask is None or not (0 < bid <= ask < 1):
+            return None
+        return (bid + ask) / 2
+
+    def get_cached_book(self, slug: str) -> Optional[OrderBook]:
+        """A fresh book with ZERO REST calls: websocket feed, then shared cache."""
         feed = getattr(self, "book_feed", None)
         if feed is not None:
             payload = feed.get_book(slug)
             if payload is not None:
-                data = {"marketData": payload}
                 self.books_from_feed = getattr(self, "books_from_feed", 0) + 1
-        # 2. shared cache (a sibling process or the feed leader wrote it)
-        if data is None:
-            data = self._shared_read(cache_name, self.shared_book_ttl)
-        # 3. REST, rate-limited
-        if data is None:
-            data = self._get(url)
-            if data:
-                self._shared_write(cache_name, data)
+                return self._parse_us_book({"marketData": payload})
+        name = os.path.join("books", f"{slug}.json")
+        data = self._shared_read(name, self.shared_book_ttl)
+        if data is None and self._leader_streams(slug):
+            # The leader's websocket is alive and subscribed to this market:
+            # its mirrored book is current however long the market was quiet.
+            data = self._shared_read(name, 6 * 3600)
+        if data:
+            return self._parse_us_book(data)
+        return None
 
+    def _leader_streams(self, slug: str) -> bool:
+        """True when the feed leader reports a live subscription to `slug`."""
+        if not self.shared_dir:
+            return False
+        now = time.time()
+        memo = getattr(self, "_feed_status_memo", None)
+        if memo is None or now - memo[0] > 2.0:
+            status = self._shared_read("feed_status.json", 15.0) or {}
+            memo = self._feed_status_memo = (now, status, set(status.get("slugs") or []))
+        _, status, slugs = memo
+        return bool(status.get("alive")) and slug in slugs
+
+    def get_us_order_book(self, slug: str) -> OrderBook:
+        """Order book: streamed/cached copy first, REST (rate-limited) last."""
+        cached = self.get_cached_book(slug)
+        if cached is not None:
+            return cached
+        data = self._get(f"{self.us_api_url}/v1/markets/{slug}/book")
+        if data:
+            self._shared_write(os.path.join("books", f"{slug}.json"), data)
+        return self._parse_us_book(data)
+
+    @staticmethod
+    def _parse_us_book(data) -> OrderBook:
         if not data or not isinstance(data, dict):
             return OrderBook()
-
         market_data = data.get("marketData", data)
 
-        bids = []
-        for b in market_data.get("bids", []):
-            px = b.get("px", {})
-            price = float(px.get("value", 0)) if isinstance(px, dict) else float(px or 0)
-            qty = float(b.get("qty", 0))
-            bids.append(OrderBookLevel(price=price, size=qty))
+        def levels(rows):
+            out = []
+            for row in rows or []:
+                px = row.get("px", {})
+                try:
+                    price = float(px.get("value", 0)) if isinstance(px, dict) else float(px or 0)
+                    qty = float(row.get("qty", 0))
+                except (TypeError, ValueError):
+                    continue
+                out.append(OrderBookLevel(price=price, size=qty))
+            return out
 
-        asks = []
-        for a in market_data.get("offers", []):
-            px = a.get("px", {})
-            price = float(px.get("value", 0)) if isinstance(px, dict) else float(px or 0)
-            qty = float(a.get("qty", 0))
-            asks.append(OrderBookLevel(price=price, size=qty))
-
+        bids = levels(market_data.get("bids"))
+        asks = levels(market_data.get("offers"))
         bids.sort(key=lambda x: x.price, reverse=True)
         asks.sort(key=lambda x: x.price)
-
         return OrderBook(bids=bids, asks=asks)
 
     def get_order_book(self, token_id: str) -> OrderBook:
@@ -549,10 +713,15 @@ class MarketDataClient:
     def build_snapshot(self, market: Dict, fetch_book: bool = True) -> Optional[MarketSnapshot]:
         """Build a MarketSnapshot from a Polymarket US market dict.
 
-        fetch_book=False builds a LIGHT snapshot from the list price alone
-        (empty order book, zero HTTP calls). The trading loop pre-screens
-        every market this way and fetches real books only for the few that
-        show edge, because the gateway allows ~0.5 book calls per second.
+        fetch_book=False builds a LIGHT snapshot with ZERO REST calls: the
+        streamed/shared-cache book when one is fresh, otherwise an empty book.
+        The trading loop pre-screens every market this way and fetches real
+        books only for the few that show edge, because the gateway allows
+        ~0.5 book calls per second.
+
+        Price: the book midpoint when a two-sided book is available (the
+        list price can be minutes old during a live game), else the list's
+        best bid/ask quotes, else the list price.
         """
         try:
             market_id = str(market.get("id", ""))
@@ -574,8 +743,18 @@ class MarketDataClient:
             if market_sides:
                 token_id = market_sides[0].get("identifier", "")
 
-            # Fetch order book from US API (or an empty book for a light snapshot)
-            order_book = self.get_us_order_book(slug) if fetch_book else OrderBook()
+            # Order book: full snapshot may hit REST; light snapshot never does
+            if fetch_book:
+                order_book = self.get_us_order_book(slug)
+            else:
+                order_book = self.get_cached_book(slug) or OrderBook()
+            fresh_mid = self._book_mid(order_book)
+            if fresh_mid is not None:
+                price = fresh_mid
+            else:
+                quote_mid = self._quote_mid(market)
+                if quote_mid is not None:
+                    price = quote_mid
 
             # No price history needed — signals use order book and external odds
             price_history = [price]

@@ -83,6 +83,41 @@ def line_movement_signal(snapshot: MarketSnapshot, config: SignalConfig) -> Sign
     )
 
 
+def _live_odds_value(snapshot: MarketSnapshot, odds_cache) -> Signal:
+    """odds_value for an in-progress game, from >=2 fresh in-play books."""
+    live = odds_cache.get_live_probability_for_slug(snapshot.slug)
+    if not live:
+        return Signal(name="odds_value", value=0.5, confidence=0.0, direction="neutral",
+                      metadata={"reason": "no_live_book_quotes", "live": True})
+    num_books = int(live.get("num_books", 0))
+    prob = float(live["prob"])
+    if num_books < 2:
+        return Signal(name="odds_value", value=0.5, confidence=0.0, direction="neutral",
+                      metadata={"reason": f"only_{num_books}_live_books", "live": True,
+                                "consensus_prob": prob, "num_books": num_books})
+    sharp = live.get("sharp_prob")
+    if sharp is not None and abs(sharp - prob) >= 0.03:
+        prob = 0.6 * sharp + 0.4 * prob      # same sharp blend as pregame
+    edge = prob - snapshot.price
+    if abs(edge) > 0.07 and num_books < 3:
+        return Signal(name="odds_value", value=0.5, confidence=0.0, direction="neutral",
+                      metadata={"reason": f"edge_{abs(edge)*100:.0f}pct_needs_3_books_have_{num_books}",
+                                "consensus_prob": prob, "edge": edge, "num_books": num_books,
+                                "live": True})
+    confidence = min(num_books / 5, 1.0) * min(abs(edge) * 5, 1.0)
+    confidence = max(0.1, min(confidence, 1.0))
+    direction = "bullish" if edge > 0.02 else "bearish" if edge < -0.02 else "neutral"
+    return Signal(
+        name="odds_value", value=float(max(0.01, min(0.99, prob))),
+        confidence=float(confidence), direction=direction,
+        metadata={"consensus_prob": float(prob), "polymarket_price": float(snapshot.price),
+                  "edge": float(edge), "num_books": num_books,
+                  "sharp_consensus": float(sharp or 0.0),
+                  "books_used": ",".join(live.get("books", [])), "live": True,
+                  "book_spread": float(live.get("spread", 0.0))},
+    )
+
+
 def odds_value_signal(
     snapshot: MarketSnapshot,
     config: SignalConfig,
@@ -98,6 +133,13 @@ def odds_value_signal(
     if not odds_cache or not odds_cache.enabled:
         return Signal(name="odds_value", value=0.5, confidence=0.0, direction="neutral",
                       metadata={"reason": "no_odds_api_key"})
+
+    # In-game with live_primary == "books": price the market off LIVE
+    # sportsbook quotes only. A pregame line during a game is stale.
+    if (getattr(snapshot, "is_live", False)
+            and getattr(config, "live_primary", "espn") == "books"
+            and hasattr(odds_cache, "get_live_probability_for_slug")):
+        return _live_odds_value(snapshot, odds_cache)
 
     result = odds_cache.get_probability_for_slug(snapshot.slug)
     if result is None:

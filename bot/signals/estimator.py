@@ -238,10 +238,15 @@ class ProbabilityEstimator:
             line = next((s for s in signals if s.name == "spread_total"), None)
             if line is not None:
                 return line
-            live = next((s for s in signals
-                         if s.name == "live_win_prob" and s.confidence > 0), None)
-            if live is not None:
-                return live
+            # live_primary "espn": ESPN's in-game model outranks the books
+            # (pre-2026-09-23 behavior, kept as the espn_live control arm).
+            # "books": odds_value — which in-game prices off live book quotes
+            # only — stays primary and ESPN merely supports.
+            if getattr(self.config, "live_primary", "espn") == "espn":
+                live = next((s for s in signals
+                             if s.name == "live_win_prob" and s.confidence > 0), None)
+                if live is not None:
+                    return live
 
         primary_name = {
             "sports": "odds_value",
@@ -344,10 +349,19 @@ class ProbabilityEstimator:
         return self.estimate_probability(signals, weights)
 
     def _effective_weights(self, market_type: str) -> Dict[str, float]:
-        """Hardcoded defaults overlaid with config.signals.weights values."""
+        """Hardcoded defaults overlaid with config.signals.weights values.
+
+        With live_primary "books", ESPN's live model is support only: its
+        weight is capped at signals.espn_support_weight (default 0.15).
+        """
         default_weights = WEIGHTS.get(market_type, WEIGHTS["other"])
         config_weights = getattr(self.config, "weights", {}).get(market_type, {})
-        return {**default_weights, **config_weights}
+        weights = {**default_weights, **config_weights}
+        if (market_type == "sports" and "live_win_prob" in weights
+                and getattr(self.config, "live_primary", "espn") == "books"):
+            cap = float(getattr(self.config, "espn_support_weight", 0.15))
+            weights["live_win_prob"] = min(weights["live_win_prob"], cap)
+        return weights
 
     def estimate_for_snapshot(self, snapshot: MarketSnapshot) -> Optional[float]:
         """Re-estimate probability for an existing position's market.

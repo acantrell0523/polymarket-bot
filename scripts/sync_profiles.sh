@@ -4,7 +4,7 @@
 # in each profile's launchd plist as POLYBOT_* environment overrides.
 set -e
 MAIN="$HOME/Projects/polymarket-bot"
-for name in aggressive ride balanced; do
+for name in $("$MAIN/venv/bin/python" "$MAIN/scripts/profiles.py" --names); do
   dst="$HOME/Projects/polybot-profiles/$name"
   mkdir -p "$dst/data" "$dst/reports"
   rsync -a --delete \

@@ -142,6 +142,13 @@ def init_db():
             id INTEGER PRIMARY KEY CHECK (id = 1),
             state_json TEXT NOT NULL
         );
+
+        -- Markets the bot may not re-enter (e.g. after a stop loss there)
+        CREATE TABLE IF NOT EXISTS reentry_blocks (
+            slug TEXT PRIMARY KEY,
+            reason TEXT,
+            blocked_at TEXT
+        );
     """)
     # Preserve old rows explicitly as legacy, gross-P&L observations.
     columns = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
@@ -595,3 +602,24 @@ def get_exit_log(limit: int = 100) -> List[Dict[str, Any]]:
 # Initialize on import
 init_db()
 init_exit_log_table()
+
+
+def block_reentry(slug: str, reason: str) -> None:
+    """Persist a no-re-entry rule for `slug` (survives restarts)."""
+    conn = _get_conn()
+    try:
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO reentry_blocks(slug, reason, blocked_at) VALUES (?,?,?)",
+                         (slug, reason, datetime.now(timezone.utc).isoformat()))
+    finally:
+        conn.close()
+
+
+def load_reentry_blocks() -> set:
+    conn = _get_conn()
+    try:
+        return {row[0] for row in conn.execute("SELECT slug FROM reentry_blocks")}
+    except sqlite3.OperationalError:
+        return set()
+    finally:
+        conn.close()

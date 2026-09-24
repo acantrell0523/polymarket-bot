@@ -150,10 +150,21 @@ class LinesCache:
 
     # -- fetch ---------------------------------------------------------------
 
+    LIVE_TTL = 20.0   # seconds between refreshes while any quote is in-play
+
     def _get(self, url: str, params: Optional[dict] = None,
              browser_ua: bool = True) -> Optional[object]:
         # Pinnacle/FanDuel want a browser UA; ESPN's CDN returns 403 to the
         # bare "Mozilla/5.0" string and 200 to the default client UA.
+        # Shared across profiles and between LinesCache and the moneyline
+        # book clients (same URLs), at this refresh's max age.
+        from bot.http_cache import get_json
+        headers = {"User-Agent": "Mozilla/5.0"} if browser_ua else {}
+        return get_json(url, params=params, headers=headers,
+                        max_age=getattr(self, "_fetch_age", self.cache_ttl))
+
+    def _get_uncached(self, url: str, params: Optional[dict] = None,
+                      browser_ua: bool = True) -> Optional[object]:
         headers = {"User-Agent": "Mozilla/5.0"} if browser_ua else {}
         try:
             resp = requests.get(url, params=params, headers=headers, timeout=15)
@@ -166,8 +177,13 @@ class LinesCache:
     def _league_games(self, league: str) -> Dict[str, Dict[str, List[dict]]]:
         now = time.time()
         cached = self._games.get(league)
-        if cached and now - cached[0] < self.cache_ttl:
+        ttl = self.cache_ttl
+        if cached and any(q.get("live") for g in cached[1].values()
+                          for kind in ("spread", "total") for q in g[kind]):
+            ttl = self.LIVE_TTL   # in-play lines move every play
+        if cached and now - cached[0] < ttl:
             return cached[1]
+        self._fetch_age = ttl
         games: Dict[str, Dict[str, List[dict]]] = {}
         sport_key = LEAGUES.get(league, {}).get("odds_api_key", "")
         for fetch in (self._pinnacle, self._fanduel, self._espn, self._actionnetwork):
@@ -312,7 +328,7 @@ class LinesCache:
         from bot.signals.book_scrapers import ActionNetworkClient
         if not hasattr(self, "_an"):
             self._an = ActionNetworkClient(cache_ttl=self.cache_ttl)
-        yield from self._an.line_quotes(sport_key)
+        yield from self._an.line_quotes(sport_key, max_age=getattr(self, "_fetch_age", None))
 
     # -- pricing -------------------------------------------------------------
 

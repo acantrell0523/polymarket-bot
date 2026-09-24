@@ -29,8 +29,10 @@ import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
-MAX_AGE = 15.0        # seconds; older than this the book is stale, fall back to REST
+MAX_AGE = 15.0        # seconds; per-book age limit when the connection is NOT known alive
+ALIVE_WINDOW = 20.0   # a message (any, incl. heartbeats) within this = connection alive
 MIRROR_MIN_GAP = 1.0  # seconds between shared-cache writes per slug
+STATUS_FILE = "feed_status.json"
 
 
 class BookFeed:
@@ -49,6 +51,8 @@ class BookFeed:
         self.disabled_reason = "" if self.enabled else "no_api_key"
         self._last_mirror: Dict[str, float] = {}
         self.messages = 0
+        self.last_msg_at = 0.0
+        self._subscribed: set = set()
 
     # -- public ---------------------------------------------------------------
 
@@ -68,12 +72,40 @@ class BookFeed:
                 self._slugs = new
                 self._slugs_version += 1
 
+    def alive(self) -> bool:
+        """Connected and hearing from the server (heartbeats count)."""
+        return self.connected and time.time() - self.last_msg_at <= ALIVE_WINDOW
+
     def get_book(self, slug: str, max_age: float = MAX_AGE) -> Optional[dict]:
-        """The latest streamed book payload for a slug, or None if absent/stale."""
+        """The latest streamed book for a subscribed slug, or None.
+
+        The server pushes the full book on every change, so while the
+        connection is alive the last book IS the current book no matter how
+        long the market has been quiet (a per-book age limit sent every quiet
+        pregame market to the REST budget). Without a live connection, a
+        book older than max_age is stale.
+        """
         entry = self.books.get(slug)
-        if not entry or time.time() - entry[0] > max_age:
+        if not entry:
+            return None
+        if self.alive() and slug in self._subscribed:
+            return entry[1]
+        if time.time() - entry[0] > max_age:
             return None
         return entry[1]
+
+    def write_status(self) -> None:
+        """Leader heartbeat for sibling processes reading mirrored books."""
+        if not self.shared_dir:
+            return
+        try:
+            fd, tmp = tempfile.mkstemp(dir=self.shared_dir, prefix=".fs-")
+            with os.fdopen(fd, "w") as fh:
+                json.dump({"t": time.time(), "alive": self.alive(),
+                           "slugs": sorted(self._subscribed)}, fh)
+            os.replace(tmp, os.path.join(self.shared_dir, STATUS_FILE))
+        except OSError:
+            pass
 
     def status(self) -> dict:
         return {"enabled": self.enabled, "connected": self.connected, "subscribed": len(self._slugs),
@@ -124,6 +156,7 @@ class BookFeed:
             ws = MarketsWebSocket(key_id=self.key_id, secret_key=self.secret_key)
             closed = asyncio.Event()
             ws.on("market_data", self.handle_market_data)
+            ws.on("message", lambda *a: setattr(self, "last_msg_at", time.time()))
             ws.on("close", lambda *a: closed.set())
             ws.on("error", lambda e, *a: self._log("warning", "book_feed_error", {"error": str(e)[:200]}))
             try:
@@ -157,12 +190,18 @@ class BookFeed:
                         request_id = f"books-{int(time.time())}-{version}"
                         await ws.subscribe_market_data(request_id, slugs)
                         subscribed_version = version
+                        # Books for markets no longer subscribed stop updating:
+                        # forget them so they can never be served as current.
+                        self._subscribed = set(slugs)
+                        for stale in [k for k in self.books if k not in self._subscribed]:
+                            self.books.pop(stale, None)
                         self._log("info", "book_feed_subscribed", {"markets": len(slugs)})
                     await asyncio.sleep(1.0)
             except Exception as e:
                 self._log("warning", "book_feed_loop_error", {"error": str(e)[:200]})
             finally:
                 self.connected = False
+                self._subscribed = set()
                 try:
                     await ws.close()
                 except Exception:
