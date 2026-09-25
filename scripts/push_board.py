@@ -1,12 +1,29 @@
 #!/usr/bin/env python3
-"""Push the live strategy scoreboard to the Vercel board every 30s (launchd).
+"""Push the live strategy scoreboard for https://polybot-board.vercel.app.
 
-Reads each profile's heartbeat.json (equity, open positions with marks) and
-trades.db (closed trades, decisions), plus the ESPN NFL scoreboard, and POSTs
-one JSON document to https://<board>/api/board. Config in ~/.polybot-board.env:
-    BOARD_URL=https://....vercel.app
-    BOARD_WRITE_KEY=...
+launchd com.polymarket.board runs this every 30 s. It builds one JSON
+document from each profile's heartbeat.json and trades.db plus the ESPN
+NFL/college scoreboards and writes two Upstash Redis keys:
+
+  polybot:board       the full document (~30-45 KB), rewritten only when its
+                      content changes, or every 10 minutes
+  polybot:board:live  timestamps, bot liveness and decision counters (~1 KB),
+                      rewritten every run
+
+The site's /api/board reads both with one MGET and overlays the live key, so
+the page stays 30 s fresh while overnight runs send ~1 KB instead of ~40 KB.
+The Redis database is shared with the FR triage board (upstash-kv-coffee-clock,
+free plan: 10 GB bandwidth and 500K commands a month).
+
+    python scripts/push_board.py            # push to Redis (30-second job)
+    python scripts/push_board.py --deploy   # also redeploy the site (page edits)
+    python scripts/push_board.py --print    # dump the document, push nothing
+
+Config in ~/.polybot-board.env: REDIS_REST_URL, REDIS_REST_TOKEN.
+Moved off Vercel Blob on 2026-09-25: Hobby Blob allows 2,000 put/list
+operations a month and locks the store for 30 days when exceeded.
 """
+import hashlib
 import json
 import os
 import plistlib
@@ -141,7 +158,28 @@ def profile(name, root):
     return p
 
 
+GAMES_CACHE = f"{HOME}/Projects/polymarket-bot/data/shared/board_games.json"
+
+
 def games():
+    """ESPN NFL + college scoreboards, cached 90 s (the college payload is ~1 MB)."""
+    try:
+        if time.time() - os.path.getmtime(GAMES_CACHE) <= 90:
+            with open(GAMES_CACHE) as fh:
+                return json.load(fh)
+    except (OSError, ValueError):
+        pass
+    out = _fetch_games()
+    if out:
+        try:
+            with open(GAMES_CACHE, "w") as fh:
+                json.dump(out, fh)
+        except OSError:
+            pass
+    return out
+
+
+def _fetch_games():
     out = []
     for url in ("https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
                 "https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?groups=80&limit=400"):
@@ -164,27 +202,72 @@ def games():
     return out
 
 
+PUSH_STATE = f"{HOME}/Projects/polymarket-bot/data/shared/board_push_state.json"
+# Fields that change every bot cycle without anything happening on the board.
+LIVE_FIELDS = ("alive", "hb_age_s", "cycle", "decisions", "executed", "rejections")
+FULL_EVERY_S = 600
+
+
+def redis(env: dict, command: list):
+    url, token = env.get("REDIS_REST_URL"), env.get("REDIS_REST_TOKEN")
+    if not url or not token:
+        raise RuntimeError("REDIS_REST_URL / REDIS_REST_TOKEN missing from ~/.polybot-board.env")
+    req = urllib.request.Request(url, data=json.dumps(command).encode(), method="POST", headers={
+        "Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.load(r).get("result")
+
+
+def push(doc: dict, env: dict) -> str:
+    live = {"updated_at": doc["updated_at"],
+            "p": {p["name"]: {k: p.get(k) for k in LIVE_FIELDS} for p in doc["profiles"]}}
+    stable = {"games": doc["games"],
+              "profiles": [{k: v for k, v in p.items() if k not in LIVE_FIELDS} for p in doc["profiles"]]}
+    digest = hashlib.sha1(json.dumps(stable, sort_keys=True).encode()).hexdigest()
+    try:
+        with open(PUSH_STATE) as fh:
+            last = json.load(fh)
+    except (OSError, ValueError):
+        last = {}
+    if last.get("digest") == digest and time.time() - last.get("full_at", 0) < FULL_EVERY_S:
+        redis(env, ["SET", "polybot:board:live", json.dumps(live)])
+        return ""
+    body = json.dumps(doc)
+    redis(env, ["MSET", "polybot:board", body, "polybot:board:live", json.dumps(live)])
+    tmp = PUSH_STATE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump({"digest": digest, "full_at": time.time()}, fh)
+    os.replace(tmp, PUSH_STATE)
+    return f"full {len(body) // 1024} KB"
+
+
 def main():
-    """Write data.json into the board site and redeploy it (static hosting,
-    no external store). Vercel Hobby allows 100 deploys/day, so launchd runs
-    this every 20 minutes. --print dumps the document instead."""
     import subprocess
     site = f"{HOME}/Projects/polybot-board/site"
+    env = load_env()
     doc = {"updated_at": datetime.now(timezone.utc).isoformat(),
            "profiles": [profile(n, r) for n, r in PROFILES.items()],
            "games": games()}
     if "--print" in sys.argv:
         print(json.dumps(doc, indent=1)[:3000])
         return
+    # static fallback, served only if the live store is unreachable
     tmp = f"{site}/data.json.tmp"
     with open(tmp, "w") as fh:
         json.dump(doc, fh)
     os.replace(tmp, f"{site}/data.json")
-    env = dict(os.environ, PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
-    r = subprocess.run(["vercel", "deploy", "--prod", "--yes"], cwd=site, env=env,
-                       capture_output=True, text=True, timeout=240)
-    print(time.strftime("%H:%M:%S"), "deploy", "ok" if r.returncode == 0 else "FAILED",
-          (r.stdout + r.stderr).strip().splitlines()[-1][:120] if (r.stdout + r.stderr).strip() else "")
+    try:
+        line = push(doc, env)
+    except Exception as e:  # one line per failed run, not a traceback every 30 s
+        line = f"redis push FAILED: {type(e).__name__}: {str(e)[:120]}"
+    if "--deploy" in sys.argv:
+        penv = dict(os.environ, PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+        r = subprocess.run(["vercel", "deploy", "--prod", "--yes"], cwd=site, env=penv,
+                           capture_output=True, text=True, timeout=240)
+        tail = (r.stdout + r.stderr).strip().splitlines()
+        line += f" | deploy {'ok' if r.returncode == 0 else 'FAILED'} {tail[-1][:80] if tail else ''}"
+    if line:  # quiet when only the live key moved
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}", flush=True)
 
 
 if __name__ == "__main__":
