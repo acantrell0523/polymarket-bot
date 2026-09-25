@@ -83,6 +83,12 @@ class RiskManager:
         if allow_quote_resolution and (current_price <= 0.001 or current_price >= 0.999):
             return "resolved"
 
+        # Hold-to-settlement profiles never exit on price: no stop-loss,
+        # take-profit, trailing or aggressive exit. The trading loop closes
+        # the position at the exchange's settlement value.
+        if getattr(self.config, "hold_to_settlement", False):
+            return None
+
         # 2. Stop-loss (25%) — always exit immediately
         loss_pct = -pnl_per_unit / risk_basis if risk_basis > 0 else 0
         if loss_pct >= self.config.stop_loss_threshold:

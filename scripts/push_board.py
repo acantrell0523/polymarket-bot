@@ -41,12 +41,15 @@ PROFILES = {name: _root(name) for name in _PROFILES}
 # (config section, field) shown on the board; values from each profile's
 # plist overrides, else the configs/config.yaml default below.
 KNOBS = [("TRADING", k) for k in (
-    "MIN_EDGE_THRESHOLD", "MIN_NET_EDGE", "REQUIRE_ROUND_TRIP_EDGE", "KELLY_FRACTION",
+    "ENTRY_WINDOW", "HOLD_TO_SETTLEMENT", "PREGAME_MAX_HOURS", "MARKET_KINDS",
+    "MAX_PORTFOLIO_EXPOSURE_USD", "MIN_EDGE_THRESHOLD", "MIN_NET_EDGE", "REQUIRE_ROUND_TRIP_EDGE", "KELLY_FRACTION",
     "MAX_POSITION_SIZE_USD", "MAX_OPEN_POSITIONS", "MAX_DAILY_TRADES", "MIN_PRICE", "MAX_PRICE",
     "REENTRY_AFTER_STOP", "AGGRESSIVE_EXIT_PCT", "TRAILING_STOP_ENABLED",
     "TRAILING_STOP_ACTIVATION_PCT", "TRAILING_STOP_PCT", "TAKE_PROFIT_THRESHOLD",
     "STOP_LOSS_THRESHOLD", "LET_IT_RIDE_THRESHOLD", "DAILY_LOSS_LIMIT_USD")] + [("SIGNALS", "LIVE_PRIMARY")]
-DEFAULTS = {"MIN_EDGE_THRESHOLD": "0.05", "MIN_NET_EDGE": "0.02", "REQUIRE_ROUND_TRIP_EDGE": "true",
+DEFAULTS = {"ENTRY_WINDOW": "any", "HOLD_TO_SETTLEMENT": "false", "PREGAME_MAX_HOURS": "0",
+            "MARKET_KINDS": "ml,spread,total", "MAX_PORTFOLIO_EXPOSURE_USD": "500",
+            "MIN_EDGE_THRESHOLD": "0.05", "MIN_NET_EDGE": "0.02", "REQUIRE_ROUND_TRIP_EDGE": "true",
             "KELLY_FRACTION": "0.25", "MAX_POSITION_SIZE_USD": "50", "MAX_OPEN_POSITIONS": "8",
             "MAX_DAILY_TRADES": "15", "MIN_PRICE": "0.15", "MAX_PRICE": "0.85",
             "REENTRY_AFTER_STOP": "false", "AGGRESSIVE_EXIT_PCT": "0.30", "TRAILING_STOP_ENABLED": "true",
@@ -92,7 +95,8 @@ def profile(name, root):
             hb_v2 = h
         age = time.time() - h.get("timestamp", 0)
         p.update(hb_age_s=int(age), alive=age < 300, cycle=h.get("cycle"), cash=h.get("cash"),
-                 equity=h.get("equity"), positions=h.get("positions", []))
+                 equity=h.get("equity"), positions=h.get("positions", []),
+                 paused_until=h.get("entries_paused_until"))
     except Exception:
         pass
     db = f"{root}/data/trades.db"

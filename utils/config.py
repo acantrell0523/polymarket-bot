@@ -90,6 +90,21 @@ class TradingConfig:
     # False = never re-enter a market after a stop loss in it (re-entries
     # lost $404 over 78 trades in the first three days).
     reentry_after_stop: bool = True
+    # --- 2026-09-25 pregame / in-game split (defaults = prior behavior) ---
+    # Game states that may OPEN positions: "any", "pregame" (before the
+    # scheduled start only) or "live" (in-game only). 80 of the first 82
+    # v2 trades were in-game and lost to stale book quotes.
+    entry_window: str = "any"
+    # Pregame entries stop this many minutes before the scheduled start.
+    pregame_cutoff_minutes: float = 10.0
+    # Pregame entries only inside this many hours of the start (0 = anywhere
+    # in filters.sports_window_hours).
+    pregame_max_hours: float = 0.0
+    # Market families that may open positions: "ml", "spread", "total".
+    market_kinds: str = "ml,spread,total"
+    # True = the bot never exits (no stop, take-profit, trailing or
+    # aggressive exit); positions close only when the market settles.
+    hold_to_settlement: bool = False
 
 
 # Default per-market-type weights — must stay in sync with WEIGHTS in estimator.py
@@ -183,6 +198,10 @@ class FilterConfig:
     # Comma-separated league allowlist ("nfl,cfb,nhl"); empty = every
     # registered league. Also selects the /v1/events universe by league tag.
     leagues: str = ""
+    # "league:YYYY-MM-DD" pairs, comma-separated: that league's games
+    # starting before the date (US Eastern) are skipped. Keeps a preseason
+    # out while the regular season turns on by itself ("nhl:2026-09-29").
+    league_start_dates: str = ""
     include_categories: List[str] = field(default_factory=list)
     exclude_categories: List[str] = field(default_factory=list)
 

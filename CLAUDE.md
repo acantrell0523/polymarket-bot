@@ -4,6 +4,26 @@ This document is a comprehensive reference for AI assistants (and human develope
 
 ---
 
+## Latest Changes — 2026-09-25 (pregame hold-to-settlement profiles, pause and take-profit fixes)
+
+The first 40 hours on v2 ledgers lost money on every profile: 80 of 82 trades
+were in-game, and the side taken won 24 times against ~31 expected at the
+prices paid (Polymarket reprices before the 20-150 s old book quotes do). NHL
+preseason was $282 of the $401 lost. Three profiles now enter pregame only and
+hold to settlement; baseline stays the in-game arm. All four restarted on empty
+ledgers (baseline's old one is in `data/archive/2026-09-25-pre-pregame/`; the
+retired profiles are in `~/Projects/polybot-profiles/_retired/<name>-2026-09-25/`
+with their plists).
+
+| Area | Change |
+|------|--------|
+| **Daily-loss pause fix** | `data/pause_until` used to skip the whole cycle, so a paused profile stopped marking, exiting and SETTLING positions (ride held three finished games for a day). `_check_supervisor_flags` now returns True with `entries_paused_until` set: `process_markets` returns early and `_prescreen` keeps only held markets, while `check_positions` runs as usual. The kill switch still halts everything. The heartbeat carries `entries_paused_until` for the board. |
+| **Live take-profit fix** | `check_positions` tightened `take_profit_threshold` to `live_take_profit` (0.03) during live games for EVERY profile, so ride (take-profit off at -1.0) took two profits. It now tightens only a positive threshold, never under `hold_to_settlement`, and restores the configured value in a `finally` (body moved to `_check_open_positions`). |
+| **Entry gates** | `trading.entry_window` (`any` / `pregame` / `live`), `trading.pregame_cutoff_minutes` (10), `trading.pregame_max_hours` (0 = whole `sports_window_hours`), `trading.market_kinds` (`ml,spread,total`). Checked on the raw market in `_prescreen` (no book call for an ineligible market) and on the snapshot in `process_markets`. A market without a kickoff time fails closed. |
+| **Hold to settlement** | `trading.hold_to_settlement: true` → `RiskManager.check_position` returns None after the resolved check (no stop, take-profit, trailing, aggressive exit or let-it-ride). Held positions are marked from the feed/shared book cache or the universe list price, never REST `/book`, and close only through the batched settlement lookup at the settlement value with no exit fee. |
+| **NHL preseason** | `filters.league_start_dates: nhl:2026-09-29` drops NHL games starting before midnight US Eastern on Sep 29 (regular-season opener) in `_filter_markets`, for moneylines and lines. NHL turns back on by itself. |
+| **Profiles** | baseline (in-game arm, websocket leader, unchanged rules); pregame (entries up to 24 h out, stop 10 min before kickoff); pregame_late (last 3 h only); pregame_ml (moneylines only). The pregame trio shares `PREGAME` in `scripts/profiles.py`: `require_round_trip_edge false` (no exit costs), `filters.min_hours_to_expiry 0`, 20 open / 30 per day / $750 exposure / $300 daily loss, since holds last hours and a Saturday slate needs room. |
+
 ## Latest Changes — 2026-09-23 (paper v2, settlement, strategy review, event universe)
 
 A review of the first three days (167 closed paper trades across four

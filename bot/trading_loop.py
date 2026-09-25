@@ -285,12 +285,25 @@ class TradingBot:
 
         # Cached market list from last full scan
         self._cached_markets: List[Dict] = []
+        # Set by _check_supervisor_flags while a daily-loss pause is active:
+        # new entries are blocked, open positions are still managed.
+        self.entries_paused_until: Optional[datetime] = None
         self._last_full_scan = 0.0
 
     def _check_supervisor_flags(self) -> bool:
-        """Check if supervisor has halted or paused trading. Returns True if OK to trade."""
-        kill_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "kill_switch")
-        pause_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "pause_until")
+        """False = kill switch: skip the whole cycle.
+
+        A daily-loss pause (data/pause_until) returns True with
+        entries_paused_until set: the cycle still marks, exits and settles
+        open positions and only NEW entries are blocked. Until 2026-09-25 the
+        pause skipped the whole cycle, which left positions on finished games
+        unsettled for a day.
+        """
+        data_dir = (getattr(self, "_data_dir", None)
+                    or os.path.join(os.path.dirname(os.path.dirname(__file__)), "data"))
+        kill_path = os.path.join(data_dir, "kill_switch")
+        pause_path = os.path.join(data_dir, "pause_until")
+        self.entries_paused_until = None
 
         if os.path.exists(kill_path):
             self.logger.warning("trading_halted_by_kill_switch", {})
@@ -301,13 +314,78 @@ class TradingBot:
                 with open(pause_path, "r") as f:
                     resume_at = dateutil_parser.isoparse(f.read().strip())
                 if datetime.now(timezone.utc) < resume_at:
-                    self.logger.info("trading_paused", {"resume_at": resume_at.isoformat()})
-                    return False
+                    self.entries_paused_until = resume_at
+                    if getattr(self, "_pause_logged", None) != resume_at:
+                        self._pause_logged = resume_at
+                        self.logger.info("entries_paused", {"resume_at": resume_at.isoformat()})
                 else:
                     os.remove(pause_path)
             except Exception:
-                os.remove(pause_path)
+                try:
+                    os.remove(pause_path)
+                except OSError:
+                    pass
         return True
+
+    # ── Entry gates: pregame / in-game window, market families ────────────
+
+    @staticmethod
+    def _market_kind(slug: str) -> str:
+        if slug.startswith("asc-"):
+            return "spread"
+        if slug.startswith("tsc-"):
+            return "total"
+        return "ml"
+
+    def _entry_allowed(self, slug: str, is_live: bool, hours_to_start: Optional[float]) -> bool:
+        """May this market OPEN a position under the profile's entry rules?
+
+        entry_window "pregame": before the scheduled start only, no later
+        than pregame_cutoff_minutes before it and, when pregame_max_hours is
+        set, no earlier than that many hours before it. "live": in-game only.
+        market_kinds limits the families (ml / spread / total).
+        """
+        tcfg = getattr(getattr(self, "config", None), "trading", None)
+        if tcfg is None:
+            return True
+        kinds = {k.strip().lower() for k in str(getattr(tcfg, "market_kinds", "") or "").split(",")
+                 if k.strip()}
+        if kinds and self._market_kind(slug or "") not in kinds:
+            return False
+        window = str(getattr(tcfg, "entry_window", "any") or "any").strip().lower()
+        if window == "live":
+            return bool(is_live)
+        if window == "pregame":
+            if is_live or hours_to_start is None:
+                return False
+            if hours_to_start * 60.0 < float(getattr(tcfg, "pregame_cutoff_minutes", 10.0) or 0.0):
+                return False
+            max_hours = float(getattr(tcfg, "pregame_max_hours", 0.0) or 0.0)
+            if max_hours > 0 and hours_to_start > max_hours:
+                return False
+        return True
+
+    def _entry_allowed_market(self, market: Dict) -> bool:
+        """_entry_allowed for a raw market dict, before any snapshot or book."""
+        slug = market.get("slug", "") or ""
+        tcfg = getattr(getattr(self, "config", None), "trading", None)
+        window = str(getattr(tcfg, "entry_window", "any") or "any").strip().lower()
+        if window == "any":
+            return self._entry_allowed(slug, False, None)
+        start = market.get("gameStartTime")
+        game_start = self.market_data._parse_datetime(start) if start else None
+        if game_start is None:
+            return self._entry_allowed(slug, False, None)   # no kickoff time: fail closed
+        hours = (game_start - datetime.now(timezone.utc)).total_seconds() / 3600.0
+        return self._entry_allowed(slug, hours <= 0, max(hours, 0.0))
+
+    def _list_price(self, slug: str) -> Optional[float]:
+        """Token-0 price from the last universe fetch (no REST call)."""
+        for m in getattr(self, "_cached_markets", None) or ():
+            if m.get("slug") == slug:
+                from bot.market_data import MarketDataClient
+                return MarketDataClient._token0_price(m)
+        return None
 
     def _is_live_market(self, market: Dict) -> bool:
         """Check if a market's game is currently in progress."""
@@ -362,6 +440,9 @@ class TradingBot:
         from bot.edge_log import extract_game_id, get_open_game_ids
         from bot.strategies.trade_filter import validate_trade, rank_opportunities, get_league_from_slug
 
+        if getattr(self, "entries_paused_until", None) is not None:
+            return  # daily-loss pause: no new entries (positions still managed)
+
         # Collect all edges
         opportunities = []
         open_positions = self.portfolio.get_open_positions()
@@ -382,6 +463,8 @@ class TradingBot:
 
             cooldown_until = self._slug_cooldowns.get(slug, 0)
             if _time.time() < cooldown_until:
+                continue
+            if not self._entry_allowed(slug, snapshot.is_live, snapshot.hours_to_expiry):
                 continue
 
             result = self._detect_edge(snapshot)
@@ -752,14 +835,29 @@ class TradingBot:
             pass  # Edge logging must not break trading
 
     def check_positions(self, has_live_games: bool = False, cycle: int = 0):
-        """Check all open positions: fetch live prices, check risk, close via API."""
-        original_tp = self.risk.config.take_profit_threshold
-        if has_live_games:
-            self.risk.config.take_profit_threshold = self.live_take_profit
+        """Check all open positions: fetch live prices, check risk, close via API.
 
+        During live games the take-profit threshold tightens to
+        live_take_profit, but only for profiles that take profits at all: a
+        threshold <= 0 (take-profit off) or hold_to_settlement stays as
+        configured (ride took two take-profits it was set never to take on
+        2026-09-24). The configured value is restored even if a check fails.
+        """
+        cfg = self.risk.config
+        original_tp = cfg.take_profit_threshold
+        if (has_live_games and original_tp > 0
+                and not getattr(cfg, "hold_to_settlement", False)):
+            cfg.take_profit_threshold = getattr(self, "live_take_profit", 0.03)
+        try:
+            self._check_open_positions(has_live_games, cycle)
+        finally:
+            cfg.take_profit_threshold = original_tp
+
+    def _check_open_positions(self, has_live_games: bool, cycle: int):
         open_positions = self.portfolio.get_open_positions()
         log_diagnostics = (cycle % 10 == 0) and cycle > 0 and open_positions
         paper = self.config.trading.paper_trading
+        hold = bool(getattr(self.risk.config, "hold_to_settlement", False))
 
         # Paper settlement. A finished game's market resolves on the exchange,
         # but its last quotes sit at 0.5c / 99.5c, so quote-based resolution
@@ -791,7 +889,17 @@ class TradingBot:
 
             paper_exit_level = None
             paper_book = None
-            if paper:
+            if paper and hold:
+                # Held to settlement: marks only feed the board and the
+                # finished-game check, so they never spend the shared REST
+                # order-book budget (~5 calls per 10 s across all profiles).
+                from bot.paper import executable_level
+                level = executable_level(self.market_data.get_cached_book(slug),
+                                         "sell" if position.side == "buy" else "buy")
+                live_price = level[0] if level is not None else self._list_price(slug)
+                if live_price is not None and (live_price <= 0.02 or live_price >= 0.98):
+                    self._settle_suspects().add(slug)
+            elif paper:
                 from bot.paper import executable_level
                 paper_book = self.market_data.get_us_order_book(slug)
                 paper_exit_level = executable_level(
@@ -999,9 +1107,6 @@ class TradingBot:
                         "message": "Close order failed on exchange, position remains open",
                     })
 
-        if has_live_games:
-            self.risk.config.take_profit_threshold = original_tp
-
     # ── Re-entry blocks and shared feed subscription ──────────────────────
 
     def _block_reentry(self, slug: str, reason: str):
@@ -1145,15 +1250,25 @@ class TradingBot:
         total today) took minutes per cycle; the pre-screen costs nothing.
         """
         open_slugs = {p.slug for p in self.portfolio.get_open_positions()}
+        tcfg = getattr(getattr(self, "config", None), "trading", None)
+        hold = bool(getattr(tcfg, "hold_to_settlement", False))
+        paused = getattr(self, "entries_paused_until", None) is not None
         keep, screened = [], 0
         for market in markets:
             if not self.running:
                 break
             slug = market.get("slug", "")
             if slug in open_slugs:
-                keep.append(market)
+                # Held markets get a real snapshot so exits see current
+                # estimates; hold-to-settlement profiles never exit on price.
+                if not hold:
+                    keep.append(market)
+                continue
+            if paused:
                 continue
             if slug in getattr(self, "_reentry_blocked", ()):
+                continue
+            if not self._entry_allowed_market(market):
                 continue
             light = self.market_data.build_snapshot(market, fetch_book=False)
             if not light:
@@ -1292,6 +1407,8 @@ class TradingBot:
                         s for s in ("market_data",) if self.health.is_degraded(s)
                     ],
                     "book_feed": self.book_feed.status() if self.book_feed else None,
+                    "entries_paused_until": (self.entries_paused_until.isoformat()
+                                             if self.entries_paused_until else None),
                 })
 
                 # Check supervisor kill switch / pause

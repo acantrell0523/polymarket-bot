@@ -43,9 +43,11 @@ trading:
   max_open_positions: 8
   paper_trading: true
   # --- 2026-09-23 strategy review (all profiles) ---
-  trailing_stop_enabled: true     # the no_trail profile turns this off
+  trailing_stop_enabled: true     # baseline's exits; hold_to_settlement profiles never exit on price
   require_round_trip_edge: true   # net edge must also cover exit fee + half spread
   reentry_after_stop: false       # never re-enter a market after a stop loss
+  entry_window: any               # pregame profiles override: pregame entries only
+  hold_to_settlement: false       # pregame profiles override: no bot exits, settle only
   # --- Cost-aware edge accounting ---
   # US fee schedule (effective 2026-07-01): fee = coef * contracts * p * (1-p)
   # Takers pay 0.06 (peaks at 3% of notional at 50c, shrinks toward extremes).
@@ -115,6 +117,7 @@ filters:
   sports_window_hours: 24     # only scan games starting within 24h
   nonsports_window_days: 14   # only scan non-sports markets resolving within 14d
   leagues: nfl,cfb,nhl        # league allowlist (MLB/WNBA/soccer/UFC excluded)
+  league_start_dates: nhl:2026-09-29   # NHL preseason off; regular season opens Tue Sep 29
   min_price_history_length: 10
   include_categories: []
   exclude_categories: []

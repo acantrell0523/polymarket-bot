@@ -201,6 +201,24 @@ class MarketDataClient:
         codes.discard("")
         return codes or None
 
+    def league_start_dates(self) -> Dict[str, datetime]:
+        """filters.league_start_dates as {league: first allowed game start}.
+
+        "nhl:2026-09-29" -> NHL games starting before midnight US Eastern on
+        Sep 29 are skipped, so the preseason stays out and the regular season
+        turns on by itself.
+        """
+        from zoneinfo import ZoneInfo
+        out: Dict[str, datetime] = {}
+        for part in str(getattr(self.filters, "league_start_dates", "") or "").split(","):
+            league, _, day = part.strip().partition(":")
+            try:
+                y, m, d = (int(x) for x in day.strip().split("-"))
+                out[league.strip().lower()] = datetime(y, m, d, tzinfo=ZoneInfo("America/New_York"))
+            except (TypeError, ValueError):
+                continue
+        return out
+
     @staticmethod
     def _slim_market(m: Dict, event: Dict) -> Optional[Dict]:
         """Keep only full-game moneyline/spread/total markets, trimmed.
@@ -362,6 +380,8 @@ class MarketDataClient:
         unregistered = 0
         league_excluded = 0
         line_out_of_band = 0
+        before_league_start = 0
+        league_starts = self.league_start_dates()
         line_candidates = []  # (parsed, token0 price, market)
         for m in markets:
             game_start_str = m.get("gameStartTime")
@@ -397,6 +417,9 @@ class MarketDataClient:
                     gs = self._parse_datetime(game_start_str)
                     if gs is None:
                         continue
+                    if parsed["league"] in league_starts and gs < league_starts[parsed["league"]]:
+                        before_league_start += 1
+                        continue
                     if gs <= now:
                         if (now - gs) > max_live_age:
                             continue
@@ -425,6 +448,9 @@ class MarketDataClient:
                     continue
                 game_start = self._parse_datetime(game_start_str)
                 if game_start is None:
+                    continue
+                if parts[1] in league_starts and game_start < league_starts[parts[1]]:
+                    before_league_start += 1
                     continue
 
                 if game_start <= now:
@@ -476,6 +502,7 @@ class MarketDataClient:
                 "dropped_unregistered_league": unregistered,
                 "dropped_league_not_allowed": league_excluded,
                 "dropped_line_out_of_band": line_out_of_band,
+                "dropped_before_league_start": before_league_start,
                 "line_markets_kept": line_kept,
                 "sports_window_hours": sports_window_hours,
                 "nonsports_window_days": nonsports_window_days,
