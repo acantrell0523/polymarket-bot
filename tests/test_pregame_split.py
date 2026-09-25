@@ -203,3 +203,27 @@ def test_shipped_config_keeps_nhl_preseason_out_until_sep_29():
     cfg = load_config()
     starts = MarketDataClient(cfg.api, None, cfg.filters).league_start_dates()
     assert starts["nhl"].date().isoformat() == "2026-09-29" and "nfl" not in starts
+
+
+# ── moneyline consensus: token-0 team mapping ───────────────────────────────
+
+@pytest.mark.parametrize("slug,probs,expected", [
+    ("aec-cfb-tx-tenn-2026-09-26", {"tennessee": 0.358, "texas": 0.642}, 0.642),
+    ("aec-cfb-nd-pur-2026-09-26", {"purdue": 0.054, "notre dame": 0.946}, 0.946),
+    ("aec-cfb-nw-ind-2026-09-25", {"indiana": 0.907, "northwestern": 0.093}, 0.093),
+    ("aec-cfb-hawaii-wyom-2026-09-26", {"wyoming cowboys": 0.444, "hawai'i warriors": 0.556}, 0.556),
+    ("aec-cfb-army-templ-2026-09-25", {"temple": 0.372, "army": 0.628}, 0.628),
+    ("aec-nfl-kc-buf-2026-09-27", {"buffalo bills": 0.55, "kansas city chiefs": 0.45}, 0.45),
+])
+def test_moneyline_consensus_prices_the_away_team_token(slug, probs, expected):
+    from bot.signals.odds_api import OddsCache
+    oc = OddsCache(api_key="", cache_ttl=300)
+    oc.get_consensus_odds = lambda s: {"probs": probs, "num_books": 4, "home_team": "x", "away_team": "y"}
+    assert oc.get_probability_for_slug(slug) == (pytest.approx(expected), 4)
+
+
+def test_three_way_slug_still_prices_the_named_outcome():
+    from bot.signals.odds_api import OddsCache
+    oc = OddsCache(api_key="", cache_ttl=300)
+    probs = {"brighton": 0.30, "liverpool": 0.45, "draw": 0.25}
+    assert oc.outcome_prob("atc-epl-bha-liv-2026-03-21-liv", probs) == pytest.approx(0.45)

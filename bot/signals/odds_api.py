@@ -604,26 +604,34 @@ class OddsCache:
                 return (draw_prob, num_books)
             return None
 
-        # For moneyline: find the probability for the team in the slug
-        # The team we're betting on is typically the home team (parts[2])
-        # But we need to check the last part for specific outcome indicators
-        home_abbr = parts[2] if len(parts) > 2 else ""
-        away_abbr = parts[3] if len(parts) > 3 else ""
+        prob = self.outcome_prob(slug, probs)
+        return (prob, num_books) if prob is not None else None
 
-        # Check if slug ends with a team abbr (e.g., atc-epl-bha-liv-2026-03-21-bha)
-        outcome_abbr = parts[-1] if len(parts) > 5 else home_abbr
+    def outcome_prob(self, slug: str, probs: Dict[str, float]) -> Optional[float]:
+        """The probability, from a {book team name: prob} map, of the outcome
+        token 0 of a moneyline slug pays on.
 
-        # Match against consensus teams
-        for team_name, prob in probs.items():
-            if team_name.lower() == "draw":
-                continue
-            if self._team_matches(outcome_abbr, team_name):
-                return (prob, num_books)
-
-        # Fallback: return home team probability
-        home_team = consensus["home_team"].lower()
-        for team_name, prob in probs.items():
-            if self._team_matches(home_abbr, team_name):
-                return (prob, num_books)
-
+        aec-{lg}-{away}-{home}-{y}-{m}-{d}: token 0 is the away team, parts[2].
+        atc-{lg}-{a}-{b}-{y}-{m}-{d}-{outcome}: the last part names it.
+        Book names map to Polymarket codes with _match_abbr, the matcher the
+        aggregator's find_game already uses. Until 2026-09-25 this read
+        parts[-1] (the DAY of the date) as the team code for every aec slug,
+        then fell back to a name-prefix match that needs 3+ letters, so games
+        whose away team is tx, nd, nw, kc, gb, sf, ne, no, tb or lv (and
+        "Hawai'i") had no pregame moneyline consensus at all.
+        """
+        from bot.signals.book_scrapers import _match_abbr
+        parts = slug.split("-")
+        if len(parts) < 4:
+            return None
+        sport_key = SPORT_MAP.get(parts[1], "")
+        outcome = parts[-1] if slug.startswith("atc-") and len(parts) >= 8 else parts[2]
+        teams = [(name, prob) for name, prob in probs.items() if name.lower() != "draw"]
+        if sport_key:
+            for name, prob in teams:
+                if _match_abbr(name, sport_key) == outcome:
+                    return prob
+        for name, prob in teams:
+            if self._team_matches(outcome, name):
+                return prob
         return None

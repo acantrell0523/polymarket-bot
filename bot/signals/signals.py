@@ -164,15 +164,10 @@ def odds_value_signal(
         sharp_probs = consensus_data.get("sharp_probs", {})
         books_used = consensus_data.get("books_used", "")
         if sharp_probs:
-            # Find the team we care about
-            for team_name, prob in sharp_probs.items():
-                if team_name.lower() == "draw":
-                    continue
-                parts = snapshot.slug.split("-")
-                outcome_abbr = parts[-1] if len(parts) > 5 else (parts[2] if len(parts) > 2 else "")
-                if odds_cache._team_matches(outcome_abbr, team_name):
-                    sharp_consensus = prob
-                    break
+            # The sharp book's probability for the outcome token 0 pays on
+            # (same team mapping as the consensus itself).
+            if hasattr(odds_cache, "outcome_prob"):
+                sharp_consensus = odds_cache.outcome_prob(snapshot.slug, sharp_probs) or 0.0
             # If sharp books differ from overall by 3%+, blend toward sharp
             if sharp_consensus > 0 and abs(sharp_consensus - consensus_prob) >= 0.03:
                 # Weight sharp 60%, overall 40%
