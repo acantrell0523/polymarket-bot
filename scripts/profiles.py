@@ -10,9 +10,14 @@ each launchd plist. Since 2026-09-26 15:xx ET:
                   outcomes after the final whistle (<= 99c), holds to
                   settlement. Also the websocket order-book leader.
     finals        the same, finals only: the zero-game-risk floor
-    pregame       value entries before kickoff (24 h out to 10 min before),
-                  3% gross edge and 2% after entry costs, held to settlement
-    pregame_late  pregame, entries only in the last 3 hours before kickoff
+    maker         bot/maker.py: rests paper quotes 3c inside the model's fair
+                  value in wide books (live alternate lines; pregame lines when
+                  they are wide), earns the spread and the maker rebate,
+                  holds fills to settlement or flips them
+    pregame_late  the taker control: value entries in the last 3 hours before
+                  kickoff, 3% gross edge, held to settlement. The venue's own
+                  market maker keeps liquid pregame books 0.5c wide, so this
+                  arm measures model error, not mispricing.
 
 Install/refresh the launchd plists (does not start them):
     python scripts/profiles.py --install
@@ -59,12 +64,20 @@ PROFILES = {
         "description": "Finals only: buys the decided side after the final whistle (at most 99c) and waits for settlement. No game risk.",
         "env": {**CERTAINTY, "POLYBOT_TRADING__CERTAINTY_LIVE_ENTRIES": "false"},
     },
-    "pregame": {
-        "description": "Enters before kickoff only, up to 24 hours out, 3% edge over the books, and holds every position to settlement.",
-        "env": dict(PREGAME),
+    "maker": {
+        "description": "Market maker: rests quotes 3c inside the model's fair value in wide books (live alternate lines, wide pregame lines), earns the spread plus the maker rebate, and holds fills to settlement unless the other side fills first.",
+        "env": {
+            "POLYBOT_TRADING__STRATEGY": "maker",
+            "POLYBOT_TRADING__HOLD_TO_SETTLEMENT": "true",
+            "POLYBOT_TRADING__MAX_OPEN_POSITIONS": "40",
+            "POLYBOT_TRADING__MAX_DAILY_TRADES": "80",
+            "POLYBOT_TRADING__MAX_PORTFOLIO_EXPOSURE_USD": "900",
+            "POLYBOT_TRADING__DAILY_LOSS_LIMIT_USD": "300",
+            "POLYBOT_FILTERS__MIN_HOURS_TO_EXPIRY": "0",
+        },
     },
     "pregame_late": {
-        "description": "Pregame and held to settlement, but enters only in the last 3 hours before kickoff.",
+        "description": "Taker control: buys before kickoff, in the last 3 hours only, when Polymarket sits 3% from the sportsbook consensus, and holds to settlement.",
         "env": {**PREGAME, "POLYBOT_TRADING__PREGAME_MAX_HOURS": "3"},
     },
 }

@@ -1274,9 +1274,9 @@ class TradingBot:
         """
         open_slugs = {p.slug for p in self.portfolio.get_open_positions()}
         tcfg = getattr(getattr(self, "config", None), "trading", None)
-        if self._strategy() == "certainty":
-            # Entries come from _certainty_scan; held markets are marked in
-            # check_positions. No estimator work on 800 markets per scan.
+        if self._strategy() in ("certainty", "maker"):
+            # Entries come from _certainty_scan / the maker; held markets are
+            # marked in check_positions. No estimator work on 800 markets.
             self.logger.info("prescreen_complete", {"scan": label, "markets": len(markets),
                                                     "screened": 0, "candidates": 0, "held": 0})
             return []
@@ -1443,11 +1443,19 @@ class TradingBot:
                          prob, price, depth, decision["why"] if decision else "none",
                          bool(decision) and fillable)
 
+    def _maker(self):
+        if getattr(self, "maker", None) is None:
+            from bot.maker import Maker
+            self.maker = Maker(self)
+        return self.maker
+
     def _do_live_scan(self, live_markets: List[Dict]):
         """Fast scan — pre-screen live markets, real books for candidates only."""
         if self._strategy() == "certainty":
             self._certainty_scan(live_markets)
             return
+        if self._strategy() == "maker":
+            return          # quotes are refreshed on full scans and polled every cycle
         candidates = self._prescreen(live_markets, "live")
         self.process_markets(self._build_snapshots(candidates))
 
@@ -1604,6 +1612,8 @@ class TradingBot:
                         continue
 
                     live_markets, pregame_markets = self._split_markets(markets)
+                    if self._strategy() == "maker":
+                        self._maker().refresh(markets)
 
                     # Two-stage: pre-screen on list prices, real books for
                     # candidates and held markets only (see _prescreen).
@@ -1675,6 +1685,10 @@ class TradingBot:
                     )
                     last_summary_date = today_str
 
+                if self._strategy() == "maker":
+                    if cycle % 10 == 0:           # live quotes follow the live lines model (30 s)
+                        self._maker().refresh(self._split_markets(self._cached_markets)[0], live_only=True)
+                    self._maker().poll()          # every cycle, games or not
                 self._publish_held()
                 self._refresh_feed_subscription()
                 time.sleep(self.live_scan_interval)

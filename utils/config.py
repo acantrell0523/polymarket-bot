@@ -55,6 +55,9 @@ class TradingConfig:
     # Takers pay 0.06; see bot/strategies/fees.py. Edge math, Kelly sizing,
     # paper fills, live fills, and the backtest all read this ONE value.
     taker_fee_coefficient: float = 0.06
+    # Maker rebate coefficient (negative = the maker is paid), same p*(1-p)
+    # curve: docs.polymarket.us/fees lists taker 0.0695 / maker -0.0125.
+    maker_fee_coefficient: float = -0.0125
     # DEPRECATED: legacy flat fee-on-notional model. No longer read by edge,
     # sizing, execution, or backtest. Kept so old env overrides don't crash.
     taker_fee_rate: float = 0.02
@@ -115,6 +118,16 @@ class TradingConfig:
     certainty_max_seconds_left: float = 480.0
     finals_max_price: float = 0.99            # most paid for a decided outcome
     certainty_size_usd: float = 100.0         # fixed size; Kelly is wrong for 97%-ers
+    # --- 2026-09-26 maker strategy (bot/maker.py): strategy = "maker" ---
+    maker_half_spread: float = 0.03           # quote fair -/+ this, inside the book
+    maker_min_edge: float = 0.02              # drop a side closer than this to fair
+    maker_size_usd: float = 25.0              # collateral per side per market
+    maker_max_markets: int = 40               # widest books first
+    maker_min_books: int = 3                  # sportsbooks behind the fair value
+    maker_pull_minutes: float = 10.0          # cancel this long before kickoff
+    maker_min_fair: float = 0.10
+    maker_max_fair: float = 0.90
+    maker_live_pull_seconds: float = 300.0    # live quotes come off inside the last 5 minutes
 
 
 # Default per-market-type weights — must stay in sync with WEIGHTS in estimator.py

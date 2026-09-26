@@ -168,6 +168,24 @@ def init_db():
             taken INTEGER DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_certainty_log_slug ON certainty_log(slug);
+
+        -- Maker strategy measurement (bot/maker.py): quotes, pulls and fills
+        CREATE TABLE IF NOT EXISTS maker_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            kind TEXT,
+            fair REAL,
+            num_books INTEGER,
+            best_bid REAL,
+            best_ask REAL,
+            bid REAL,
+            ask REAL,
+            event TEXT,
+            price REAL,
+            contracts REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_maker_log_slug ON maker_log(slug);
     """)
     # Preserve old rows explicitly as legacy, gross-P&L observations.
     columns = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
@@ -658,6 +676,25 @@ def insert_certainty(ts: str, slug: str, kind: str, state: str, seconds_left, ma
                 "leader_win_prob, leader_price, depth, decision, taken) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ts, slug, kind, state, seconds_left, margin, leader, leader_win_prob, leader_price,
                  depth, decision, 1 if taken else 0))
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+
+def insert_maker_log(ts: str, slug: str, kind: str, fair, num_books, best_bid, best_ask, bid, ask,
+                     event: str, price=None, contracts=0.0) -> None:
+    """One maker_log row; never raises."""
+    try:
+        conn = _get_conn()
+    except Exception:
+        return
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO maker_log(ts, slug, kind, fair, num_books, best_bid, best_ask, bid, ask, "
+                "event, price, contracts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (ts, slug, kind, fair, num_books, best_bid, best_ask, bid, ask, event, price, contracts))
     except Exception:
         pass
     finally:
