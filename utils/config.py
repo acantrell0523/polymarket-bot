@@ -128,6 +128,14 @@ class TradingConfig:
     maker_min_fair: float = 0.10
     maker_max_fair: float = 0.90
     maker_live_pull_seconds: float = 300.0    # live quotes come off inside the last 5 minutes
+    # In-game quoting: the first two minutes live (2026-09-26 15:00 ET) filled
+    # 19 times and 14 moved through our price within a minute: the venue's
+    # market maker steps away after a play, our quote lands in the gap off a
+    # slower model, and it comes back on the far side of us. Off by default.
+    maker_live_quotes: bool = False
+    # A book must have been wide this long before we quote it, so a maker
+    # that has only stepped away for a play does not get to pick us off.
+    maker_wide_seconds: float = 300.0
 
 
 # Default per-market-type weights — must stay in sync with WEIGHTS in estimator.py

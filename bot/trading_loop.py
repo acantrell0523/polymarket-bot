@@ -481,7 +481,7 @@ class TradingBot:
                 continue
             if slug in self._settled_slugs:
                 continue
-            if slug in getattr(self, "_reentry_blocked", ()):
+            if self._reentry_blocked_market(slug):
                 continue
 
             cooldown_until = self._slug_cooldowns.get(slug, 0)
@@ -1133,21 +1133,38 @@ class TradingBot:
     # ── Re-entry blocks and shared feed subscription ──────────────────────
 
     def _block_reentry(self, slug: str, reason: str):
-        """Never re-enter `slug` after a stop loss there (unless configured)."""
+        """Never re-enter `slug`, or any other line of its game, after a stop
+        loss there (unless configured). On 2026-09-25 the per-market block let
+        baseline stop out of eleven different lines of one game in two hours.
+        The game block is stored as "game:<id>" in the same table."""
         if getattr(self.config.trading, "reentry_after_stop", True):
             return
+        from bot.edge_log import extract_game_id
         blocked = getattr(self, "_reentry_blocked", None)
         if blocked is None:
             blocked = self._reentry_blocked = set()
-        if slug in blocked:
+        game_id = extract_game_id(slug)
+        new = [k for k in (slug, f"game:{game_id}" if game_id else "") if k and k not in blocked]
+        if not new:
             return
-        blocked.add(slug)
-        try:
-            from bot.trade_db import block_reentry
-            block_reentry(slug, reason)
-        except Exception as e:
-            self.logger.warning("reentry_block_persist_failed", {"slug": slug, "error": str(e)[:200]})
-        self.logger.info("reentry_blocked", {"slug": slug, "reason": reason})
+        for key in new:
+            blocked.add(key)
+            try:
+                from bot.trade_db import block_reentry
+                block_reentry(key, reason)
+            except Exception as e:
+                self.logger.warning("reentry_block_persist_failed", {"slug": key, "error": str(e)[:200]})
+        self.logger.info("reentry_blocked", {"slug": slug, "game": game_id, "reason": reason})
+
+    def _reentry_blocked_market(self, slug: str) -> bool:
+        blocked = getattr(self, "_reentry_blocked", None)
+        if not blocked:
+            return False
+        if slug in blocked:
+            return True
+        from bot.edge_log import extract_game_id
+        game_id = extract_game_id(slug)
+        return bool(game_id) and f"game:{game_id}" in blocked
 
     def _shared_held_dir(self) -> Optional[str]:
         shared = os.environ.get("POLYBOT_SHARED_DIR")
@@ -1295,7 +1312,7 @@ class TradingBot:
                 continue
             if paused:
                 continue
-            if slug in getattr(self, "_reentry_blocked", ()):
+            if self._reentry_blocked_market(slug):
                 continue
             if not self._entry_allowed_market(market):
                 continue

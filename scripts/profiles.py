@@ -18,6 +18,9 @@ each launchd plist. Since 2026-09-26 15:xx ET:
                   kickoff, 3% gross edge, held to settlement. The venue's own
                   market maker keeps liquid pregame books 0.5c wide, so this
                   arm measures model error, not mispricing.
+    live          in-game value betting (the Sep 23 rules) with a 4% net edge
+                  bar and a whole-game block after a stop loss; the measured
+                  live-betting arm Austin asked to keep
 
 Install/refresh the launchd plists (does not start them):
     python scripts/profiles.py --install
@@ -79,6 +82,14 @@ PROFILES = {
     "pregame_late": {
         "description": "Taker control: buys before kickoff, in the last 3 hours only, when Polymarket sits 3% from the sportsbook consensus, and holds to settlement.",
         "env": {**PREGAME, "POLYBOT_TRADING__PREGAME_MAX_HOURS": "3"},
+    },
+    "live": {
+        "description": "In-game value betting: prices live moneylines and lines off live sportsbook quotes, needs 4% edge after round-trip costs, keeps stops and profit-taking, and blocks a whole game after a stop loss.",
+        "env": {
+            "POLYBOT_TRADING__ENTRY_WINDOW": "live",
+            "POLYBOT_TRADING__MIN_NET_EDGE": "0.04",
+            "POLYBOT_TRADING__MAX_DAILY_TRADES": "20",
+        },
     },
 }
 

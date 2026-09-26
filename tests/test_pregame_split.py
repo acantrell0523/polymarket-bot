@@ -256,3 +256,25 @@ def test_capped_profile_logs_once_and_evaluates_nothing():
     bot._detect_edge.assert_not_called()
     events = [c.args[0] for c in bot.logger.warning.call_args_list]
     assert events == ["entries_capped"]
+
+
+# ── a stop loss blocks the whole game, not just the line ────────────────────
+
+def test_stop_loss_blocks_every_line_of_the_game():
+    from bot.trading_loop import TradingBot
+    from bot import trade_db
+    bot = TradingBot.__new__(TradingBot)
+    bot.config = SimpleNamespace(trading=TradingConfig(reentry_after_stop=False))
+    bot.logger = Mock()
+    bot._block_reentry("asc-cfb-army-templ-2026-09-25-neg-6pt5", "stop_loss")
+    assert bot._reentry_blocked_market("asc-cfb-army-templ-2026-09-25-neg-6pt5")
+    assert bot._reentry_blocked_market("tsc-cfb-army-templ-2026-09-25-total-49pt5")   # another line, same game
+    assert bot._reentry_blocked_market("aec-cfb-army-templ-2026-09-25")
+    assert not bot._reentry_blocked_market("aec-cfb-navy-uab-2026-09-25")
+    assert "game:cfb-army-templ-2026-09-25" in trade_db.load_reentry_blocks()
+    bot.running = True
+    bot.portfolio = SimpleNamespace(get_open_positions=lambda: [])
+    bot.market_data = Mock()
+    bot._detect_edge = Mock(return_value=("sig", "snap"))
+    keep = bot._prescreen([{"slug": "tsc-cfb-army-templ-2026-09-25-total-45pt5"}, {"slug": "aec-cfb-navy-uab-2026-09-25"}], "t")
+    assert [m["slug"] for m in keep] == ["aec-cfb-navy-uab-2026-09-25"]

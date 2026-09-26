@@ -32,6 +32,7 @@ def _bot(payloads, positions=(), **cfg):
     from bot.trading_loop import TradingBot
     from bot.strategies.risk import RiskManager
     bot = TradingBot.__new__(TradingBot)
+    cfg = {"maker_wide_seconds": 0.0, "maker_live_quotes": True, **cfg}
     bot.config = SimpleNamespace(trading=TradingConfig(strategy="maker", hold_to_settlement=True, **cfg))
     bot.logger = Mock()
     bot.risk = RiskManager(bot.config.trading)
@@ -205,3 +206,26 @@ def test_live_lines_are_quoted_off_the_live_model_and_pulled_late(monkeypatch):
     bot.game_state.state_for.return_value = {"state": "in", "league": "cfb", "period": 4, "clock_seconds": 200}
     m.refresh([_market(live_slug, hours=-1.0)], live_only=True)   # 3:20 left: pulled
     assert set(m.quotes) == {ML}
+
+
+def test_a_book_must_stay_wide_before_it_is_quoted(monkeypatch):
+    payloads = {ML: _payload([(0.40, 500)], [(0.60, 500)])}
+    bot = _bot(payloads, maker_wide_seconds=300.0)
+    m = Maker(bot)
+    m.refresh([_market(ML)])
+    assert m.quotes == {}                                    # first sighting of a wide book: wait
+    m._wide_since[ML] -= 400
+    m.refresh([_market(ML)])
+    assert ML in m.quotes                                    # wide for 5 minutes: quote
+    payloads[ML] = _payload([(0.49, 500)], [(0.51, 500)])    # the maker is back: pulled, clock reset
+    m.refresh([_market(ML)])
+    assert m.quotes == {} and ML not in m._wide_since
+
+
+def test_live_quoting_is_off_by_default():
+    live_slug = "asc-cfb-tx-tenn-2026-09-26-pos-14pt5"
+    bot = _bot({live_slug: _payload([(0.30, 40)], [(0.60, 40)])}, maker_live_quotes=False)
+    bot.lines_cache.price_market.return_value = {"prob": 0.45, "num_books": 3, "clock_known": True}
+    m = Maker(bot)
+    m.refresh([_market(live_slug, hours=-1.0)])
+    assert m.quotes == {}

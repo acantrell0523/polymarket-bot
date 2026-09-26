@@ -99,6 +99,7 @@ class Maker:
     def __init__(self, bot):
         self.bot = bot
         self.quotes: Dict[str, Quote] = {}
+        self._wide_since: Dict[str, float] = {}
 
     # ── fair value ────────────────────────────────────────────────────────
 
@@ -181,7 +182,7 @@ class Maker:
             if live_only and not is_live:
                 continue
             if is_live:
-                if self._live_pull_due(slug):
+                if not getattr(cfg, "maker_live_quotes", False) or self._live_pull_due(slug):
                     continue
             elif start - now <= pull_before:
                 continue
@@ -198,6 +199,15 @@ class Maker:
             if not book.bids or not book.asks:
                 continue
             best_bid, best_ask = book.bids[0].price, book.asks[0].price
+            # Only books that have stayed wide: a gap the market maker left
+            # for one play closes on the far side of whoever quoted into it.
+            wide = best_ask - best_bid >= 2 * float(cfg.maker_half_spread) + 2 * TICK
+            if not wide:
+                self._wide_since.pop(slug, None)
+                continue
+            since = self._wide_since.setdefault(slug, now.timestamp())
+            if slug not in self.quotes and now.timestamp() - since < float(cfg.maker_wide_seconds):
+                continue
             bid, ask = quote_prices(fair, best_bid, best_ask, float(cfg.maker_half_spread),
                                     float(cfg.maker_min_edge))
             pos = open_by_slug.get(slug)

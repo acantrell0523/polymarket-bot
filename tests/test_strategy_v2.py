@@ -217,7 +217,7 @@ def test_stop_loss_blocks_reentry_and_survives_restart():
     bot.logger = Mock()
     bot._block_reentry("aec-nfl-nyg-lar-2026-09-21", "stop_loss")
     assert "aec-nfl-nyg-lar-2026-09-21" in bot._reentry_blocked
-    assert trade_db.load_reentry_blocks() == {"aec-nfl-nyg-lar-2026-09-21"}
+    assert trade_db.load_reentry_blocks() == {"aec-nfl-nyg-lar-2026-09-21", "game:nfl-nyg-lar-2026-09-21"}
     allow = TradingBot.__new__(TradingBot)
     allow.config = SimpleNamespace(trading=TradingConfig(reentry_after_stop=True))
     allow.logger = Mock()
