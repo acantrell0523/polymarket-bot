@@ -180,6 +180,8 @@ class TradingBot:
         # Live in-game win probabilities (ESPN model) — the live-edge engine
         from bot.signals.live_win_prob import LiveWinProbCache
         self.live_cache = LiveWinProbCache()
+        from bot.certainty import GameStateCache
+        self.game_state = GameStateCache()
 
         # Spread/total quotes (Pinnacle + FanDuel + ESPN) for asc-/tsc- markets
         from bot.signals.lines import LinesCache
@@ -430,6 +432,24 @@ class TradingBot:
             return None
         return (trade_signal, snapshot)
 
+    def _entries_capped(self) -> bool:
+        """Daily trade cap / loss limit, logged once per episode instead of
+        dropping every candidate silently (the cap hid a 20-hour lockout)."""
+        capped = (self.risk.is_daily_trade_limit_reached() or self.risk.is_daily_limit_breached())
+        if capped != getattr(self, "_cap_logged", False):
+            self._cap_logged = capped
+            self.logger.warning("entries_capped" if capped else "entries_uncapped", {
+                "daily_trades": self.risk.daily_trade_count,
+                "max_daily_trades": self.config.trading.max_daily_trades,
+                "daily_pnl": round(self.risk.daily_pnl, 2),
+                "daily_loss_limit_usd": self.config.trading.daily_loss_limit_usd,
+            })
+        return capped
+
+    def _strategy(self) -> str:
+        tcfg = getattr(getattr(self, "config", None), "trading", None)
+        return str(getattr(tcfg, "strategy", "value") or "value").strip().lower()
+
     def process_markets(self, snapshots: list):
         """Sniper strategy: rank ALL opportunities, take only the best 1-2.
 
@@ -443,18 +463,7 @@ class TradingBot:
         if getattr(self, "entries_paused_until", None) is not None:
             return  # daily-loss pause: no new entries (positions still managed)
 
-        # Daily trade cap / loss limit: say so once per episode instead of
-        # dropping every candidate silently (the cap hid a 20-hour lockout).
-        capped = (self.risk.is_daily_trade_limit_reached() or self.risk.is_daily_limit_breached())
-        if capped != getattr(self, "_cap_logged", False):
-            self._cap_logged = capped
-            self.logger.warning("entries_capped" if capped else "entries_uncapped", {
-                "daily_trades": self.risk.daily_trade_count,
-                "max_daily_trades": self.config.trading.max_daily_trades,
-                "daily_pnl": round(self.risk.daily_pnl, 2),
-                "daily_loss_limit_usd": self.config.trading.daily_loss_limit_usd,
-            })
-        if capped:
+        if self._entries_capped():
             return
 
         # Collect all edges
@@ -1265,6 +1274,12 @@ class TradingBot:
         """
         open_slugs = {p.slug for p in self.portfolio.get_open_positions()}
         tcfg = getattr(getattr(self, "config", None), "trading", None)
+        if self._strategy() == "certainty":
+            # Entries come from _certainty_scan; held markets are marked in
+            # check_positions. No estimator work on 800 markets per scan.
+            self.logger.info("prescreen_complete", {"scan": label, "markets": len(markets),
+                                                    "screened": 0, "candidates": 0, "held": 0})
+            return []
         hold = bool(getattr(tcfg, "hold_to_settlement", False))
         paused = getattr(self, "entries_paused_until", None) is not None
         keep, screened = [], 0
@@ -1309,8 +1324,130 @@ class TradingBot:
                 snapshots.append(snapshot)
         return snapshots
 
+    # ── Certainty strategy (bot/certainty.py) ─────────────────────────────
+
+    def _certainty_scan(self, live_markets: List[Dict]):
+        """Late-lead and final entries. Every quote in the zone is logged to
+        certainty_log, taken or not, so thresholds can be set from data."""
+        from bot import certainty
+        from bot.paper import executable_level
+        from utils.models import TradeSignal
+        tcfg = self.config.trading
+        game_state = getattr(self, "game_state", None)
+        if game_state is None or getattr(self, "entries_paused_until", None) is not None:
+            return
+        if self._entries_capped():
+            return
+        open_slugs = {p.slug for p in self.portfolio.get_open_positions()}
+        kinds = {k.strip().lower() for k in str(getattr(tcfg, "market_kinds", "") or "").split(",")
+                 if k.strip()}
+        for m in live_markets:
+            if not self.running:
+                break
+            slug = m.get("slug", "") or ""
+            if not slug or slug in open_slugs or slug in self._settled_slugs:
+                continue
+            kind = self._market_kind(slug)
+            if kinds and kind not in kinds:
+                continue
+            try:
+                gs = game_state.state_for(slug)
+            except Exception:
+                gs = None
+            if not gs or gs["state"] not in ("in", "post"):
+                continue
+            wp = None
+            if gs["state"] == "in" and kind == "ml" and getattr(self, "live_cache", None) is not None:
+                try:
+                    wp = self.live_cache.get_live_prob(slug)
+                except Exception:
+                    wp = None
+            decision = certainty.decide(slug, gs, wp, tcfg)
+            if decision is None and not self._certainty_worth_logging(gs, wp):
+                continue
+            book = self.market_data.get_us_order_book(slug)
+            level = executable_level(book, decision["side"]) if decision else None
+            fillable = bool(level) and not (
+                (decision["side"] == "buy" and level[0] > decision["limit"])
+                or (decision["side"] == "sell" and level[0] < decision["limit"]))
+            self._log_certainty(slug, kind, gs, wp, decision, book, fillable)
+            if decision is None or not fillable:
+                continue
+            px, depth = level
+            if not self.risk.can_open_position(self.portfolio.get_open_positions()):
+                break
+            room = float(tcfg.max_portfolio_exposure_usd) - float(self.portfolio.get_total_exposure())
+            size = min(float(getattr(tcfg, "certainty_size_usd", 100.0)), room,
+                       float(self.portfolio.bankroll) - 1.0)
+            if size < float(tcfg.min_position_size_usd):
+                break
+            token0_prob = float(decision["token0_prob"])
+            sig = TradeSignal(
+                market_id=str(m.get("id") or slug), token_id=slug, side=decision["side"],
+                estimated_prob=token0_prob, market_price=px,
+                edge=(token0_prob - px) if decision["side"] == "buy" else (px - token0_prob),
+                position_size_usd=size, slug=slug, timestamp=datetime.now(timezone.utc))
+            sig.exec_price = float(decision["limit"])
+            sig.spread = ((book.asks[0].price - book.bids[0].price)
+                          if (book is not None and book.bids and book.asks) else 0.0)
+            sig._question = m.get("question", "")
+            sig._is_live = gs["state"] == "in"
+            snapshot = self.market_data.build_snapshot(m, fetch_book=False)
+            trade = self.executor.execute_trade(sig, order_book=book)
+            if trade:
+                self.portfolio.open_position(sig, trade)
+                self.risk.record_trade_opened()
+                open_slugs.add(slug)
+                if snapshot:
+                    self._log_decision(sig, snapshot, "executed", decision["why"])
+                self.logger.info("certainty_trade_executed", {
+                    "slug": slug, "side": decision["side"], "why": decision["why"],
+                    "leader": decision["leader"], "margin": decision["margin"],
+                    "seconds_left": round(float(decision["seconds_left"] or 0.0)),
+                    "price": round(trade.price, 4), "size": round(trade.size_usd, 2),
+                    "contracts": trade.quantity, "fees": round(trade.fees, 2),
+                    "detail": gs.get("detail", ""), "daily_trade": self.risk.daily_trade_count,
+                })
+            elif snapshot:
+                self._log_decision(sig, snapshot, "execution_failed", decision["why"])
+
+    @staticmethod
+    def _certainty_worth_logging(gs: Dict, wp) -> bool:
+        from bot.certainty import seconds_left
+        if gs["state"] == "post":
+            return True
+        left = seconds_left(gs)
+        if left is not None and left <= 600:
+            return True
+        return bool(wp) and max(wp[0], 1.0 - wp[0]) >= 0.90
+
+    def _log_certainty(self, slug: str, kind: str, gs: Dict, wp, decision, book, fillable: bool):
+        """certainty_log row, at most one per 30 s per market (120 s once final)."""
+        from bot.certainty import leader_quote, seconds_left
+        from bot.trade_db import insert_certainty
+        logged = getattr(self, "_certainty_logged", None)
+        if logged is None:
+            logged = self._certainty_logged = {}
+        now = time.time()
+        if now - logged.get(slug, 0.0) < (120.0 if gs["state"] == "post" else 30.0):
+            return
+        logged[slug] = now
+        a, h = gs["away_score"], gs["home_score"]
+        leader = "away" if a > h else "home" if h > a else "none"
+        prob = None
+        if wp and leader != "none":
+            prob = float(wp[0]) if leader == "away" else 1.0 - float(wp[0])
+        price, depth = leader_quote(book, leader) if leader != "none" else (None, 0.0)
+        insert_certainty(datetime.now(timezone.utc).isoformat(), slug, kind, gs["state"],
+                         seconds_left(gs) if gs["state"] == "in" else 0.0, abs(a - h), leader,
+                         prob, price, depth, decision["why"] if decision else "none",
+                         bool(decision) and fillable)
+
     def _do_live_scan(self, live_markets: List[Dict]):
         """Fast scan — pre-screen live markets, real books for candidates only."""
+        if self._strategy() == "certainty":
+            self._certainty_scan(live_markets)
+            return
         candidates = self._prescreen(live_markets, "live")
         self.process_markets(self._build_snapshots(candidates))
 

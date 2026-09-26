@@ -105,6 +105,16 @@ class TradingConfig:
     # True = the bot never exits (no stop, take-profit, trailing or
     # aggressive exit); positions close only when the market settles.
     hold_to_settlement: bool = False
+    # --- 2026-09-26 certainty strategy (bot/certainty.py) ---
+    # "value": the estimator/edge pipeline. "certainty": buy near-certain
+    # outcomes late in a game and at the final, hold to settlement.
+    strategy: str = "value"
+    certainty_live_entries: bool = True       # False = finals only
+    certainty_min_win_prob: float = 0.97      # ESPN win probability for the leader
+    certainty_max_price: float = 0.96         # most paid to back the leader, live
+    certainty_max_seconds_left: float = 480.0
+    finals_max_price: float = 0.99            # most paid for a decided outcome
+    certainty_size_usd: float = 100.0         # fixed size; Kelly is wrong for 97%-ers
 
 
 # Default per-market-type weights — must stay in sync with WEIGHTS in estimator.py

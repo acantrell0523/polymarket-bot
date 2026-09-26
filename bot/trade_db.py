@@ -149,6 +149,25 @@ def init_db():
             reason TEXT,
             blocked_at TEXT
         );
+
+        -- Certainty strategy measurement (bot/certainty.py): every late-game
+        -- or final quote seen for a leader, taken or not.
+        CREATE TABLE IF NOT EXISTS certainty_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            kind TEXT,
+            state TEXT,
+            seconds_left REAL,
+            margin INTEGER,
+            leader TEXT,
+            leader_win_prob REAL,
+            leader_price REAL,
+            depth REAL,
+            decision TEXT,
+            taken INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_certainty_log_slug ON certainty_log(slug);
     """)
     # Preserve old rows explicitly as legacy, gross-P&L observations.
     columns = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
@@ -621,5 +640,25 @@ def load_reentry_blocks() -> set:
         return {row[0] for row in conn.execute("SELECT slug FROM reentry_blocks")}
     except sqlite3.OperationalError:
         return set()
+    finally:
+        conn.close()
+
+
+def insert_certainty(ts: str, slug: str, kind: str, state: str, seconds_left, margin, leader: str,
+                     leader_win_prob, leader_price, depth, decision: str, taken: bool) -> None:
+    """One certainty_log row; never raises (measurement must not block trading)."""
+    try:
+        conn = _get_conn()
+    except Exception:
+        return
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO certainty_log(ts, slug, kind, state, seconds_left, margin, leader, "
+                "leader_win_prob, leader_price, depth, decision, taken) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (ts, slug, kind, state, seconds_left, margin, leader, leader_win_prob, leader_price,
+                 depth, decision, 1 if taken else 0))
+    except Exception:
+        pass
     finally:
         conn.close()
