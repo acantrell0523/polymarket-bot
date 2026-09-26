@@ -28,6 +28,8 @@ def _bot(**trading):
     bot.market_data = Mock()
     bot.market_data._parse_datetime = MarketDataClient._parse_datetime.__get__(bot.market_data)
     bot.portfolio = SimpleNamespace(get_open_positions=lambda: [])
+    from bot.strategies.risk import RiskManager
+    bot.risk = RiskManager(bot.config.trading)
     return bot
 
 
@@ -227,3 +229,30 @@ def test_three_way_slug_still_prices_the_named_outcome():
     oc = OddsCache(api_key="", cache_ttl=300)
     probs = {"brighton": 0.30, "liverpool": 0.45, "draw": 0.25}
     assert oc.outcome_prob("atc-epl-bha-liv-2026-03-21-liv", probs) == pytest.approx(0.45)
+
+
+# ── daily counters roll over without a trade event ──────────────────────────
+
+def test_daily_caps_reset_on_a_new_utc_day_without_a_trade_event():
+    from bot.strategies.risk import RiskManager
+    risk = RiskManager(TradingConfig(max_daily_trades=15, daily_loss_limit_usd=75))
+    risk.reset_daily_pnl("2026-09-25")
+    risk.daily_trade_count, risk.daily_pnl = 15, -80.0
+    assert not risk.is_daily_trade_limit_reached() and not risk.is_daily_limit_breached()
+    assert risk.daily_trade_count == 0 and risk.daily_pnl == 0.0
+    assert risk.can_open_position([])
+    risk.daily_trade_count = 15                      # same day: still capped
+    assert risk.is_daily_trade_limit_reached() and not risk.can_open_position([])
+
+
+def test_capped_profile_logs_once_and_evaluates_nothing():
+    from bot.strategies.risk import RiskManager
+    bot = _bot(max_daily_trades=1)
+    bot.risk = RiskManager(bot.config.trading)
+    bot.risk.record_trade_opened()
+    bot._settled_slugs, bot._slug_cooldowns = set(), {}
+    bot._detect_edge = Mock(return_value=None)
+    bot.process_markets([snap()]); bot.process_markets([snap()])
+    bot._detect_edge.assert_not_called()
+    events = [c.args[0] for c in bot.logger.warning.call_args_list]
+    assert events == ["entries_capped"]

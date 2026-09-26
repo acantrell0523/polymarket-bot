@@ -35,10 +35,24 @@ class RiskManager:
             self.reset_daily_pnl(today)
         self.daily_trade_count += 1
 
+    def _roll_day(self):
+        """Reset the daily counters when the UTC date has changed.
+
+        Until 2026-09-26 only record_pnl / record_trade_opened rolled the
+        day, so a profile that hit its trade cap (or loss limit) with no
+        position left open could never trade again until restarted:
+        baseline sat locked from Friday 22:07 UTC through Saturday's slate.
+        """
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self.last_reset_date is not None and self.last_reset_date != today:
+            self.reset_daily_pnl(today)
+
     def is_daily_trade_limit_reached(self) -> bool:
+        self._roll_day()
         return self.daily_trade_count >= self.config.max_daily_trades
 
     def is_daily_limit_breached(self) -> bool:
+        self._roll_day()
         return self.daily_pnl <= -self.config.daily_loss_limit_usd
 
     def check_position(self, position: Position, current_price: float,

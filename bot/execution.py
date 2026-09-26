@@ -60,6 +60,15 @@ class ExecutionEngine:
         else:
             return self._live_execute(signal, trade_type)
 
+    def _paper_no_fill(self, signal: TradeSignal, reason: str, **extra):
+        """A refused paper fill used to be silent; pregame retried one thin
+        market 38 times overnight on 2026-09-26 with nothing in the log."""
+        if self.logger:
+            self.logger.warning("paper_fill_refused", {
+                "slug": signal.slug, "side": signal.side, "reason": reason,
+                "limit": round(float(signal.exec_price or 0), 4),
+                "size_usd": round(float(signal.position_size_usd or 0), 2), **extra})
+
     def _paper_execute(self, signal: TradeSignal, trade_type: str, order_book=None) -> Optional[Trade]:
         """Simulate an IOC at the executable limit, capped by visible depth.
 
@@ -72,10 +81,12 @@ class ExecutionEngine:
         price = signal.exec_price
         size_usd = signal.position_size_usd
         if level is None or price <= 0 or size_usd <= 0:
+            self._paper_no_fill(signal, "no_executable_level")
             return None
         book_price, depth = level
         if ((signal.side == "buy" and book_price > price)
                 or (signal.side == "sell" and book_price < price)):
+            self._paper_no_fill(signal, "book_moved_past_limit", book=book_price)
             return None
         price = book_price
 
@@ -88,6 +99,7 @@ class ExecutionEngine:
         while quantity > 0 and quantity * collateral + booked_fee_usd(quantity, price, coef) > size_usd:
             quantity -= 1
         if quantity <= 0:
+            self._paper_no_fill(signal, "under_one_contract", book=price, depth=depth)
             return None
         size_usd = quantity * collateral
         fees = booked_fee_usd(quantity, price, coef)

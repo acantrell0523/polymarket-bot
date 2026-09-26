@@ -443,6 +443,20 @@ class TradingBot:
         if getattr(self, "entries_paused_until", None) is not None:
             return  # daily-loss pause: no new entries (positions still managed)
 
+        # Daily trade cap / loss limit: say so once per episode instead of
+        # dropping every candidate silently (the cap hid a 20-hour lockout).
+        capped = (self.risk.is_daily_trade_limit_reached() or self.risk.is_daily_limit_breached())
+        if capped != getattr(self, "_cap_logged", False):
+            self._cap_logged = capped
+            self.logger.warning("entries_capped" if capped else "entries_uncapped", {
+                "daily_trades": self.risk.daily_trade_count,
+                "max_daily_trades": self.config.trading.max_daily_trades,
+                "daily_pnl": round(self.risk.daily_pnl, 2),
+                "daily_loss_limit_usd": self.config.trading.daily_loss_limit_usd,
+            })
+        if capped:
+            return
+
         # Collect all edges
         opportunities = []
         open_positions = self.portfolio.get_open_positions()
@@ -1409,6 +1423,9 @@ class TradingBot:
                     "book_feed": self.book_feed.status() if self.book_feed else None,
                     "entries_paused_until": (self.entries_paused_until.isoformat()
                                              if self.entries_paused_until else None),
+                    "daily_trades": self.risk.daily_trade_count,
+                    "daily_pnl": round(self.risk.daily_pnl, 2),
+                    "entries_capped": bool(getattr(self, "_cap_logged", False)),
                 })
 
                 # Check supervisor kill switch / pause
