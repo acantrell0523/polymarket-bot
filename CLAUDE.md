@@ -4,6 +4,23 @@ This document is a comprehensive reference for AI assistants (and human develope
 
 ---
 
+## Latest Changes — 2026-09-26 (certainty strategy, daily-cap rollover, moneyline consensus fix)
+
+Saturday's read: the value strategy loses on both sides of the clock. In-game,
+Polymarket reprices on every play while the scraped sportsbook quotes run
+20 s to 2.5 min behind (24 of 82 in-game picks won against 31 expected), and
+pregame the gap to the books is ~1%, under the fee. The in-game arm also sat
+silently locked for 20 hours (daily cap never rolled over) and cycled 15
+trades through one game's line ladder on Friday.
+
+| Area | Change |
+|------|--------|
+| **Certainty strategy** | `bot/certainty.py`, `trading.strategy: certainty`. `GameStateCache` reads each league's ESPN scoreboard through `bot/http_cache` (12 s, shared by every profile; `groups=80`, so FCS-only games have no state). `decide()` returns a "final" entry once ESPN reports the game over (buy the decided side of a moneyline, spread or total at <= `finals_max_price`) or a "late_lead" entry on moneylines only: inside `certainty_max_seconds_left`, lead >= 9 inside 4:00 or >= 17 inside 8:00, ESPN leader probability >= `certainty_min_win_prob` (<= 60 s old), quote <= `certainty_max_price`; never live in overtime. Token 0 = away side; the home side is a sell of token 0 at bid >= 1 - limit. Fixed `certainty_size_usd`, `hold_to_settlement`, closed by the settlement check. `_certainty_scan` replaces the live prescreen; every late/final leader quote goes to the `certainty_log` table (30 s in-game, 120 s post), taken or not. |
+| **Daily caps** | `RiskManager.is_daily_trade_limit_reached` / `is_daily_limit_breached` roll the UTC day themselves (they only rolled inside record_* before, so a capped profile with nothing open never traded again until restart). `process_markets` / `_certainty_scan` log `entries_capped` once per episode; heartbeat carries `daily_trades`, `daily_pnl`, `entries_capped`. |
+| **Moneyline consensus** | `OddsCache.outcome_prob` maps book team names with `_match_abbr`; `get_probability_for_slug` used to read the date's day as the team code and needed a 3-letter prefix, so tx/nd/nw/kc/gb/sf/ne/no/tb/lv away teams and "Hawai'i" had no pregame consensus. The sharp-book blend had the same bug. |
+| **Paper fills** | `ExecutionEngine._paper_no_fill` logs `paper_fill_refused` (no executable level, book moved past the limit, under one contract). |
+| **Profiles** | certainty (leader, late leads + finals), finals (finals only), pregame and pregame_late (value, `league_min_edge_override 0.03`, held). baseline's value ledger archived in `data/archive/2026-09-26-value-baseline/`; pregame_ml retired. |
+
 ## Latest Changes — 2026-09-25 (pregame hold-to-settlement profiles, pause and take-profit fixes)
 
 The first 40 hours on v2 ledgers lost money on every profile: 80 of 82 trades
