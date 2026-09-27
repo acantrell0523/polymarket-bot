@@ -84,11 +84,14 @@ PROFILES = {
         "env": {**PREGAME, "POLYBOT_TRADING__PREGAME_MAX_HOURS": "3"},
     },
     "live": {
-        "description": "In-game value betting: prices live moneylines and lines off live sportsbook quotes, needs 4% edge after round-trip costs, keeps stops and profit-taking, and blocks a whole game after a stop loss.",
+        "description": "In-game value betting on moneylines only: prices live moneylines off live sportsbook quotes, needs 4% edge after round-trip costs, keeps stops and profit-taking, and blocks a whole game after a stop loss.",
         "env": {
             "POLYBOT_TRADING__ENTRY_WINDOW": "live",
             "POLYBOT_TRADING__MIN_NET_EDGE": "0.04",
             "POLYBOT_TRADING__MAX_DAILY_TRADES": "20",
+            # Moneylines only (2026-09-26 night slate): alternate lines cost
+            # 50-75% of collateral per stop because the books are thin.
+            "POLYBOT_TRADING__MARKET_KINDS": "ml",
         },
     },
 }
