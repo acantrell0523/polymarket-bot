@@ -229,3 +229,28 @@ def test_value_profiles_skip_live_entries_right_after_a_score():
     assert bot._score_settled(ML)
     bot.game_state.state_for.return_value = None
     assert bot._score_settled(ML)
+
+
+def test_a_total_already_passed_is_a_decided_over_mid_game():
+    gs = _gs(away=28, home=24, period=3, clock="9:00")
+    d = certainty.decide("tsc-cfb-tx-tenn-2026-09-26-total-49pt5", gs, None, _cfg())
+    assert d and d["side"] == "buy" and d["why"] == "locked_total" and d["limit"] == 0.99 and d["margin"] == 2
+    assert certainty.decide("tsc-cfb-tx-tenn-2026-09-26-total-52pt5", gs, None, _cfg()) is None   # not there yet
+    assert certainty.decide("tsc-cfb-tx-tenn-2026-09-26-total-49pt5", dict(gs, seconds_since_score=5.0), None, _cfg())["why"] == "locked_total"
+
+
+def test_leader_writes_a_game_state_tape(tmp_path, monkeypatch):
+    import json as _json
+    monkeypatch.setenv("POLYBOT_BOOK_FEED", "1")
+    monkeypatch.setenv("POLYBOT_SHARED_DIR", str(tmp_path))
+    payload = {"events": [{"status": {"period": 2, "displayClock": "5:00", "type": {"state": "in", "completed": False, "shortDetail": "5:00 - 2nd"}},
+                           "competitions": [{"competitors": [
+                               {"homeAway": "home", "score": "10", "team": {"abbreviation": "TENN"}},
+                               {"homeAway": "away", "score": "3", "team": {"abbreviation": "TEX"}}]}]}]}
+    monkeypatch.setattr(certainty, "get_json", lambda url, **kw: payload)
+    cache = certainty.GameStateCache()
+    cache.state_for(ML); cache.state_for(ML)                       # same state twice: one line
+    payload["events"][0]["competitions"][0]["competitors"][1]["score"] = "10"
+    cache.state_for(ML)
+    lines = [_json.loads(l) for f in (tmp_path / "tape").glob("games-*.jsonl") for l in f.read_text().splitlines()]
+    assert [(l["as"], l["hs"]) for l in lines] == [(3, 10), (10, 10)] and lines[0]["away"] == "tx"

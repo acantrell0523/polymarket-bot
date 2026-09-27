@@ -66,6 +66,7 @@ class GameStateCache:
         # (league, away, home) -> (last scores seen, time the score last changed).
         # The first sighting of a game is not a change.
         self._scores: Dict[Tuple[str, str, str], Tuple[Tuple[int, int], Optional[float]]] = {}
+        self._taped: Dict[Tuple[str, str, str], tuple] = {}
 
     def games(self, league: str) -> Dict[Tuple[str, str], dict]:
         url = scoreboard_url(league)
@@ -98,6 +99,8 @@ class GameStateCache:
             if prev is not None and prev[0] != pair:
                 changed_at = now
             self._scores[(league, away, home)] = (pair, changed_at)
+            self._tape(league, away, home, stype.get("state", ""), pair, int(status.get("period") or 0),
+                       status.get("displayClock"), now)
             out[(away, home)] = {
                 "state": stype.get("state", ""), "completed": bool(stype.get("completed")),
                 "detail": stype.get("shortDetail", ""), "period": int(status.get("period") or 0),
@@ -118,6 +121,32 @@ class GameStateCache:
             return None
         return {**gs, "league": league, "away": away, "home": home,
                 "away_score": gs["scores"][away], "home_score": gs["scores"][home]}
+
+
+    def _tape(self, league, away, home, state, pair, period, clock, now) -> None:
+        """Leader only: one line per game-state change to
+        <shared>/tape/games-YYYY-MM-DD.jsonl, the score/clock timeline that the
+        price tape is joined against."""
+        import json, os
+        if os.environ.get("POLYBOT_BOOK_FEED") != "1":
+            return
+        shared = os.environ.get("POLYBOT_SHARED_DIR")
+        if not shared:
+            return
+        row = (state, pair, period, clock)
+        key = (league, away, home)
+        if self._taped.get(key) == row:
+            return
+        self._taped[key] = row
+        folder = os.path.join(shared, "tape")
+        try:
+            os.makedirs(folder, exist_ok=True)
+            with open(os.path.join(folder, "games-" + time.strftime("%Y-%m-%d", time.gmtime(now)) + ".jsonl"), "a") as fh:
+                fh.write(json.dumps({"t": round(now, 3), "lg": league, "away": away, "home": home, "state": state,
+                                     "as": pair[0], "hs": pair[1], "p": period, "clock": clock},
+                                    separators=(",", ":")) + "\n")
+        except OSError:
+            pass
 
 
 def token0_final_value(slug: str, gs: dict) -> Optional[float]:
@@ -171,7 +200,19 @@ def decide(slug: str, gs: Optional[dict], win_prob_away, cfg) -> Optional[dict]:
         return {"side": side, "limit": limit, "token0_prob": value, "why": "final", "kind": kind,
                 "leader": "away" if gs["away_score"] > gs["home_score"] else "home",
                 "margin": abs(gs["away_score"] - gs["home_score"]), "seconds_left": 0.0}
-    if gs["state"] != "in" or kind != "ml" or not getattr(cfg, "certainty_live_entries", True):
+    if gs["state"] != "in":
+        return None
+    if kind == "total":
+        # Points scored can only rise: once they pass the line the over has
+        # won mid-game, whatever the clock says. Anything offered under $1 is
+        # a decided outcome (stat corrections aside).
+        parsed = parse_line_slug(slug)
+        if parsed and (gs["away_score"] + gs["home_score"]) > parsed["line"]:
+            return {"side": "buy", "limit": cfg.finals_max_price, "token0_prob": 1.0, "why": "locked_total",
+                    "kind": kind, "leader": "over", "margin": int(gs["away_score"] + gs["home_score"] - parsed["line"]),
+                    "seconds_left": seconds_left(gs)}
+        return None
+    if kind != "ml" or not getattr(cfg, "certainty_live_entries", True):
         return None
     if in_overtime(gs):
         return None

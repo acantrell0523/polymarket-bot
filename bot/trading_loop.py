@@ -1425,7 +1425,7 @@ class TradingBot:
             if decision is not None and decision["why"] == "late_lead" and not certainty.score_settled(
                     gs, float(getattr(tcfg, "score_quiet_seconds", 90.0))):
                 decision = None      # a lead that just changed is not settled evidence
-            if decision is None and not self._certainty_worth_logging(gs, wp):
+            if decision is None and not self._certainty_worth_logging(gs, wp, slug):
                 continue
             book = self.market_data.get_us_order_book(slug)
             level = executable_level(book, decision["side"]) if decision else None
@@ -1598,10 +1598,14 @@ class TradingBot:
                         decision["why"] if decision else "none", bool(decision) and fillable)
 
     @staticmethod
-    def _certainty_worth_logging(gs: Dict, wp) -> bool:
+    def _certainty_worth_logging(gs: Dict, wp, slug: str = "") -> bool:
         from bot.certainty import seconds_left
+        from bot.signals.lines import parse_line_slug
         if gs["state"] == "post":
             return True
+        if slug.startswith("tsc-"):
+            parsed = parse_line_slug(slug)     # totals within a score of the line, or past it
+            return bool(parsed) and gs["away_score"] + gs["home_score"] >= parsed["line"] - 7
         left = seconds_left(gs)
         if left is not None and left <= 600:
             return True
