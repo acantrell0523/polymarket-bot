@@ -38,6 +38,8 @@ MIRROR_MIN_GAP = 1.0  # seconds between shared-cache writes per slug
 # strategy compared them to slower sportsbook copies and lost, and a live
 # strategy built on the market's own behaviour needs this to be tested.
 TAPE_MIN_GAP = 5.0
+AUTH_RETRY_SECONDS = 120.0       # after a 401/403 on the handshake
+AUTH_FAILURES_TO_DISABLE = 6     # ~12 minutes of rejections before falling back to REST for good
 STATUS_FILE = "feed_status.json"
 
 
@@ -193,6 +195,7 @@ class BookFeed:
     async def _main(self) -> None:
         from polymarket_us.websocket import MarketsWebSocket
         backoff = 2.0
+        auth_failures = 0
         while not self._stop.is_set():
             ws = MarketsWebSocket(key_id=self.key_id, secret_key=self.secret_key)
             closed = asyncio.Event()
@@ -205,15 +208,27 @@ class BookFeed:
             except Exception as e:
                 msg = str(e)
                 if "401" in msg or "403" in msg:
-                    self.enabled = False
-                    self.disabled_reason = "auth_rejected"
-                    self._log("warning", "book_feed_disabled", {"reason": "websocket auth rejected (dead or missing API key); using REST books"})
-                    return
+                    # One rejection is not a dead key: on 2026-09-27 a 401/403
+                    # during a reconnect storm at 12:12 PM ET disabled the feed
+                    # for the whole NFL slate while the key was fine. Retry on a
+                    # long backoff; give up only after a run of rejections.
+                    auth_failures += 1
+                    if auth_failures >= AUTH_FAILURES_TO_DISABLE:
+                        self.enabled = False
+                        self.disabled_reason = "auth_rejected"
+                        self._log("warning", "book_feed_disabled", {"reason": "websocket auth rejected repeatedly (dead or missing API key); using REST books",
+                                                                    "rejections": auth_failures})
+                        return
+                    self._log("warning", "book_feed_auth_rejected", {"error": msg[:200], "retry_in": AUTH_RETRY_SECONDS,
+                                                                       "rejections": auth_failures})
+                    await asyncio.sleep(AUTH_RETRY_SECONDS)
+                    continue
                 self._log("warning", "book_feed_connect_failed", {"error": msg[:200], "retry_in": backoff})
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
                 continue
             backoff = 2.0
+            auth_failures = 0
             self.connected = True
             self._log("info", "book_feed_connected", {})
             subscribed_version = -1

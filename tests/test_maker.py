@@ -247,3 +247,31 @@ def test_leader_writes_a_price_tape(tmp_path, monkeypatch):
     payload["bids"][0]["px"]["value"] = "0.4100"
     feed.handle_market_data({"marketData": payload})
     assert len(files[0].read_text().splitlines()) == 2
+
+
+def test_one_auth_rejection_does_not_disable_the_feed(monkeypatch):
+    import asyncio, types, sys
+    from bot import book_feed as bf
+    attempts = []
+
+    class FakeWS:
+        def __init__(self, **kw): pass
+        def on(self, *a): pass
+        async def connect(self):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise RuntimeError("HTTP 401 Unauthorized")
+            raise RuntimeError("connection refused")           # any other error: normal backoff
+        async def close(self): pass
+    fake_mod = types.SimpleNamespace(MarketsWebSocket=FakeWS)
+    monkeypatch.setitem(sys.modules, "polymarket_us.websocket", fake_mod)
+    monkeypatch.setattr(bf, "AUTH_RETRY_SECONDS", 0.0)
+    sleeps = []
+    async def fake_sleep(s): sleeps.append(s); (_ for _ in ()).throw(SystemExit) if len(sleeps) >= 2 else None
+    monkeypatch.setattr(bf.asyncio, "sleep", fake_sleep)
+    feed = bf.BookFeed("k", "s", logger=None)
+    try:
+        asyncio.run(feed._main())
+    except SystemExit:
+        pass
+    assert feed.enabled and feed.disabled_reason == "" and len(attempts) == 2
