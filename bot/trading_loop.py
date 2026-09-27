@@ -931,8 +931,17 @@ class TradingBot:
                     self._settle_suspects().add(slug)
                     self.logger.warning("paper_exit_no_executable_book", {"slug": slug})
                     continue
-                live_price = paper_exit_level[0]
-                if live_price <= 0.02 or live_price >= 0.98:
+                # Mark and judge stops at the book MID; the exit itself still
+                # sweeps the real far side. On a 20c-wide alternate line the
+                # far side sits 40% below the entry ask, so a stop keyed to it
+                # fired ten seconds after entry on spread, not on the game
+                # (2026-09-26 night slate: 3 of 5 stops inside 15 s).
+                exit_px = paper_exit_level[0]
+                if paper_book.bids and paper_book.asks:
+                    live_price = round((paper_book.bids[0].price + paper_book.asks[0].price) / 2, 4)
+                else:
+                    live_price = exit_px
+                if exit_px <= 0.02 or exit_px >= 0.98:
                     self._settle_suspects().add(slug)
             else:
                 live_price = self.market_data.get_live_price(slug)
