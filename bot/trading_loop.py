@@ -285,12 +285,43 @@ class TradingBot:
         # (live books, 0.5 req/s) needs the time between full scans.
         self.full_scan_interval = 180
 
+        # Daily counters live in memory; rebuild today's from the ledger so a
+        # restart cannot reset the loss limit (three restarts on 2026-09-26
+        # let `live` run to -$167 past a $75 limit).
+        self._seed_daily_counters()
+
         # Cached market list from last full scan
         self._cached_markets: List[Dict] = []
         # Set by _check_supervisor_flags while a daily-loss pause is active:
         # new entries are blocked, open positions are still managed.
         self.entries_paused_until: Optional[datetime] = None
         self._last_full_scan = 0.0
+
+    def _seed_daily_counters(self) -> None:
+        """Today's realized P&L and entries from trades.db into the RiskManager."""
+        try:
+            from bot.strategies.risk import next_day_roll, trading_day
+            from bot.trade_db import _get_conn
+            from datetime import timedelta as _td
+            day_start = (next_day_roll() - _td(days=1)).isoformat()
+            conn = _get_conn()
+            try:
+                pnl = conn.execute("SELECT COALESCE(SUM(realized_pnl), 0) FROM trades WHERE close_time >= ?",
+                                   (day_start,)).fetchone()[0]
+                opened = conn.execute("SELECT COUNT(*) FROM decision_log WHERE decision = 'executed' "
+                                      "AND timestamp >= ?", (day_start,)).fetchone()[0]
+            finally:
+                conn.close()
+            self.risk.reset_daily_pnl(trading_day())
+            self.risk.daily_pnl = float(pnl or 0.0)
+            self.risk.daily_trade_count = int(opened or 0)
+            if self.risk.daily_pnl or self.risk.daily_trade_count:
+                self.logger.info("daily_counters_seeded", {"daily_pnl": round(self.risk.daily_pnl, 2),
+                                                           "daily_trades": self.risk.daily_trade_count,
+                                                           "since": day_start})
+            self._enforce_daily_loss_pause()
+        except Exception as e:
+            self.logger.warning("daily_counter_seed_failed", {"error": str(e)[:200]})
 
     def _check_supervisor_flags(self) -> bool:
         """False = kill switch: skip the whole cycle.

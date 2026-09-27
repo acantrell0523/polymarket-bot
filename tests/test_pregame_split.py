@@ -289,3 +289,22 @@ def test_trading_day_rolls_at_5am_eastern_not_midnight_utc():
     sun_noon = datetime(2026, 9, 27, 16, 0, tzinfo=timezone.utc)
     assert trading_day(sun_noon) == "2026-09-27"
     assert next_day_roll(sun_noon) == datetime(2026, 9, 28, 9, 0, tzinfo=timezone.utc)
+
+
+def test_daily_counters_rebuild_from_the_ledger_after_a_restart(tmp_path, monkeypatch):
+    from tests.test_paper_validation import bot_with_position, book
+    from bot.trading_loop import TradingBot
+    from bot.strategies.risk import RiskManager
+    bot, pos = bot_with_position(book(.35, .39))            # a stop loss today, booked to trades.db
+    bot.check_positions()
+    assert pos.status == "closed" and pos.realized_pnl < 0
+    fresh = TradingBot.__new__(TradingBot)
+    fresh.config = SimpleNamespace(trading=TradingConfig(daily_loss_limit_usd=5.0))
+    fresh.logger = Mock()
+    fresh.risk = RiskManager(fresh.config.trading)
+    fresh._data_dir = str(tmp_path)
+    fresh.alerter = None
+    fresh._seed_daily_counters()
+    assert fresh.risk.daily_pnl == pytest.approx(pos.realized_pnl)
+    assert fresh.risk.is_daily_limit_breached()
+    assert (tmp_path / "pause_until").exists()                # the pause is durable again
