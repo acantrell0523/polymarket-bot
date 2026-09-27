@@ -278,3 +278,14 @@ def test_stop_loss_blocks_every_line_of_the_game():
     bot._detect_edge = Mock(return_value=("sig", "snap"))
     keep = bot._prescreen([{"slug": "tsc-cfb-army-templ-2026-09-25-total-45pt5"}, {"slug": "aec-cfb-navy-uab-2026-09-25"}], "t")
     assert [m["slug"] for m in keep] == ["aec-cfb-navy-uab-2026-09-25"]
+
+
+def test_trading_day_rolls_at_5am_eastern_not_midnight_utc():
+    from bot.strategies.risk import trading_day, next_day_roll
+    from datetime import datetime, timezone
+    sat_night = datetime(2026, 9, 27, 0, 30, tzinfo=timezone.utc)      # Sat 8:30 PM ET
+    assert trading_day(sat_night) == "2026-09-26"
+    assert next_day_roll(sat_night) == datetime(2026, 9, 27, 9, 0, tzinfo=timezone.utc)   # Sun 5 AM ET
+    sun_noon = datetime(2026, 9, 27, 16, 0, tzinfo=timezone.utc)
+    assert trading_day(sun_noon) == "2026-09-27"
+    assert next_day_roll(sun_noon) == datetime(2026, 9, 28, 9, 0, tzinfo=timezone.utc)

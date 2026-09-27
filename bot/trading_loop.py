@@ -684,8 +684,8 @@ class TradingBot:
         pause_path = os.path.join(self._data_dir, "pause_until")
         if os.path.exists(pause_path):
             return  # already paused
-        now = datetime.now(timezone.utc)
-        resume_at = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        from bot.strategies.risk import next_day_roll
+        resume_at = next_day_roll()          # 09:00 UTC, before the next day's games
         try:
             with open(pause_path, "w") as f:
                 f.write(resume_at.isoformat())

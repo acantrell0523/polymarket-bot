@@ -1,11 +1,26 @@
 """Risk management: stop-loss, take-profit, trailing stop, aggressive exit."""
 
 from typing import List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from utils.models import Position
 from utils.config import TradingConfig
 
 MIN_HOLD_SECONDS = 600  # 10 minutes — no exit under 10min except 25% stop-loss
+# The trading day rolls at 09:00 UTC (5 AM ET), before any US game. A UTC
+# midnight boundary (8 PM ET) made a Saturday-night loss pause block all of
+# Sunday's NFL slate and split one evening's trades across two "days".
+DAY_ROLL_HOURS = 9
+
+
+def trading_day(now: Optional[datetime] = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    return (now - timedelta(hours=DAY_ROLL_HOURS)).strftime("%Y-%m-%d")
+
+
+def next_day_roll(now: Optional[datetime] = None) -> datetime:
+    now = now or datetime.now(timezone.utc)
+    roll = now.replace(hour=DAY_ROLL_HOURS, minute=0, second=0, microsecond=0)
+    return roll if roll > now else roll + timedelta(days=1)
 LET_IT_RIDE_THRESHOLD = 0.70  # When price hits 70%+, hold for full resolution payout
 
 
@@ -21,16 +36,16 @@ class RiskManager:
     def reset_daily_pnl(self, date_str: Optional[str] = None):
         self.daily_pnl = 0.0
         self.daily_trade_count = 0
-        self.last_reset_date = date_str or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self.last_reset_date = date_str or trading_day()
 
     def record_pnl(self, pnl: float):
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = trading_day()
         if self.last_reset_date != today:
             self.reset_daily_pnl(today)
         self.daily_pnl += pnl
 
     def record_trade_opened(self):
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = trading_day()
         if self.last_reset_date != today:
             self.reset_daily_pnl(today)
         self.daily_trade_count += 1
@@ -43,7 +58,7 @@ class RiskManager:
         position left open could never trade again until restarted:
         baseline sat locked from Friday 22:07 UTC through Saturday's slate.
         """
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = trading_day()
         if self.last_reset_date is not None and self.last_reset_date != today:
             self.reset_daily_pnl(today)
 
