@@ -102,7 +102,11 @@ PROFILES = {
         "env": {
             "POLYBOT_TRADING__ENTRY_WINDOW": "live",
             "POLYBOT_TRADING__MIN_NET_EDGE": "0.04",
-            "POLYBOT_TRADING__MAX_DAILY_TRADES": "20",
+            # Austin 2026-09-26 22:30 ET: keep it trading through the night
+            # slate after the moneylines-only change; limits widened so the
+            # earlier -$271 day does not pause the new rules before they run.
+            "POLYBOT_TRADING__MAX_DAILY_TRADES": "60",
+            "POLYBOT_TRADING__DAILY_LOSS_LIMIT_USD": "500",
             # Moneylines only (2026-09-26 night slate): alternate lines cost
             # 50-75% of collateral per stop because the books are thin.
             "POLYBOT_TRADING__MARKET_KINDS": "ml",
