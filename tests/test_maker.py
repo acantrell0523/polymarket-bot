@@ -229,3 +229,21 @@ def test_live_quoting_is_off_by_default():
     m = Maker(bot)
     m.refresh([_market(live_slug, hours=-1.0)])
     assert m.quotes == {}
+
+
+def test_leader_writes_a_price_tape(tmp_path, monkeypatch):
+    from bot.book_feed import BookFeed, TAPE_MIN_GAP
+    import json as _json
+    feed = BookFeed("k", "s", logger=None, shared_dir=str(tmp_path))
+    payload = _payload([(0.40, 100)], [(0.60, 50)], shares=10.0, last_px=0.5, last_qty=2.0, last_time="t0")
+    payload["marketSlug"] = ML
+    feed.handle_market_data({"marketData": payload})
+    feed.handle_market_data({"marketData": payload})                     # unchanged: no second line
+    files = list((tmp_path / "tape").glob("*.jsonl"))
+    rows = [_json.loads(l) for l in files[0].read_text().splitlines()]
+    assert len(rows) == 1 and rows[0]["s"] == ML and rows[0]["b"] == 0.40 and rows[0]["a"] == 0.60
+    assert rows[0]["lp"] == "0.5000" and rows[0]["st"] == "10.0000"
+    feed._last_tape[ML] = (feed._last_tape[ML][0] - TAPE_MIN_GAP - 1, feed._last_tape[ML][1])
+    payload["bids"][0]["px"]["value"] = "0.4100"
+    feed.handle_market_data({"marketData": payload})
+    assert len(files[0].read_text().splitlines()) == 2

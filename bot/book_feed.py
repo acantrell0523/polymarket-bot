@@ -32,6 +32,12 @@ from typing import Dict, List, Optional, Tuple
 MAX_AGE = 15.0        # seconds; per-book age limit when the connection is NOT known alive
 ALIVE_WINDOW = 20.0   # a message (any, incl. heartbeats) within this = connection alive
 MIRROR_MIN_GAP = 1.0  # seconds between shared-cache writes per slug
+# Price tape: one line per market whenever its top of book or last trade
+# changed, at most every TAPE_MIN_GAP seconds, to <shared>/tape/YYYY-MM-DD.jsonl.
+# The only record of how Polymarket's own live prices move; the value
+# strategy compared them to slower sportsbook copies and lost, and a live
+# strategy built on the market's own behaviour needs this to be tested.
+TAPE_MIN_GAP = 5.0
 STATUS_FILE = "feed_status.json"
 
 
@@ -50,6 +56,7 @@ class BookFeed:
         self.connected = False
         self.disabled_reason = "" if self.enabled else "no_api_key"
         self._last_mirror: Dict[str, float] = {}
+        self._last_tape: Dict[str, Tuple[float, tuple]] = {}
         self.messages = 0
         self.last_msg_at = 0.0
         self._subscribed: set = set()
@@ -121,6 +128,7 @@ class BookFeed:
         self.books[slug] = (time.time(), payload)
         self.messages += 1
         self._mirror(slug, payload)
+        self._tape(slug, payload)
         return slug
 
     def _mirror(self, slug: str, payload: dict) -> None:
@@ -137,6 +145,39 @@ class BookFeed:
             with os.fdopen(fd, "w") as fh:
                 json.dump({"marketData": payload}, fh)
             os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def _tape(self, slug: str, payload: dict) -> None:
+        if not self.shared_dir:
+            return
+        now = time.time()
+        last = self._last_tape.get(slug)
+        if last and now - last[0] < TAPE_MIN_GAP:
+            return
+        try:
+            bids, asks = payload.get("bids") or [], payload.get("offers") or []
+            stats = payload.get("stats") or {}
+            def px(level):
+                p = level.get("px")
+                return float(p["value"] if isinstance(p, dict) else p)
+            row = (px(bids[0]) if bids else None, float(bids[0].get("qty", 0)) if bids else 0.0,
+                   px(asks[0]) if asks else None, float(asks[0].get("qty", 0)) if asks else 0.0,
+                   (stats.get("lastTradePx") or {}).get("value"), stats.get("lastTradeQty"),
+                   stats.get("lastTradeSetTime"), stats.get("sharesTraded"))
+        except (TypeError, ValueError, AttributeError):
+            return
+        if last and last[1] == row:
+            return
+        self._last_tape[slug] = (now, row)
+        folder = os.path.join(self.shared_dir, "tape")
+        path = os.path.join(folder, time.strftime("%Y-%m-%d", time.gmtime(now)) + ".jsonl")
+        try:
+            os.makedirs(folder, exist_ok=True)
+            with open(path, "a") as fh:
+                fh.write(json.dumps({"t": round(now, 3), "s": slug, "b": row[0], "bq": row[1], "a": row[2],
+                                     "aq": row[3], "lp": row[4], "lq": row[5], "lt": row[6], "st": row[7]},
+                                    separators=(",", ":")) + "\n")
         except OSError:
             pass
 
