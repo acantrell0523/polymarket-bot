@@ -29,6 +29,7 @@ team's line; total: Over). Buying token 0 backs the away side; selling it
 backs the home side with (1 - price) collateral. Both fill at the executable
 top of book within visible depth like every other paper trade.
 """
+import time
 from typing import Dict, Optional, Tuple
 
 from bot.http_cache import get_json
@@ -62,6 +63,9 @@ class GameStateCache:
 
     def __init__(self, max_age: float = SCOREBOARD_MAX_AGE):
         self.max_age = max_age
+        # (league, away, home) -> (last scores seen, time the score last changed).
+        # The first sighting of a game is not a change.
+        self._scores: Dict[Tuple[str, str, str], Tuple[Tuple[int, int], Optional[float]]] = {}
 
     def games(self, league: str) -> Dict[Tuple[str, str], dict]:
         url = scoreboard_url(league)
@@ -87,11 +91,19 @@ class GameStateCache:
                     away = code
             if not (away and home):
                 continue
+            now = time.time()
+            pair = (scores.get(away, 0), scores.get(home, 0))
+            prev = self._scores.get((league, away, home))
+            changed_at = prev[1] if prev else None
+            if prev is not None and prev[0] != pair:
+                changed_at = now
+            self._scores[(league, away, home)] = (pair, changed_at)
             out[(away, home)] = {
                 "state": stype.get("state", ""), "completed": bool(stype.get("completed")),
                 "detail": stype.get("shortDetail", ""), "period": int(status.get("period") or 0),
                 "clock_seconds": _clock_seconds(status.get("displayClock")),
                 "scores": scores, "espn_away": away, "espn_home": home,
+                "seconds_since_score": (now - changed_at) if changed_at else None,
             }
         return out
 
@@ -195,3 +207,12 @@ def leader_quote(book, leader: str) -> Tuple[Optional[float], float]:
         return (level[0], level[1]) if level else (None, 0.0)
     level = executable_level(book, "sell")
     return (round(1.0 - level[0], 4), level[1]) if level else (None, 0.0)
+
+
+def score_settled(gs: Optional[dict], quiet_seconds: float) -> bool:
+    """True unless the score changed within quiet_seconds. Right after a
+    score the market has moved and every slower copy of it has not."""
+    if not gs:
+        return True
+    since = gs.get("seconds_since_score")
+    return since is None or since >= quiet_seconds

@@ -158,3 +158,74 @@ def test_value_profiles_ignore_the_certainty_path():
     bot.logger = Mock()
     bot.portfolio = SimpleNamespace(get_open_positions=lambda: [])
     assert bot._prescreen([{"slug": ML}], "full") == []
+
+
+# ── score changes and the comeback rules ────────────────────────────────────
+
+def test_score_changes_are_timed_and_gate_entries(monkeypatch):
+    payload = {"events": [{"status": {"period": 2, "displayClock": "5:00", "type": {"state": "in", "completed": False, "shortDetail": "5:00 - 2nd"}},
+                           "competitions": [{"competitors": [
+                               {"homeAway": "home", "score": "10", "team": {"abbreviation": "TENN"}},
+                               {"homeAway": "away", "score": "3", "team": {"abbreviation": "TEX"}}]}]}]}
+    monkeypatch.setattr(certainty, "get_json", lambda url, **kw: payload)
+    cache = certainty.GameStateCache()
+    first = cache.state_for(ML)
+    assert first["seconds_since_score"] is None and certainty.score_settled(first, 90)   # first sighting: no change
+    payload["events"][0]["competitions"][0]["competitors"][1]["score"] = "10"           # Texas scores
+    gs = cache.state_for(ML)
+    assert gs["seconds_since_score"] is not None and gs["seconds_since_score"] < 5
+    assert not certainty.score_settled(gs, 90) and certainty.score_settled(gs, 0)
+    again = cache.state_for(ML)                                                         # same score: clock keeps running
+    assert again["seconds_since_score"] >= gs["seconds_since_score"]
+
+
+def test_comeback_buys_a_big_favorite_that_fell_behind_early():
+    from bot import comeback
+    cfg = TradingConfig(strategy="comeback", hold_to_settlement=True)
+    # Texas (away, token 0) opened at 80%, trails 3-10 in the 2nd, ESPN still 62% for Texas
+    gs = _gs(away=3, home=10, period=2, clock="5:00")
+    gs["seconds_since_score"] = 200.0
+    d = comeback.decide(ML, gs, 0.80, (0.62, 4.0), cfg)
+    assert d and d["side"] == "buy" and d["favorite"] == "away" and d["deficit"] == 7
+    assert d["limit"] == pytest.approx(0.65) and d["live_prob"] == pytest.approx(0.62)
+    home = comeback.decide(ML, dict(gs, away_score=10, home_score=3), 0.20, (0.38, 4.0), cfg)   # home favorite behind
+    assert home and home["side"] == "sell" and home["favorite"] == "home" and home["limit"] == pytest.approx(0.35)
+    assert comeback.decide(ML, gs, 0.70, (0.62, 4.0), cfg) is None                    # not a big enough favorite
+    assert comeback.decide(ML, dict(gs, period=3), 0.80, (0.62, 4.0), cfg) is None    # too late in the game
+    assert comeback.decide(ML, dict(gs, home_score=24), 0.80, (0.62, 4.0), cfg) is None   # down 21: too far
+    assert comeback.decide(ML, dict(gs, away_score=10), 0.80, (0.62, 4.0), cfg) is None   # not behind
+    assert comeback.decide(ML, gs, 0.80, (0.45, 4.0), cfg) is None                    # ESPN gave up on it
+    assert comeback.decide(ML, dict(gs, seconds_since_score=20.0), 0.80, (0.62, 4.0), cfg) is None   # just scored
+    assert comeback.decide(ML, gs, None, (0.62, 4.0), cfg) is None                    # no pregame anchor
+    assert comeback.decide("asc-cfb-tx-tenn-2026-09-26-neg-3pt5", gs, 0.80, (0.62, 4.0), cfg) is None   # moneylines only
+
+
+def test_comeback_scan_takes_the_favorite_at_the_ask_and_logs(monkeypatch):
+    rows = []
+    monkeypatch.setattr("bot.trade_db.insert_comeback", lambda *a: rows.append(a))
+    book = OrderBook([OrderBookLevel(0.55, 300)], [OrderBookLevel(0.58, 200)])
+    gs = _gs(away=3, home=10, period=2, clock="5:00"); gs["seconds_since_score"] = 200.0
+    bot = _scan_bot(book, gs, (0.62, 3.0), comeback_size_usd=50.0)
+    bot.config.trading.strategy = "comeback"
+    bot._pregame_anchor = {ML: 0.80}
+    bot._comeback_scan([{"slug": ML, "id": "1", "question": "Texas vs Tennessee"}])
+    sig = bot.executor.execute_trade.call_args.args[0]
+    assert sig.side == "buy" and sig.exec_price == pytest.approx(0.65) and sig.position_size_usd == 50.0
+    assert len(rows) == 1 and rows[0][2] == "away" and rows[0][3] == 0.80 and rows[0][5] == 7 and rows[0][10] == "comeback"
+    pricey = _scan_bot(OrderBook([OrderBookLevel(0.66, 300)], [OrderBookLevel(0.70, 200)]), gs, (0.62, 3.0))
+    pricey.config.trading.strategy = "comeback"; pricey._pregame_anchor = {ML: 0.80}
+    pricey._comeback_scan([{"slug": ML, "id": "1"}])
+    pricey.executor.execute_trade.assert_not_called()                     # 70c is not 20 points below 80c
+
+
+def test_value_profiles_skip_live_entries_right_after_a_score():
+    from bot.trading_loop import TradingBot
+    bot = TradingBot.__new__(TradingBot)
+    bot.config = SimpleNamespace(trading=TradingConfig(score_quiet_seconds=90.0))
+    bot.game_state = Mock()
+    bot.game_state.state_for.return_value = {"seconds_since_score": 30.0}
+    assert not bot._score_settled(ML)
+    bot.game_state.state_for.return_value = {"seconds_since_score": 300.0}
+    assert bot._score_settled(ML)
+    bot.game_state.state_for.return_value = None
+    assert bot._score_settled(ML)

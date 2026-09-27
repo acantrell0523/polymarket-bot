@@ -3,13 +3,15 @@
 
 Every profile shares configs/config.yaml (v2 paper accounting, NFL/CFB, NHL
 from its Sep 29 opener). Profile settings are POLYBOT_* env overrides in
-each launchd plist. Since 2026-09-26 15:xx ET:
+each launchd plist. Since 2026-09-26 (finals retired 22:40 ET: Polymarket US expires a market at the final whistle):
 
     certainty     bot/certainty.py: buys near-certain outcomes late in a game
                   (two-score lead, ESPN >= 97%, quote <= 96c) and decided
                   outcomes after the final whistle (<= 99c), holds to
                   settlement. Also the websocket order-book leader.
-    finals        the same, finals only: the zero-game-risk floor
+    comeback      bot/comeback.py: a 75%+ pregame favorite trailing by <= 14
+                  in the first half, ESPN still >= 50%, priced 20+ points
+                  below its pregame price: buy and hold (Austin's thesis)
     maker         bot/maker.py: rests paper quotes 3c inside the model's fair
                   value in wide books (live alternate lines; pregame lines when
                   they are wide), earns the spread and the maker rebate,
@@ -63,9 +65,16 @@ PROFILES = {
         "description": "Buys near-certain outcomes: two-score leads late (ESPN 97%+, at most 96c) and decided games after the final (at most 99c), held to settlement.",
         "env": {"POLYBOT_BOOK_FEED": "1", **CERTAINTY},
     },
-    "finals": {
-        "description": "Finals only: buys the decided side after the final whistle (at most 99c) and waits for settlement. No game risk.",
-        "env": {**CERTAINTY, "POLYBOT_TRADING__CERTAINTY_LIVE_ENTRIES": "false"},
+    "comeback": {
+        "description": "Buys a heavy pregame favorite (75%+) that trails by 14 or fewer in the first half while ESPN still gives it 50%+, at a price at least 20 points below its pregame price, and holds to settlement.",
+        "env": {
+            "POLYBOT_TRADING__STRATEGY": "comeback",
+            "POLYBOT_TRADING__HOLD_TO_SETTLEMENT": "true",
+            "POLYBOT_TRADING__MAX_OPEN_POSITIONS": "20",
+            "POLYBOT_TRADING__MAX_DAILY_TRADES": "40",
+            "POLYBOT_TRADING__MAX_PORTFOLIO_EXPOSURE_USD": "900",
+            "POLYBOT_TRADING__DAILY_LOSS_LIMIT_USD": "300",
+        },
     },
     "maker": {
         "description": "Market maker: rests quotes 3c inside the model's fair value in books that have stayed wide for a minute (mostly live alternate lines), earns the spread plus the maker rebate, and holds fills to settlement unless the other side fills first.",

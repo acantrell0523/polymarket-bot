@@ -249,7 +249,7 @@ class TestActionNetworkLive:
         from bot.signals.book_scrapers import ActionNetworkClient
         import datetime as dt
         now = dt.datetime(2026, 9, 21, 3, 0, tzinfo=dt.timezone.utc).timestamp()
-        fresh = dt.datetime.fromtimestamp(now - 60, dt.timezone.utc).isoformat()
+        fresh = dt.datetime.fromtimestamp(now - 20, dt.timezone.utc).isoformat()   # inside AN_LIVE_MAX_AGE (45 s)
         stale = dt.datetime.fromtimestamp(now - 900, dt.timezone.utc).isoformat()
         rows = [{"type": "game", "book_id": 68, "ml_home": -280, "ml_away": 230, "inserted": stale},
                 {"type": "live", "book_id": 68, "ml_home": -1160, "ml_away": 720, "spread_away": 2.5,

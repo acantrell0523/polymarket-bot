@@ -520,6 +520,8 @@ class TradingBot:
                 continue
             if not self._entry_allowed(slug, snapshot.is_live, snapshot.hours_to_expiry):
                 continue
+            if snapshot.is_live and not self._score_settled(slug):
+                continue
 
             result = self._detect_edge(snapshot)
             if result:
@@ -1331,7 +1333,7 @@ class TradingBot:
         """
         open_slugs = {p.slug for p in self.portfolio.get_open_positions()}
         tcfg = getattr(getattr(self, "config", None), "trading", None)
-        if self._strategy() in ("certainty", "maker"):
+        if self._strategy() in ("certainty", "maker", "comeback"):
             # Entries come from _certainty_scan / the maker; held markets are
             # marked in check_positions. No estimator work on 800 markets.
             self.logger.info("prescreen_complete", {"scan": label, "markets": len(markets),
@@ -1420,6 +1422,9 @@ class TradingBot:
                 except Exception:
                     wp = None
             decision = certainty.decide(slug, gs, wp, tcfg)
+            if decision is not None and decision["why"] == "late_lead" and not certainty.score_settled(
+                    gs, float(getattr(tcfg, "score_quiet_seconds", 90.0))):
+                decision = None      # a lead that just changed is not settled evidence
             if decision is None and not self._certainty_worth_logging(gs, wp):
                 continue
             book = self.market_data.get_us_order_book(slug)
@@ -1430,43 +1435,167 @@ class TradingBot:
             self._log_certainty(slug, kind, gs, wp, decision, book, fillable)
             if decision is None or not fillable:
                 continue
-            px, depth = level
-            if not self.risk.can_open_position(self.portfolio.get_open_positions()):
+            if not self._take(m, gs, decision, book, level, float(getattr(tcfg, "certainty_size_usd", 100.0)),
+                              "certainty_trade_executed", {"leader": decision["leader"], "margin": decision["margin"],
+                                                           "seconds_left": round(float(decision["seconds_left"] or 0.0))}):
                 break
-            room = float(tcfg.max_portfolio_exposure_usd) - float(self.portfolio.get_total_exposure())
-            size = min(float(getattr(tcfg, "certainty_size_usd", 100.0)), room,
-                       float(self.portfolio.bankroll) - 1.0)
-            if size < float(tcfg.min_position_size_usd):
+            open_slugs.add(slug)
+
+    def _take(self, m: Dict, gs: Dict, decision: Dict, book, level, size_usd: float, event: str, extra: Dict) -> bool:
+        """Open a paper position on token 0 per `decision` (side, limit,
+        token0_prob, why) at the executable level. False = stop scanning
+        (caps or cash exhausted)."""
+        from utils.models import TradeSignal
+        tcfg = self.config.trading
+        slug = m.get("slug", "") or ""
+        px, depth = level
+        if not self.risk.can_open_position(self.portfolio.get_open_positions()):
+            return False
+        room = float(tcfg.max_portfolio_exposure_usd) - float(self.portfolio.get_total_exposure())
+        size = min(float(size_usd), room, float(self.portfolio.bankroll) - 1.0)
+        if size < float(tcfg.min_position_size_usd):
+            return False
+        token0_prob = float(decision["token0_prob"])
+        sig = TradeSignal(
+            market_id=str(m.get("id") or slug), token_id=slug, side=decision["side"],
+            estimated_prob=token0_prob, market_price=px,
+            edge=(token0_prob - px) if decision["side"] == "buy" else (px - token0_prob),
+            position_size_usd=size, slug=slug, timestamp=datetime.now(timezone.utc))
+        sig.exec_price = float(decision["limit"])
+        sig.spread = ((book.asks[0].price - book.bids[0].price)
+                      if (book is not None and book.bids and book.asks) else 0.0)
+        sig._question = m.get("question", "")
+        sig._is_live = gs.get("state") == "in"
+        snapshot = self.market_data.build_snapshot(m, fetch_book=False)
+        trade = self.executor.execute_trade(sig, order_book=book)
+        if trade:
+            self.portfolio.open_position(sig, trade)
+            self.risk.record_trade_opened()
+            if snapshot:
+                self._log_decision(sig, snapshot, "executed", decision["why"])
+            self.logger.info(event, {
+                "slug": slug, "side": decision["side"], "why": decision["why"],
+                "price": round(trade.price, 4), "size": round(trade.size_usd, 2),
+                "contracts": trade.quantity, "fees": round(trade.fees, 2),
+                "detail": gs.get("detail", ""), "daily_trade": self.risk.daily_trade_count, **extra,
+            })
+        elif snapshot:
+            self._log_decision(sig, snapshot, "execution_failed", decision["why"])
+        return True
+
+    def _score_settled(self, slug: str) -> bool:
+        """False inside score_quiet_seconds of a score change (the market has
+        moved, our copy of the books has not)."""
+        from bot.certainty import score_settled
+        game_state = getattr(self, "game_state", None)
+        if game_state is None:
+            return True
+        try:
+            gs = game_state.state_for(slug)
+        except Exception:
+            return True
+        return score_settled(gs, float(getattr(self.config.trading, "score_quiet_seconds", 90.0)))
+
+    # ── Comeback strategy (bot/comeback.py) ───────────────────────────────
+
+    def _remember_pregame_prices(self, markets: List[Dict]) -> None:
+        """Polymarket's own last pregame price per moneyline: the anchor the
+        comeback rules measure the in-game drop against."""
+        from bot.market_data import MarketDataClient
+        anchors = getattr(self, "_pregame_anchor", None)
+        if anchors is None:
+            anchors = self._pregame_anchor = {}
+        now = datetime.now(timezone.utc)
+        for m in markets:
+            slug = m.get("slug", "") or ""
+            if not slug.startswith("aec-"):
+                continue
+            start = self.market_data._parse_datetime(m.get("gameStartTime")) if m.get("gameStartTime") else None
+            if start is None or start <= now:
+                continue
+            p = MarketDataClient._token0_price(m)
+            if p is not None and 0.0 < p < 1.0:
+                anchors[slug] = p
+
+    def _pregame_anchor_for(self, slug: str) -> Optional[float]:
+        anchors = getattr(self, "_pregame_anchor", None) or {}
+        if slug in anchors:
+            return anchors[slug]
+        try:
+            got = self.odds_cache.get_probability_for_slug(slug)   # sportsbook pregame consensus
+        except Exception:
+            got = None
+        return float(got[0]) if got and got[1] >= 2 else None
+
+    def _comeback_scan(self, live_markets: List[Dict]):
+        from bot import comeback
+        from bot.paper import executable_level
+        tcfg = self.config.trading
+        game_state = getattr(self, "game_state", None)
+        if game_state is None or getattr(self, "entries_paused_until", None) is not None:
+            return
+        if self._entries_capped():
+            return
+        open_slugs = {p.slug for p in self.portfolio.get_open_positions()}
+        for m in live_markets:
+            if not self.running:
                 break
-            token0_prob = float(decision["token0_prob"])
-            sig = TradeSignal(
-                market_id=str(m.get("id") or slug), token_id=slug, side=decision["side"],
-                estimated_prob=token0_prob, market_price=px,
-                edge=(token0_prob - px) if decision["side"] == "buy" else (px - token0_prob),
-                position_size_usd=size, slug=slug, timestamp=datetime.now(timezone.utc))
-            sig.exec_price = float(decision["limit"])
-            sig.spread = ((book.asks[0].price - book.bids[0].price)
-                          if (book is not None and book.bids and book.asks) else 0.0)
-            sig._question = m.get("question", "")
-            sig._is_live = gs["state"] == "in"
-            snapshot = self.market_data.build_snapshot(m, fetch_book=False)
-            trade = self.executor.execute_trade(sig, order_book=book)
-            if trade:
-                self.portfolio.open_position(sig, trade)
-                self.risk.record_trade_opened()
-                open_slugs.add(slug)
-                if snapshot:
-                    self._log_decision(sig, snapshot, "executed", decision["why"])
-                self.logger.info("certainty_trade_executed", {
-                    "slug": slug, "side": decision["side"], "why": decision["why"],
-                    "leader": decision["leader"], "margin": decision["margin"],
-                    "seconds_left": round(float(decision["seconds_left"] or 0.0)),
-                    "price": round(trade.price, 4), "size": round(trade.size_usd, 2),
-                    "contracts": trade.quantity, "fees": round(trade.fees, 2),
-                    "detail": gs.get("detail", ""), "daily_trade": self.risk.daily_trade_count,
-                })
-            elif snapshot:
-                self._log_decision(sig, snapshot, "execution_failed", decision["why"])
+            slug = m.get("slug", "") or ""
+            if not slug.startswith("aec-") or slug in open_slugs or slug in self._settled_slugs:
+                continue
+            try:
+                gs = game_state.state_for(slug)
+            except Exception:
+                gs = None
+            if not gs or gs["state"] != "in":
+                continue
+            anchor = self._pregame_anchor_for(slug)
+            fav = comeback.favorite_side(anchor, float(tcfg.comeback_min_favorite))
+            if fav is None:
+                continue
+            favorite, p0 = fav
+            a, h = gs["away_score"], gs["home_score"]
+            deficit = (h - a) if favorite == "away" else (a - h)
+            if deficit < 1:
+                continue                                   # the favorite is not behind
+            try:
+                wp = self.live_cache.get_live_prob(slug)
+            except Exception:
+                wp = None
+            decision = comeback.decide(slug, gs, anchor, wp, tcfg)
+            book = self.market_data.get_us_order_book(slug)
+            from bot.certainty import leader_quote
+            fav_price, depth = leader_quote(book, favorite)
+            level = executable_level(book, decision["side"]) if decision else None
+            fillable = bool(level) and not (
+                (decision["side"] == "buy" and level[0] > decision["limit"])
+                or (decision["side"] == "sell" and level[0] < decision["limit"]))
+            self._log_comeback(slug, favorite, p0, wp, gs, deficit, fav_price, depth, decision, fillable)
+            if decision is None or not fillable:
+                continue
+            if not self._take(m, gs, decision, book, level, float(tcfg.comeback_size_usd), "comeback_trade_executed",
+                              {"favorite": favorite, "deficit": deficit, "pregame_prob": round(p0, 3),
+                               "live_prob": round(decision["live_prob"], 3)}):
+                break
+            open_slugs.add(slug)
+
+    def _log_comeback(self, slug, favorite, p0, wp, gs, deficit, fav_price, depth, decision, fillable) -> None:
+        """comeback_log row at most once per 30 s per market."""
+        from bot.certainty import seconds_left
+        from bot.trade_db import insert_comeback
+        logged = getattr(self, "_comeback_logged", None)
+        if logged is None:
+            logged = self._comeback_logged = {}
+        now = time.time()
+        if now - logged.get(slug, 0.0) < 30.0:
+            return
+        logged[slug] = now
+        live_prob = None
+        if wp:
+            live_prob = float(wp[0]) if favorite == "away" else 1.0 - float(wp[0])
+        insert_comeback(datetime.now(timezone.utc).isoformat(), slug, favorite, p0, live_prob, deficit,
+                        int(gs.get("period") or 0), seconds_left(gs), fav_price, depth,
+                        decision["why"] if decision else "none", bool(decision) and fillable)
 
     @staticmethod
     def _certainty_worth_logging(gs: Dict, wp) -> bool:
@@ -1510,6 +1639,9 @@ class TradingBot:
         """Fast scan — pre-screen live markets, real books for candidates only."""
         if self._strategy() == "certainty":
             self._certainty_scan(live_markets)
+            return
+        if self._strategy() == "comeback":
+            self._comeback_scan(live_markets)
             return
         if self._strategy() == "maker":
             return          # quotes are refreshed on full scans and polled every cycle
@@ -1671,6 +1803,8 @@ class TradingBot:
                     live_markets, pregame_markets = self._split_markets(markets)
                     if self._strategy() == "maker":
                         self._maker().refresh(markets)
+                    if self._strategy() == "comeback":
+                        self._remember_pregame_prices(pregame_markets)
 
                     # Two-stage: pre-screen on list prices, real books for
                     # candidates and held markets only (see _prescreen).

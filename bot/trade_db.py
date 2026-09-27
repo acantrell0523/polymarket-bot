@@ -186,6 +186,25 @@ def init_db():
             contracts REAL
         );
         CREATE INDEX IF NOT EXISTS idx_maker_log_slug ON maker_log(slug);
+
+        -- Comeback strategy measurement (bot/comeback.py): every qualifying
+        -- favorite-behind moment, taken or not
+        CREATE TABLE IF NOT EXISTS comeback_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            favorite TEXT,
+            pregame_prob REAL,
+            live_prob REAL,
+            deficit INTEGER,
+            period INTEGER,
+            seconds_left REAL,
+            fav_price REAL,
+            depth REAL,
+            decision TEXT,
+            taken INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_comeback_log_slug ON comeback_log(slug);
     """)
     # Preserve old rows explicitly as legacy, gross-P&L observations.
     columns = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
@@ -695,6 +714,26 @@ def insert_maker_log(ts: str, slug: str, kind: str, fair, num_books, best_bid, b
                 "INSERT INTO maker_log(ts, slug, kind, fair, num_books, best_bid, best_ask, bid, ask, "
                 "event, price, contracts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ts, slug, kind, fair, num_books, best_bid, best_ask, bid, ask, event, price, contracts))
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+
+def insert_comeback(ts: str, slug: str, favorite: str, pregame_prob, live_prob, deficit, period, seconds_left,
+                    fav_price, depth, decision: str, taken: bool) -> None:
+    """One comeback_log row; never raises."""
+    try:
+        conn = _get_conn()
+    except Exception:
+        return
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO comeback_log(ts, slug, favorite, pregame_prob, live_prob, deficit, period, seconds_left, "
+                "fav_price, depth, decision, taken) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (ts, slug, favorite, pregame_prob, live_prob, deficit, period, seconds_left, fav_price, depth,
+                 decision, 1 if taken else 0))
     except Exception:
         pass
     finally:

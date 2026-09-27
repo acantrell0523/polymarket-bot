@@ -558,7 +558,7 @@ class OddsCache:
                     return True
         return False
 
-    LIVE_MAX_AGE = 20.0   # seconds; in-play quotes older than this are refetched
+    LIVE_MAX_AGE = 8.0    # seconds; in-play quotes older than this are refetched (20 until 2026-09-26)
 
     def get_live_probability_for_slug(self, slug: str) -> Optional[Dict]:
         """In-play sportsbook consensus for token 0 of a full-game moneyline.

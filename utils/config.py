@@ -133,6 +133,21 @@ class TradingConfig:
     # market maker steps away after a play, our quote lands in the gap off a
     # slower model, and it comes back on the far side of us. Off by default.
     maker_live_quotes: bool = False
+    # --- 2026-09-26 night: no live entries right after a score ---
+    # Every losing live trade on 2026-09-26 was taken in the window after a
+    # score, when the market had moved and our copy of the books had not.
+    score_quiet_seconds: float = 90.0
+    # --- comeback strategy (bot/comeback.py): strategy = "comeback" ---
+    # A pregame favorite of comeback_min_favorite or better, trailing by
+    # 1..comeback_max_deficit inside the first comeback_max_period periods,
+    # ESPN still >= comeback_min_live_prob, priced comeback_min_drop below
+    # its pregame price: buy the favorite's moneyline, hold to settlement.
+    comeback_min_favorite: float = 0.75
+    comeback_max_deficit: int = 14
+    comeback_max_period: int = 2
+    comeback_min_live_prob: float = 0.50
+    comeback_min_drop: float = 0.20
+    comeback_size_usd: float = 50.0
     # A book must have been wide this long before we quote it, so a maker
     # that has only stepped away for a play does not get to pick us off.
     maker_wide_seconds: float = 300.0

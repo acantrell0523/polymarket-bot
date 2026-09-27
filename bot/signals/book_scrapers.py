@@ -497,7 +497,7 @@ class MultiBookAggregator:
         return games
 
     def live_consensus(self, sport_key: str, token0_abbr: str, other_abbr: str,
-                       max_age: float = 20.0) -> Optional[dict]:
+                       max_age: float = 8.0) -> Optional[dict]:
         """In-play consensus that `token0_abbr` wins, from LIVE quotes only.
 
         Polymarket's aec- token 0 is the away team (slug parts[2]); books key
@@ -660,8 +660,8 @@ AN_BASE = "https://api.actionnetwork.com/web/v1/scoreboard"
 AN_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
 # FanDuel (69) is excluded: the direct FanDuel client already supplies it (live-aware).
 AN_BOOKS = {68: "an_draftkings", 75: "an_betmgm", 123: "an_caesars", 79: "an_bet365", 71: "an_betrivers"}
-AN_LIVE_MAX_AGE = 150   # seconds; a live row older than this is a stale line, not a quote
-AN_LIVE_TTL = 25        # refetch cadence while any game is in progress
+AN_LIVE_MAX_AGE = 45    # seconds; a live row older than this is a stale line, not a quote (150 until 2026-09-26)
+AN_LIVE_TTL = 8         # refetch cadence while any game is in progress (25 until 2026-09-26)
 AN_LEAGUES = {
     "americanfootball_nfl": ("nfl", ""),
     "americanfootball_ncaaf": ("ncaaf", "&division=FBS"),

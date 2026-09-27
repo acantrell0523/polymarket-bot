@@ -150,7 +150,7 @@ class LinesCache:
 
     # -- fetch ---------------------------------------------------------------
 
-    LIVE_TTL = 20.0   # seconds between refreshes while any quote is in-play
+    LIVE_TTL = 8.0    # seconds between refreshes while any quote is in-play (20 until 2026-09-26)
 
     def _get(self, url: str, params: Optional[dict] = None,
              browser_ua: bool = True) -> Optional[object]:
