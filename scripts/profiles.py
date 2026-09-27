@@ -68,7 +68,7 @@ PROFILES = {
         "env": {**CERTAINTY, "POLYBOT_TRADING__CERTAINTY_LIVE_ENTRIES": "false"},
     },
     "maker": {
-        "description": "Market maker: rests quotes 3c inside the model's fair value in wide books (live alternate lines, wide pregame lines), earns the spread plus the maker rebate, and holds fills to settlement unless the other side fills first.",
+        "description": "Market maker: rests quotes 3c inside the model's fair value in books that have stayed wide for a minute (mostly live alternate lines), earns the spread plus the maker rebate, and holds fills to settlement unless the other side fills first.",
         "env": {
             "POLYBOT_TRADING__STRATEGY": "maker",
             "POLYBOT_TRADING__HOLD_TO_SETTLEMENT": "true",
@@ -77,6 +77,11 @@ PROFILES = {
             "POLYBOT_TRADING__MAX_PORTFOLIO_EXPOSURE_USD": "900",
             "POLYBOT_TRADING__DAILY_LOSS_LIMIT_USD": "300",
             "POLYBOT_FILTERS__MIN_HOURS_TO_EXPIRY": "0",
+            # Live quoting back on 2026-09-26 22:20 ET as a measured arm: the
+            # first 22 live fills settled 11-11, +92.93 (one 4-to-1 short).
+            # A book must have been wide for 60 s first.
+            "POLYBOT_TRADING__MAKER_LIVE_QUOTES": "true",
+            "POLYBOT_TRADING__MAKER_WIDE_SECONDS": "60",
         },
     },
     "pregame_late": {
