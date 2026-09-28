@@ -1624,8 +1624,10 @@ class TradingBot:
         logged[slug] = now
         a, h = gs["away_score"], gs["home_score"]
         leader = "away" if a > h else "home" if h > a else "none"
+        if kind == "total":
+            leader = "over"                      # token 0; the ask backs it
         prob = None
-        if wp and leader != "none":
+        if wp and leader in ("away", "home"):
             prob = float(wp[0]) if leader == "away" else 1.0 - float(wp[0])
         price, depth = leader_quote(book, leader) if leader != "none" else (None, 0.0)
         insert_certainty(datetime.now(timezone.utc).isoformat(), slug, kind, gs["state"],

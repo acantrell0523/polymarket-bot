@@ -62,14 +62,15 @@ CERTAINTY = {
 
 PROFILES = {
     "certainty": {
-        "description": "Buys near-certain outcomes: two-score leads late (ESPN 97%+, at most 96c) and decided games after the final (at most 99c), held to settlement.",
-        "env": {"POLYBOT_BOOK_FEED": "1", **CERTAINTY},
+        "description": "Buys near-certain outcomes late in a game: a two-score lead with ESPN at 97%+ (at most 96c), 98.5%+ (97.5c) or 99.5%+ (98.5c), and totals already past their line (99.5c), held to settlement.",
+        "env": {"POLYBOT_BOOK_FEED": "1", "POLYBOT_FILTERS__MIN_HOURS_TO_EXPIRY": "0", **CERTAINTY},
     },
     "comeback": {
-        "description": "Buys a heavy pregame favorite (75%+) that trails by 14 or fewer in the first half while ESPN still gives it 50%+, at a price at least 20 points below its pregame price, and holds to settlement.",
+        "description": "Buys a pregame favorite of 70%+ that trails by 17 or fewer in the first half (2 goals in hockey) while ESPN still gives it 50%+, at a price at least 20 points below its pregame price, and holds to settlement.",
         "env": {
             "POLYBOT_TRADING__STRATEGY": "comeback",
             "POLYBOT_TRADING__HOLD_TO_SETTLEMENT": "true",
+            "POLYBOT_FILTERS__MIN_HOURS_TO_EXPIRY": "0",
             "POLYBOT_TRADING__MAX_OPEN_POSITIONS": "20",
             "POLYBOT_TRADING__MAX_DAILY_TRADES": "40",
             "POLYBOT_TRADING__MAX_PORTFOLIO_EXPOSURE_USD": "900",
@@ -91,25 +92,9 @@ PROFILES = {
             # A book must have been wide for 60 s first.
             "POLYBOT_TRADING__MAKER_LIVE_QUOTES": "true",
             "POLYBOT_TRADING__MAKER_WIDE_SECONDS": "60",
-        },
-    },
-    "pregame_late": {
-        "description": "Taker control: buys before kickoff, in the last 3 hours only, when Polymarket sits 3% from the sportsbook consensus, and holds to settlement.",
-        "env": {**PREGAME, "POLYBOT_TRADING__PREGAME_MAX_HOURS": "3"},
-    },
-    "live": {
-        "description": "In-game value betting on moneylines only: prices live moneylines off live sportsbook quotes, needs 4% edge after round-trip costs, keeps stops and profit-taking, and blocks a whole game after a stop loss.",
-        "env": {
-            "POLYBOT_TRADING__ENTRY_WINDOW": "live",
-            "POLYBOT_TRADING__MIN_NET_EDGE": "0.04",
-            # Austin 2026-09-26 22:30 ET: keep it trading through the night
-            # slate after the moneylines-only change; limits widened so the
-            # earlier -$271 day does not pause the new rules before they run.
-            "POLYBOT_TRADING__MAX_DAILY_TRADES": "60",
-            "POLYBOT_TRADING__DAILY_LOSS_LIMIT_USD": "500",
-            # Moneylines only (2026-09-26 night slate): alternate lines cost
-            # 50-75% of collateral per stop because the books are thin.
-            "POLYBOT_TRADING__MARKET_KINDS": "ml",
+            # College only (2026-09-28): NFL alternate lines are 0.5-4c wide,
+            # nothing to quote inside; its 4 NFL fills lost 44.91.
+            "POLYBOT_FILTERS__LEAGUES": "cfb",
         },
     },
 }

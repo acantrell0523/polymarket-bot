@@ -275,3 +275,14 @@ def test_one_auth_rejection_does_not_disable_the_feed(monkeypatch):
     except SystemExit:
         pass
     assert feed.enabled and feed.disabled_reason == "" and len(attempts) == 2
+
+
+def test_maker_holds_one_position_per_game():
+    pos = _position("buy", 40.0, 0.47)                      # long the moneyline of KC-MIA
+    other = "asc-nfl-kc-mia-2026-09-27-neg-3pt5"
+    payloads = {ML: _payload([(0.40, 500)], [(0.60, 500)]), other: _payload([(0.40, 100)], [(0.60, 100)])}
+    bot = _bot(payloads, positions=[pos])
+    m = Maker(bot)
+    m.refresh([_market(ML), _market(other)])
+    assert set(m.quotes) == {ML}                            # the spread of the same game is not quoted
+    assert m.quotes[ML].bid is None and m.quotes[ML].ask == 0.53

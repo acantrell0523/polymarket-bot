@@ -231,19 +231,35 @@ def decide(slug: str, gs: Optional[dict], win_prob_away, cfg) -> Optional[dict]:
         return None
     leader = "away" if gs["away_score"] > gs["home_score"] else "home"
     leader_prob = p_away if leader == "away" else 1.0 - p_away
-    if leader_prob < cfg.certainty_min_win_prob:
+    max_price = tier_price(leader_prob, cfg)
+    if max_price is None:
         return None
     side = "buy" if leader == "away" else "sell"
-    limit = cfg.certainty_max_price if side == "buy" else round(1.0 - cfg.certainty_max_price, 4)
+    limit = max_price if side == "buy" else round(1.0 - max_price, 4)
     return {"side": side, "limit": limit, "token0_prob": p_away, "why": "late_lead", "kind": kind,
             "leader": leader, "margin": margin, "seconds_left": left}
+
+
+def tier_price(leader_prob: float, cfg) -> Optional[float]:
+    """The most we pay to back a leader ESPN gives `leader_prob`: the highest
+    ceiling among certainty_tiers whose probability floor is met, with
+    certainty_min_win_prob / certainty_max_price as the first tier."""
+    tiers = [(float(cfg.certainty_min_win_prob), float(cfg.certainty_max_price))]
+    for part in str(getattr(cfg, "certainty_tiers", "") or "").split(","):
+        prob, _, price = part.strip().partition(":")
+        try:
+            tiers.append((float(prob), float(price)))
+        except ValueError:
+            continue
+    ok = [price for prob, price in tiers if leader_prob >= prob]
+    return max(ok) if ok else None
 
 
 def leader_quote(book, leader: str) -> Tuple[Optional[float], float]:
     """(price to back the leader, contracts at that price): token 0's ask
     for the away side, 1 - token 0's bid for the home side."""
     from bot.paper import executable_level
-    if leader == "away":
+    if leader in ("away", "over"):
         level = executable_level(book, "buy")
         return (level[0], level[1]) if level else (None, 0.0)
     level = executable_level(book, "sell")

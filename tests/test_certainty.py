@@ -29,9 +29,9 @@ ML = "aec-cfb-tx-tenn-2026-09-26"
 def test_final_buys_the_winner_on_moneylines_spreads_and_totals():
     gs = _gs(state="post", away=31, home=20, completed=True)
     d = certainty.decide(ML, gs, None, _cfg())
-    assert d["side"] == "buy" and d["limit"] == 0.99 and d["why"] == "final"
+    assert d["side"] == "buy" and d["limit"] == 0.995 and d["why"] == "final"
     d = certainty.decide("aec-cfb-tx-tenn-2026-09-26", _gs(state="post", away=20, home=31), None, _cfg())
-    assert d["side"] == "sell" and d["limit"] == pytest.approx(0.01)        # home won: short token 0
+    assert d["side"] == "sell" and d["limit"] == pytest.approx(0.005)       # home won: short token 0
     assert certainty.decide("asc-cfb-tx-tenn-2026-09-26-neg-10pt5", gs, None, _cfg())["side"] == "buy"   # 31-20 covers -10.5
     assert certainty.decide("asc-cfb-tx-tenn-2026-09-26-neg-11pt5", gs, None, _cfg())["side"] == "sell"  # not -11.5
     assert certainty.decide("tsc-cfb-tx-tenn-2026-09-26-total-50pt5", gs, None, _cfg())["side"] == "buy"  # 51 > 50.5
@@ -44,7 +44,7 @@ def test_late_lead_needs_time_margin_and_espn_to_agree():
     cfg = _cfg()
     live = (0.985, 5.0)                                     # ESPN: away 98.5%
     d = certainty.decide(ML, _gs(away=24, home=7, clock="4:59"), live, cfg)
-    assert d and d["side"] == "buy" and d["limit"] == 0.96 and d["why"] == "late_lead"
+    assert d and d["side"] == "buy" and d["limit"] == 0.975 and d["why"] == "late_lead"   # ESPN 98.5%: second tier
     assert d["seconds_left"] == pytest.approx(299) and d["margin"] == 17
     assert certainty.decide(ML, _gs(away=24, home=7, clock="8:30"), live, cfg) is None      # too early
     assert certainty.decide(ML, _gs(away=24, home=17, clock="4:59"), live, cfg) is None     # one score, 5 min
@@ -54,7 +54,7 @@ def test_late_lead_needs_time_margin_and_espn_to_agree():
     assert certainty.decide(ML, _gs(away=24, home=7, clock="4:59"), None, cfg) is None         # no ESPN
     assert certainty.decide(ML, _gs(away=24, home=7, period=5, clock="0:00"), live, cfg) is None  # overtime
     home = certainty.decide(ML, _gs(away=7, home=24, clock="4:59"), (0.02, 5.0), cfg)
-    assert home["side"] == "sell" and home["limit"] == pytest.approx(0.04) and home["leader"] == "home"
+    assert home["side"] == "sell" and home["limit"] == pytest.approx(0.04) and home["leader"] == "home"    # ESPN 98%: first tier
     assert certainty.decide("asc-cfb-tx-tenn-2026-09-26-neg-10pt5", _gs(clock="1:00"), live, cfg) is None  # lines: finals only
     assert certainty.decide(ML, _gs(clock="4:59"), live, _cfg(certainty_live_entries=False)) is None
 
@@ -109,7 +109,7 @@ def test_scan_buys_a_late_leader_at_the_ask_and_logs_the_quote(monkeypatch):
     bot = _scan_bot(book, _gs(away=24, home=7, clock="4:59"), (0.985, 3.0))
     bot._certainty_scan([{"slug": ML, "id": "1", "question": "Texas vs Tennessee"}])
     sig = bot.executor.execute_trade.call_args.args[0]
-    assert sig.side == "buy" and sig.exec_price == 0.96 and sig.position_size_usd == 100.0
+    assert sig.side == "buy" and sig.exec_price == 0.975 and sig.position_size_usd == 100.0
     assert sig.estimated_prob == pytest.approx(0.985)
     bot.portfolio.open_position.assert_called_once()
     assert bot.risk.daily_trade_count == 1
@@ -137,7 +137,7 @@ def test_scan_respects_market_kinds_exposure_and_the_daily_cap():
     bot._certainty_scan([{"slug": "tsc-cfb-tx-tenn-2026-09-26-total-50pt5", "id": "2"}])
     bot.executor.execute_trade.assert_not_called()                     # totals excluded
     bot._certainty_scan([{"slug": ML, "id": "1"}])
-    assert bot.executor.execute_trade.call_args.args[0].exec_price == 0.99
+    assert bot.executor.execute_trade.call_args.args[0].exec_price == 0.995
     capped = _scan_bot(book, gs, None, max_daily_trades=1)
     capped.risk.record_trade_opened()
     capped._certainty_scan([{"slug": ML, "id": "1"}])
@@ -190,9 +190,13 @@ def test_comeback_buys_a_big_favorite_that_fell_behind_early():
     assert d["limit"] == pytest.approx(0.65) and d["live_prob"] == pytest.approx(0.62)
     home = comeback.decide(ML, dict(gs, away_score=10, home_score=3), 0.20, (0.38, 4.0), cfg)   # home favorite behind
     assert home and home["side"] == "sell" and home["favorite"] == "home" and home["limit"] == pytest.approx(0.35)
-    assert comeback.decide(ML, gs, 0.70, (0.62, 4.0), cfg) is None                    # not a big enough favorite
+    assert comeback.decide(ML, gs, 0.65, (0.62, 4.0), cfg) is None                    # not a big enough favorite
     assert comeback.decide(ML, dict(gs, period=3), 0.80, (0.62, 4.0), cfg) is None    # too late in the game
     assert comeback.decide(ML, dict(gs, home_score=24), 0.80, (0.62, 4.0), cfg) is None   # down 21: too far
+    assert comeback.decide(ML, dict(gs, home_score=19), 0.80, (0.62, 4.0), cfg) is not None  # down 16: allowed now
+    nhl = dict(gs, league="nhl", away_score=0, home_score=3, period=2)
+    assert comeback.decide("aec-nhl-min-dal-2026-09-29", nhl, 0.80, (0.62, 4.0), cfg) is None      # 3 goals: too far in hockey
+    assert comeback.decide("aec-nhl-min-dal-2026-09-29", dict(nhl, home_score=2), 0.80, (0.62, 4.0), cfg) is not None
     assert comeback.decide(ML, dict(gs, away_score=10), 0.80, (0.62, 4.0), cfg) is None   # not behind
     assert comeback.decide(ML, gs, 0.80, (0.45, 4.0), cfg) is None                    # ESPN gave up on it
     assert comeback.decide(ML, dict(gs, seconds_since_score=20.0), 0.80, (0.62, 4.0), cfg) is None   # just scored
@@ -234,7 +238,7 @@ def test_value_profiles_skip_live_entries_right_after_a_score():
 def test_a_total_already_passed_is_a_decided_over_mid_game():
     gs = _gs(away=28, home=24, period=3, clock="9:00")
     d = certainty.decide("tsc-cfb-tx-tenn-2026-09-26-total-49pt5", gs, None, _cfg())
-    assert d and d["side"] == "buy" and d["why"] == "locked_total" and d["limit"] == 0.99 and d["margin"] == 2
+    assert d and d["side"] == "buy" and d["why"] == "locked_total" and d["limit"] == 0.995 and d["margin"] == 2
     assert certainty.decide("tsc-cfb-tx-tenn-2026-09-26-total-52pt5", gs, None, _cfg()) is None   # not there yet
     assert certainty.decide("tsc-cfb-tx-tenn-2026-09-26-total-49pt5", dict(gs, seconds_since_score=5.0), None, _cfg())["why"] == "locked_total"
 
@@ -254,3 +258,12 @@ def test_leader_writes_a_game_state_tape(tmp_path, monkeypatch):
     cache.state_for(ML)
     lines = [_json.loads(l) for f in (tmp_path / "tape").glob("games-*.jsonl") for l in f.read_text().splitlines()]
     assert [(l["as"], l["hs"]) for l in lines] == [(3, 10), (10, 10)] and lines[0]["away"] == "tx"
+
+
+def test_certainty_tiers_pay_more_for_higher_espn_probability():
+    cfg = _cfg()
+    assert certainty.tier_price(0.96, cfg) is None
+    assert certainty.tier_price(0.97, cfg) == 0.96
+    assert certainty.tier_price(0.985, cfg) == 0.975
+    assert certainty.tier_price(0.999, cfg) == 0.985
+    assert certainty.tier_price(0.999, _cfg(certainty_tiers="bad,0.99:0.98")) == 0.98

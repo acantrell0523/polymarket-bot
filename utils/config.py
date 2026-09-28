@@ -113,10 +113,14 @@ class TradingConfig:
     # outcomes late in a game and at the final, hold to settlement.
     strategy: str = "value"
     certainty_live_entries: bool = True       # False = finals only
-    certainty_min_win_prob: float = 0.97      # ESPN win probability for the leader
-    certainty_max_price: float = 0.96         # most paid to back the leader, live
+    certainty_min_win_prob: float = 0.97      # ESPN win probability for the leader (first tier)
+    certainty_max_price: float = 0.96         # most paid to back the leader at the first tier
+    # Higher ESPN probability buys a higher ceiling: "min_prob:max_price,...".
+    # Weekend of 2026-09-26: offers at 96.5c-98.5c with ESPN >= 98.5% were
+    # 5 for 5, +3.4% per dollar risked; the old single 96c cap took one.
+    certainty_tiers: str = "0.97:0.96,0.985:0.975,0.995:0.985"
     certainty_max_seconds_left: float = 480.0
-    finals_max_price: float = 0.99            # most paid for a decided outcome
+    finals_max_price: float = 0.995           # most paid for a decided outcome (locked totals)
     certainty_size_usd: float = 100.0         # fixed size; Kelly is wrong for 97%-ers
     # --- 2026-09-26 maker strategy (bot/maker.py): strategy = "maker" ---
     maker_half_spread: float = 0.03           # quote fair -/+ this, inside the book
@@ -142,8 +146,9 @@ class TradingConfig:
     # 1..comeback_max_deficit inside the first comeback_max_period periods,
     # ESPN still >= comeback_min_live_prob, priced comeback_min_drop below
     # its pregame price: buy the favorite's moneyline, hold to settlement.
-    comeback_min_favorite: float = 0.75
-    comeback_max_deficit: int = 14
+    comeback_min_favorite: float = 0.70       # 0.75 until 2026-09-28: two moments a Sunday is too thin
+    comeback_max_deficit: int = 17            # 14 until 2026-09-28 (Denver came back from 16-0)
+    comeback_max_deficit_nhl: int = 2         # goals, not points
     comeback_max_period: int = 2
     comeback_min_live_prob: float = 0.50
     comeback_min_drop: float = 0.20

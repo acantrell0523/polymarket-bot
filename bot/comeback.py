@@ -50,7 +50,8 @@ def decide(slug: str, gs: Optional[dict], pregame_token0_prob: Optional[float], 
         return None
     a, h = gs["away_score"], gs["home_score"]
     deficit = (h - a) if favorite == "away" else (a - h)
-    if not (1 <= deficit <= int(cfg.comeback_max_deficit)):
+    max_deficit = int(cfg.comeback_max_deficit_nhl) if gs.get("league") == "nhl" else int(cfg.comeback_max_deficit)
+    if not (1 <= deficit <= max_deficit):
         return None
     if not score_settled(gs, float(cfg.score_quiet_seconds)):
         return None

@@ -165,7 +165,11 @@ class Maker:
         if getattr(bot, "entries_paused_until", None) is not None or bot._entries_capped():
             self._pull_all("entries_blocked")
             return
+        from bot.edge_log import extract_game_id
         open_by_slug = {p.slug: p for p in bot.portfolio.get_open_positions()}
+        # One position per game: two lines of one game are one bet twice
+        # (both Southern Miss lines lost together on 2026-09-26).
+        open_games = {extract_game_id(p.slug) for p in open_by_slug.values()}
         kinds = {k.strip().lower() for k in str(getattr(cfg, "market_kinds", "") or "").split(",")
                  if k.strip()}
         pull_before = timedelta(minutes=float(cfg.maker_pull_minutes))
@@ -174,6 +178,8 @@ class Maker:
             slug = m.get("slug", "") or ""
             kind = bot._market_kind(slug)
             if not slug or (kinds and kind not in kinds):
+                continue
+            if slug not in open_by_slug and extract_game_id(slug) in open_games:
                 continue
             start = bot.market_data._parse_datetime(m.get("gameStartTime")) if m.get("gameStartTime") else None
             if start is None:
